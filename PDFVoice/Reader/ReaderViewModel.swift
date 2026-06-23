@@ -64,6 +64,9 @@ final class ReaderViewModel: ObservableObject {
 
         if PDFTextExtractor.hasTextLayer(doc) {
             finishLoading(PDFTextExtractor.sentences(from: doc))
+        } else if let cached = OCRCache.load(for: item.fileName) {
+            // Кеш найден — открываем мгновенно без OCR.
+            finishLoading(cached)
         } else {
             runOCR(on: doc)
         }
@@ -79,6 +82,8 @@ final class ReaderViewModel: ObservableObject {
             if sentences.isEmpty {
                 loadError = "Не удалось распознать текст на страницах."
             } else {
+                // Сохраняем в кеш — следующее открытие будет мгновенным.
+                OCRCache.save(sentences, for: item.fileName)
                 finishLoading(sentences)
             }
         }

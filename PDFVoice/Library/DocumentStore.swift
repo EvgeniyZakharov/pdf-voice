@@ -60,6 +60,7 @@ final class DocumentStore: ObservableObject {
 
     func delete(_ item: LibraryItem) {
         try? fileManager.removeItem(at: item.fileURL)
+        OCRCache.remove(for: item.fileName)
         items.removeAll { $0.id == item.id }
         save()
     }
