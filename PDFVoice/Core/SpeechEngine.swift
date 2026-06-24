@@ -26,21 +26,30 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     /// Пауза после каждого предложения (секунды). Применяется при следующей постановке в очередь.
     @Published var pauseBetweenSentences: Double = 0.3
 
+    /// Доп. пауза после строки-заголовка — отделяет название главы/раздела от текста.
+    private let headingPause: Double = 0.7
+
     @Published var voice: AVSpeechSynthesisVoice? = SpeechEngine.bestRussianVoice() {
         didSet {
-            guard isSpeaking, voice !== oldValue else { return }
+            guard isSpeaking, voice !== oldValue, sileroServerURL == nil else { return }
             enqueueRemaining(from: currentIndex)
         }
     }
 
     /// Доступные множители скорости (1.0 = обычная речь).
-    static let speedOptions: [Double] = [0.5, 0.75, 1, 1.2, 1.4, 1.6, 1.8, 2, 2.5]
+    /// Диапазон 0.5–2.0 совпадает с допустимым `rate` у AVAudioPlayer (Silero).
+    static let speedOptions: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
     /// Текущая скорость. Меняется сразу: очередь пере-наполняется с текущего места.
     @Published var speed: Double = 1.0 {
         didSet {
             guard speed != oldValue, isSpeaking else { return }
-            enqueueRemaining(from: currentIndex)
+            if sileroServerURL == nil {
+                enqueueRemaining(from: currentIndex)
+            } else {
+                // Silero: меняем темп текущего клипа сразу, следующие читают `speed`.
+                audioPlayer?.rate = Float(speed)
+            }
         }
     }
 
@@ -59,6 +68,8 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     var sileroServerURL: URL? = nil
     /// Голос Silero: aidar / baya / kseniya / xenia / eugene
     var sileroSpeaker: String = "xenia"
+    /// API-ключ для удалённого сервера. Пусто — заголовок не отправляется.
+    var sileroAPIKey: String = ""
 
     private var audioPlayer: AVAudioPlayer?
     private var sileroTask: Task<Void, Never>?
@@ -67,9 +78,39 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     /// Сопоставление поставленного в очередь utterance → индекс предложения.
     private var indexForUtterance: [ObjectIdentifier: Int] = [:]
 
+    private var interruptionObserver: Any?
+
     override init() {
         super.init()
         synthesizer.delegate = self
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAudioInterruption(notification)
+        }
+    }
+
+    deinit {
+        if let token = interruptionObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+    }
+
+    private func handleAudioInterruption(_ notification: Notification) {
+        guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+        switch type {
+        case .began:
+            if isSpeaking { pause() }
+        case .ended:
+            let opts = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                .map(AVAudioSession.InterruptionOptions.init) ?? []
+            if opts.contains(.shouldResume) { resume() }
+        @unknown default:
+            break
+        }
     }
 
     // MARK: - TTSProvider
@@ -78,6 +119,24 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         stop()
         self.sentences = sentences
         currentIndex = clamp(startIndex)
+    }
+
+    func appendSentences(_ newSentences: [Sentence]) {
+        guard !newSentences.isEmpty else { return }
+        let appendStart = sentences.count
+        sentences.append(contentsOf: newSentences)
+
+        guard sileroServerURL == nil else { return }
+        guard synthesizer.isSpeaking || synthesizer.isPaused else { return }
+
+        for i in appendStart..<sentences.count {
+            let utterance = AVSpeechUtterance(string: sentences[i].text)
+            utterance.voice = voice
+            utterance.rate = SpeechEngine.utteranceRate(for: speed)
+            utterance.postUtteranceDelay = pauseBetweenSentences + (sentences[i].isHeading ? headingPause : 0)
+            indexForUtterance[ObjectIdentifier(utterance)] = i
+            synthesizer.speak(utterance)
+        }
     }
 
     func play(from index: Int) {
@@ -135,6 +194,12 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     func skipForward() { play(from: currentIndex + 1) }
     func skipBackward() { play(from: currentIndex - 1) }
 
+    /// Перемещает курсор без запуска воспроизведения — для восстановления позиции после фоновой загрузки.
+    func seekSilent(to index: Int) {
+        guard !isSpeaking else { return }
+        currentIndex = clamp(index)
+    }
+
     // MARK: - Очередь
 
     /// Ставит в очередь синтезатора все предложения, начиная с `start`.
@@ -152,7 +217,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
             let utterance = AVSpeechUtterance(string: sentences[i].text)
             utterance.voice = voice
             utterance.rate = SpeechEngine.utteranceRate(for: speed)
-            utterance.postUtteranceDelay = pauseBetweenSentences
+            utterance.postUtteranceDelay = pauseBetweenSentences + (sentences[i].isHeading ? headingPause : 0)
             indexForUtterance[ObjectIdentifier(utterance)] = i
             synthesizer.speak(utterance)
         }
@@ -175,7 +240,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         let minR = Double(AVSpeechUtteranceMinimumSpeechRate)
         let r = multiplier <= 1
             ? def * multiplier
-            : def + (multiplier - 1) / (2.5 - 1) * (maxR - def)
+            : def + (multiplier - 1) / (2.0 - 1) * (maxR - def)
         return Float(min(max(r, minR), maxR))
     }
 
@@ -192,6 +257,8 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
 extension SpeechEngine {
     private func playSilero(from index: Int) {
+        synthesizer.stopSpeaking(at: .immediate)
+        indexForUtterance.removeAll()
         sileroTask?.cancel()
         audioPlayer?.stop()
         audioPlayer = nil
@@ -200,21 +267,57 @@ extension SpeechEngine {
         }
     }
 
+    /// Проигрывает предложения с предзагрузкой следующего во время текущего.
+    ///
+    /// Сетевой запрос за следующим клипом стартует, пока ещё звучит текущий,
+    /// поэтому между предложениями нет паузы на скачивание. Это критично для
+    /// фонового режима: iOS усыпляет свёрнутое приложение, как только звук
+    /// прекращается, а сетевой запрос через удалённый сервер мог занимать
+    /// секунды тишины — за это время воспроизведение убивалось.
     private func runSileroQueue(from startIndex: Int) async {
+        func prefetch(_ index: Int) -> Task<Data, Error>? {
+            guard sentences.indices.contains(index) else { return nil }
+            let text = sentences[index].text
+            return Task.detached { [weak self] in
+                guard let self else { throw CancellationError() }
+                return try await self.fetchSileroAudio(text)
+            }
+        }
+
         var i = startIndex
+        var pending = prefetch(i)
         while i < sentences.count {
-            guard !Task.isCancelled, isSpeaking else { return }
+            guard !Task.isCancelled, isSpeaking, let current = pending else {
+                pending?.cancel()
+                if isSpeaking { isSpeaking = false }
+                return
+            }
             currentIndex = i
             onIndexChange?(i)
+            let data: Data
             do {
-                let data = try await fetchSileroAudio(sentences[i].text)
-                guard !Task.isCancelled, isSpeaking else { return }
-                try await playAndWait(data)
+                data = try await current.value
             } catch is CancellationError {
                 return
             } catch {
                 isSpeaking = false
                 return
+            }
+            guard !Task.isCancelled, isSpeaking else { return }
+            // Запускаем загрузку следующего предложения ДО проигрывания текущего.
+            pending = prefetch(i + 1)
+            do {
+                let extra = sentences[i].isHeading ? headingPause : 0
+                try await playAndWait(data, extraPause: extra)
+            } catch is CancellationError {
+                pending?.cancel()
+                return
+            } catch {
+                // Данные не сложились в аудио (сервер вернул не-WAV для этого
+                // предложения) — пропускаем его и продолжаем чтение, а не глушим
+                // всю очередь.
+                i += 1
+                continue
             }
             i += 1
         }
@@ -227,17 +330,25 @@ extension SpeechEngine {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !sileroAPIKey.isEmpty {
+            req.setValue(sileroAPIKey, forHTTPHeaderField: "X-API-Key")
+        }
         req.httpBody = try JSONEncoder().encode(SileroRequest(text: text, speaker: sileroSpeaker))
         let (data, _) = try await URLSession.shared.data(for: req)
         return data
     }
 
-    private func playAndWait(_ data: Data) async throws {
+    private func playAndWait(_ data: Data, extraPause: Double = 0) async throws {
         let player = try AVAudioPlayer(data: data)
         self.audioPlayer = player
+        player.enableRate = true
+        player.rate = Float(speed)            // темп воспроизведения Silero-аудио
         player.prepareToPlay()
         player.play()
-        let nanos = UInt64((player.duration + max(0, pauseBetweenSentences)) * 1_000_000_000)
+        // Длительность клипа сокращается пропорционально темпу.
+        let clip = player.duration / Double(max(0.5, speed))
+        let pause = max(0, pauseBetweenSentences) + max(0, extraPause)
+        let nanos = UInt64((clip + pause) * 1_000_000_000)
         try await Task.sleep(nanoseconds: nanos)
     }
 }

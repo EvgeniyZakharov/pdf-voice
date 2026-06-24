@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 
 struct ReaderView: View {
     @EnvironmentObject private var store: DocumentStore
@@ -16,6 +17,7 @@ struct ReaderView: View {
     @State private var showThumbnails = false
     @State private var showBookmarks = false
     @State private var showSleepTimer = false
+    @State private var showPageLoadingBanner = false
 
     init(item: LibraryItem) {
         _model = StateObject(wrappedValue: ReaderViewModel(item: item, store: nil))
@@ -29,6 +31,17 @@ struct ReaderView: View {
             if model.document != nil, pageCount > 1 {
                 Divider()
                 pageBar
+            }
+            if currentPage >= model.loadedPageCount && model.isLoadingRemainingPages {
+                HStack(spacing: 6) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("Страница \(currentPage + 1) ещё загружается…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(Color(.secondarySystemBackground))
             }
             Divider()
             PlayerControls(model: model, showSleepTimer: $showSleepTimer)
@@ -59,8 +72,13 @@ struct ReaderView: View {
             model.attach(store: store)
             model.applySettings(settings)
             model.load()
+            settings.probeSilero()
         }
         .onDisappear { model.endSession() }
+        .onChange(of: settings.selectedVoice)      { _ in model.applySettings(settings) }
+        .onChange(of: settings.sileroServerURL)    { _ in model.applySettings(settings); settings.probeSilero() }
+        .onChange(of: settings.sileroAPIKey)       { _ in model.applySettings(settings) }
+        .onChange(of: settings.speed)              { _ in model.applySettings(settings) }
     }
 
     // MARK: - Тулбар
@@ -75,17 +93,13 @@ struct ReaderView: View {
                 Image(systemName: model.sleepTimer.isActive ? "moon.fill" : "moon")
                     .foregroundStyle(model.sleepTimer.isActive ? Color.indigo : Color.primary)
             }
-            // Закладка
-            Button {
-                model.addBookmark()
-            } label: {
-                Image(systemName: "bookmark")
-            }
-            // Список закладок
+            // Закладки — открывает список; добавление через + внутри листа
+            let hasBookmarkOnPage = model.bookmarks.contains(where: { $0.pageIndex == currentPage })
             Button {
                 showBookmarks = true
             } label: {
-                Image(systemName: "list.bullet")
+                Image(systemName: hasBookmarkOnPage ? "bookmark.fill" : "bookmark")
+                    .foregroundStyle(hasBookmarkOnPage ? Color.accentColor : Color.primary)
             }
             // Голос
             voiceMenu
@@ -130,8 +144,6 @@ struct ReaderView: View {
     private var content: some View {
         if let error = model.loadError {
             infoMessage(icon: "exclamationmark.triangle", text: error)
-        } else if let progress = model.ocrProgress {
-            ocrProgressView(progress)
         } else if let document = model.document {
             ZStack(alignment: .topLeading) {
                 PDFKitView(document: document,
@@ -146,12 +158,28 @@ struct ReaderView: View {
                                    withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
                                }
                            },
-                           onPageChange: { page in currentPage = page })
+                           onPageChange: { page in
+                               currentPage = page
+                               model.updateVisiblePage(page)
+                               if page >= model.loadedPageCount && model.isLoadingRemainingPages {
+                                   model.requestPriorityLoad(pageIndex: page)
+                               }
+                           })
 
                 if let index = pendingIndex {
                     playHereBubble(for: index)
                         .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
                         .transition(.scale.combined(with: .opacity))
+                }
+
+                if currentPage >= model.loadedPageCount && model.isLoadingRemainingPages {
+                    pageLoadingBanner()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                }
+
+                if let progress = model.ocrProgress {
+                    ocrProgressBanner(progress)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 }
             }
         } else {
@@ -163,32 +191,33 @@ struct ReaderView: View {
 
     @ViewBuilder
     private var voiceMenu: some View {
-        let voices = model.speech.availableRussianVoices
         Menu {
-            if voices.isEmpty {
-                Text("Русские голоса не найдены")
-            } else {
-                ForEach(voices, id: \.identifier) { v in
-                    Button {
-                        model.speech.voice = v
-                        settings.voiceIdentifier = v.identifier
-                    } label: {
-                        Label(voiceTitle(v),
-                              systemImage: model.speech.voice?.identifier == v.identifier ? "checkmark" : "")
+            Section("Системные") {
+                ForEach(VoiceCatalog.systemOptions()) { opt in
+                    voiceButton(opt)
+                }
+            }
+            if settings.sileroReachable {
+                Section("Silero · нейросеть") {
+                    ForEach(VoiceCatalog.sileroOptions()) { opt in
+                        voiceButton(opt)
                     }
                 }
             }
         } label: {
             Image(systemName: "person.wave.2")
         }
-        .disabled(voices.isEmpty)
     }
 
-    private func voiceTitle(_ v: AVSpeechSynthesisVoice) -> String {
-        switch v.quality {
-        case .premium:  return v.name + " · Premium"
-        case .enhanced: return v.name + " · Enhanced"
-        default:        return v.name
+    private func voiceButton(_ opt: VoiceOption) -> some View {
+        Button {
+            settings.selectedVoice = opt.id
+        } label: {
+            if settings.selectedVoice == opt.id {
+                Label(opt.title, systemImage: "checkmark")
+            } else {
+                Text(opt.title)
+            }
         }
     }
 
@@ -210,15 +239,27 @@ struct ReaderView: View {
         .buttonStyle(.plain)
     }
 
-    private func ocrProgressView(_ progress: Double) -> some View {
-        VStack(spacing: 16) {
-            ProgressView(value: progress).frame(maxWidth: 220)
+    private func pageLoadingBanner() -> some View {
+        Label("Загружается аудио для этой страницы…", systemImage: "waveform")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.bottom, 12)
+    }
+
+    private func ocrProgressBanner(_ progress: Double) -> some View {
+        VStack(spacing: 6) {
+            ProgressView(value: progress)
             Text("Распознаём текст… \(Int(progress * 100))%")
-                .font(.subheadline).foregroundStyle(.secondary)
-            Text("Это скан — извлекаем текст для озвучки.")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
     }
 
     private func infoMessage(icon: String, text: String) -> some View {
@@ -262,27 +303,30 @@ private struct PlayerControls: View {
                     .foregroundStyle(.secondary)
             }
 
-            HStack(spacing: 40) {
-                Button { speech.skipBackward() } label: {
-                    Image(systemName: "backward.fill").font(.title2)
+            ZStack {
+                // Транспорт по центру экрана.
+                HStack(spacing: 40) {
+                    Button { speech.skipBackward() } label: {
+                        Image(systemName: "backward.fill").font(.title2)
+                    }
+                    Button { model.togglePlayPause() } label: {
+                        Image(systemName: speech.isSpeaking ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 52))
+                    }
+                    Button { speech.skipForward() } label: {
+                        Image(systemName: "forward.fill").font(.title2)
+                    }
                 }
-                Button { model.togglePlayPause() } label: {
-                    Image(systemName: speech.isSpeaking ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 52))
-                }
-                Button { speech.skipForward() } label: {
-                    Image(systemName: "forward.fill").font(.title2)
-                }
-            }
-
-            HStack(spacing: 12) {
-                speedMenu
-                Spacer()
-                if sleepTimer.isActive {
-                    Button { showSleepTimer = true } label: {
-                        Label(sleepTimer.remainingFormatted, systemImage: "moon.fill")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.indigo)
+                // Скорость слева, таймер сна справа — на одном уровне с play.
+                HStack {
+                    speedMenu
+                    Spacer()
+                    if sleepTimer.isActive {
+                        Button { showSleepTimer = true } label: {
+                            Label(sleepTimer.remainingFormatted, systemImage: "moon.fill")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.indigo)
+                        }
                     }
                 }
             }
@@ -305,12 +349,12 @@ private struct PlayerControls: View {
                 }
             }
         } label: {
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 Image(systemName: "speedometer")
-                Text("Скорость \(ReaderView.speedLabel(speech.speed))")
+                Text(ReaderView.speedLabel(speech.speed))
             }
             .font(.subheadline.weight(.medium))
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(Color(.secondarySystemBackground), in: Capsule())
         }

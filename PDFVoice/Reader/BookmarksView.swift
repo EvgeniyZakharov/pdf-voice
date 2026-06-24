@@ -1,8 +1,10 @@
 import SwiftUI
+import UIKit
 
 struct BookmarksView: View {
     @ObservedObject var model: ReaderViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var bookmarkAdded = false
 
     var body: some View {
         NavigationStack {
@@ -14,7 +16,7 @@ struct BookmarksView: View {
                             .foregroundStyle(.secondary)
                         Text("Закладок нет")
                             .font(.headline)
-                        Text("Нажмите  в читалке, чтобы добавить.")
+                        Text("Нажмите + чтобы добавить закладку.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -34,7 +36,7 @@ struct BookmarksView: View {
                                         .lineLimit(2)
                                         .foregroundStyle(.primary)
                                     HStack {
-                                        Text("Стр. \(bm.pageIndex + 1)")
+                                        Text("Страница \(bm.pageIndex + 1)")
                                         Spacer()
                                         Text(bm.createdAt.formatted(date: .abbreviated, time: .shortened))
                                     }
@@ -52,6 +54,22 @@ struct BookmarksView: View {
             .navigationTitle("Закладки")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        if model.addBookmark() {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            withAnimation(.spring(response: 0.2, dampingFraction: 0.5)) {
+                                bookmarkAdded = true
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                                withAnimation { bookmarkAdded = false }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: bookmarkAdded ? "checkmark" : "plus")
+                            .animation(.easeInOut(duration: 0.15), value: bookmarkAdded)
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Готово") { dismiss() }
                 }

@@ -1,11 +1,14 @@
 import io
+import os
 import wave
 import asyncio
+import secrets
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -15,6 +18,21 @@ executor = ThreadPoolExecutor(max_workers=1)
 SAMPLE_RATE = 24000
 SPEAKERS = ["aidar", "baya", "kseniya", "xenia", "eugene"]
 
+# API-ключ для удалённого доступа. Если переменная не задана — авторизации нет
+# (режим localhost). Для туннеля в интернет ЗАДАЙ её: export SILERO_API_KEY=...
+API_KEY = os.environ.get("SILERO_API_KEY", "").strip()
+if API_KEY:
+    print("Авторизация включена (X-API-Key).")
+else:
+    print("ВНИМАНИЕ: SILERO_API_KEY не задан — сервер открыт без авторизации.")
+
+
+def _check_key(provided: Optional[str]) -> None:
+    if not API_KEY:
+        return
+    if not provided or not secrets.compare_digest(provided, API_KEY):
+        raise HTTPException(401, "invalid or missing X-API-Key")
+
 print("Загрузка модели Silero (первый запуск скачает ~200MB)...")
 model, _ = torch.hub.load(
     repo_or_dir="snakers4/silero-models",
@@ -22,7 +40,6 @@ model, _ = torch.hub.load(
     language="ru",
     speaker="v3_1_ru",
 )
-model.eval()
 print("Модель загружена. Сервер готов.")
 
 
@@ -31,10 +48,7 @@ class TTSRequest(BaseModel):
     speaker: str = "xenia"
 
 
-def _synthesize(text: str, speaker: str) -> bytes:
-    with torch.no_grad():
-        audio = model.apply_tts(text=text, speaker=speaker, sample_rate=SAMPLE_RATE)
-    pcm = (audio.numpy() * 32767).astype(np.int16)
+def _wav_bytes(pcm: np.ndarray) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
@@ -44,8 +58,30 @@ def _synthesize(text: str, speaker: str) -> bytes:
     return buf.getvalue()
 
 
+def _silence(seconds: float = 0.12) -> bytes:
+    return _wav_bytes(np.zeros(int(SAMPLE_RATE * seconds), dtype=np.int16))
+
+
+def _synthesize(text: str, speaker: str) -> bytes:
+    # Silero падает на тексте без букв (чистые номера разделов «2.1», «§ 4»).
+    # Такие подзаголовки незачем озвучивать — отдаём короткую тишину, чтобы
+    # очередь чтения не прерывалась.
+    if not any(ch.isalpha() for ch in text):
+        return _silence()
+    try:
+        with torch.no_grad():
+            audio = model.apply_tts(text=text, speaker=speaker, sample_rate=SAMPLE_RATE)
+        pcm = (audio.numpy() * 32767).astype(np.int16)
+        return _wav_bytes(pcm)
+    except Exception as exc:
+        # Любой сбой синтеза не должен ронять воспроизведение на клиенте.
+        print(f"Синтез не удался для {text!r}: {exc}")
+        return _silence()
+
+
 @app.post("/synthesize")
-async def synthesize(req: TTSRequest):
+async def synthesize(req: TTSRequest, x_api_key: Optional[str] = Header(default=None)):
+    _check_key(x_api_key)
     if not req.text.strip():
         raise HTTPException(400, "text is empty")
     if req.speaker not in SPEAKERS:

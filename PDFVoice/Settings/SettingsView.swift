@@ -5,10 +5,6 @@ struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
 
-    private let voices = AVSpeechSynthesisVoice.speechVoices()
-        .filter { $0.language == "ru-RU" }
-        .sorted { $0.quality.rawValue > $1.quality.rawValue }
-
     private let pauseOptions: [(String, Double)] = [
         ("Нет", 0), ("0.3 с", 0.3), ("0.5 с", 0.5), ("1 с", 1.0), ("1.5 с", 1.5)
     ]
@@ -16,31 +12,39 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Голос") {
-                    if voices.isEmpty {
-                        Text("Русские голоса не найдены")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(voices, id: \.identifier) { v in
-                            Button {
-                                settings.voiceIdentifier = v.identifier
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(v.name).foregroundStyle(.primary)
-                                        Text(qualityLabel(v))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if settings.voiceIdentifier == v.identifier {
-                                        Image(systemName: "checkmark")
-                                            .foregroundStyle(.tint)
-                                    }
+                Section("Оформление") {
+                    Picker("Тема", selection: $settings.appearance) {
+                        ForEach(AppAppearance.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                }
+
+                Section {
+                    ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable)) { opt in
+                        Button {
+                            settings.selectedVoice = opt.id
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.title).foregroundStyle(.primary)
+                                    Text(opt.subtitle)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if settings.selectedVoice == opt.id {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
                                 }
                             }
                         }
                     }
+                } header: {
+                    Text("Голос")
+                } footer: {
+                    Text(settings.sileroReachable
+                         ? "Голоса Silero доступны — сервер подключён."
+                         : "Голоса Silero появятся, когда подключится сервер (см. ниже).")
                 }
 
                 Section("Скорость по умолчанию") {
@@ -77,31 +81,37 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("Silero TTS (нейросеть)", isOn: $settings.useSilero)
-                    if settings.useSilero {
-                        HStack {
-                            Text("Адрес сервера")
-                            Spacer()
-                            TextField("http://localhost:8000", text: $settings.sileroServerURL)
-                                .multilineTextAlignment(.trailing)
-                                .foregroundStyle(.secondary)
-                                .autocorrectionDisabled()
-                                .textInputAutocapitalization(.never)
-                        }
-                        Picker("Голос", selection: $settings.sileroSpeaker) {
-                            Text("Ксения").tag("kseniya")
-                            Text("Ксения 2").tag("xenia")
-                            Text("Айдар").tag("aidar")
-                            Text("Байя").tag("baya")
-                            Text("Евгений").tag("eugene")
-                        }
+                    HStack {
+                        Text("Адрес сервера")
+                        Spacer()
+                        TextField("http://localhost:8000", text: $settings.sileroServerURL)
+                            .multilineTextAlignment(.trailing)
+                            .foregroundStyle(.secondary)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                    }
+                    HStack {
+                        Text("API-ключ")
+                        Spacer()
+                        SecureField("необязательно", text: $settings.sileroAPIKey)
+                            .multilineTextAlignment(.trailing)
+                            .foregroundStyle(.secondary)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                    }
+                    HStack {
+                        Label(settings.sileroReachable ? "Сервер подключён" : "Сервер недоступен",
+                              systemImage: settings.sileroReachable ? "checkmark.circle.fill" : "xmark.circle")
+                            .foregroundStyle(settings.sileroReachable ? .green : .secondary)
+                            .font(.subheadline)
+                        Spacer()
+                        Button("Проверить") { settings.probeSilero() }
+                            .font(.subheadline)
                     }
                 } header: {
-                    Text("Нейросетевой голос")
+                    Text("Сервер Silero")
                 } footer: {
-                    if settings.useSilero {
-                        Text("Запустите silero-server/start.sh на Mac перед использованием.")
-                    }
+                    Text("Локально: запустите silero-server/start.sh. Удалённо: укажите HTTPS-адрес туннеля и API-ключ из silero-server/.api_key. Голоса Silero появятся в списке выше при успешном подключении.")
                 }
 
                 Section {
@@ -126,14 +136,9 @@ struct SettingsView: View {
                     Button("Готово") { dismiss() }
                 }
             }
+            .onAppear { settings.probeSilero() }
         }
-    }
-
-    private func qualityLabel(_ v: AVSpeechSynthesisVoice) -> String {
-        switch v.quality {
-        case .premium:  return "Premium"
-        case .enhanced: return "Enhanced"
-        default:        return "Стандартный"
-        }
+        // Применяем тему внутри листа, иначе смена видна только после переоткрытия.
+        .preferredColorScheme(settings.appearance.colorScheme)
     }
 }

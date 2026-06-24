@@ -8,17 +8,23 @@ import Vision
 /// Возвращает предложения с боксами строк в координатах страницы — для подсветки.
 enum OCRTextExtractor {
 
-    /// Распознаёт весь документ. `progress(done, total)` вызывается на главном потоке.
+    /// Распознаёт документ. `progress(done, total)` вызывается на главном потоке.
     static func sentences(from document: PDFDocument,
+                          pageRange: Range<Int>? = nil,
                           progress: @escaping (Int, Int) -> Void) async -> [Sentence] {
         let pageCount = document.pageCount
         guard pageCount > 0 else { return [] }
 
+        let range = pageRange ?? (0..<pageCount)
+        guard !range.isEmpty else { return [] }
+
         var result: [Sentence] = []
         let tokenizer = NLTokenizer(unit: .sentence)
 
-        for pi in 0..<pageCount {
-            defer { let done = pi + 1; Task { @MainActor in progress(done, pageCount) } }
+        for pi in range {
+            let done = pi - range.lowerBound + 1
+            let total = range.count
+            defer { Task { @MainActor in progress(done, total) } }
             guard let page = document.page(at: pi) else { continue }
             let pageRect = page.bounds(for: .mediaBox)
             guard let observations = await recognize(page: page, pageRect: pageRect),
