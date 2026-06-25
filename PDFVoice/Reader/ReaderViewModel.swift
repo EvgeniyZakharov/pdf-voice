@@ -316,7 +316,8 @@ final class ReaderViewModel: ObservableObject {
         ocrProgress = Double(startPage) / Double(totalPageCount)
         let fileName = item.fileName
 
-        Task {
+        backgroundTask?.cancel()
+        backgroundTask = Task {
             let initialCount = min(startPage + 15, totalPageCount)
 
             if startPage < initialCount {
@@ -352,28 +353,38 @@ final class ReaderViewModel: ObservableObject {
 
                 isLoadingRemainingPages = true
 
+                // Остаток обрабатываем батчами: предложения добавляем в плеер И
+                // двигаем loadedPageCount ВМЕСТЕ — страница «открывается» только
+                // когда её аудио реально в speech.sentences. Иначе пользователь
+                // видит готовую страницу, но не может её слушать.
                 var allSentences = allInitial
-                let rest = await OCRTextExtractor.sentences(
-                    from: doc,
-                    pageRange: initialCount..<totalPageCount
-                ) { [weak self] done, total in
-                    let overall = 0.2 + Double(initialCount + done) / Double(totalPageCount)
-                    self?.ocrProgress = min(overall, 0.99)
-                    self?.loadedPageCount = initialCount + done
+                var batchStart = initialCount
+                let batchSize = 15
+                while batchStart < totalPageCount {
+                    if Task.isCancelled { return }
+                    let batchEnd = min(batchStart + batchSize, totalPageCount)
+                    let captureStart = batchStart
+                    let batch = await OCRTextExtractor.sentences(
+                        from: doc,
+                        pageRange: batchStart..<batchEnd
+                    ) { [weak self] done, _ in
+                        let overall = 0.2 + Double(captureStart + done) / Double(totalPageCount) * 0.8
+                        self?.ocrProgress = min(overall, 0.99)
+                    }
+                    if Task.isCancelled { return }
+                    allSentences.append(contentsOf: batch)
+                    speech.appendSentences(batch)   // сначала аудио в плеер...
+                    loadedPageCount = batchEnd       // ...потом показываем страницы (в синхроне)
+                    SentencePageCache.save(sentences: allSentences,
+                                          loadedPageCount: batchEnd,
+                                          totalPageCount: totalPageCount, for: fileName)
+                    batchStart = batchEnd
                 }
 
                 ocrProgress = nil
-                allSentences.append(contentsOf: rest)
-
+                isLoadingRemainingPages = false
                 if allSentences.isEmpty {
                     loadError = "Не удалось распознать текст на страницах."
-                } else {
-                    SentencePageCache.save(sentences: allSentences,
-                                          loadedPageCount: totalPageCount,
-                                          totalPageCount: totalPageCount, for: fileName)
-                    speech.appendSentences(rest)
-                    loadedPageCount = totalPageCount
-                    isLoadingRemainingPages = false
                 }
             }
         }
