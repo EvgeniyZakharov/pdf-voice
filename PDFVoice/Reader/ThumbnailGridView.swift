@@ -2,9 +2,12 @@ import PDFKit
 import SwiftUI
 
 /// Постраничный листинг: сетка миниатюр всех страниц. Тап → переход.
+/// Страницы с index >= readyPageCount ещё не обработаны — показываем плейсхолдер,
+/// рендер миниатюры не запрашивается, тап игнорируется.
 struct ThumbnailGridView: View {
     let document: PDFDocument
     let currentPage: Int
+    let readyPageCount: Int
     let onSelect: (Int) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -12,9 +15,11 @@ struct ThumbnailGridView: View {
 
     private let columns = [GridItem(.adaptive(minimum: 100), spacing: 16)]
 
-    init(document: PDFDocument, currentPage: Int, onSelect: @escaping (Int) -> Void) {
+    init(document: PDFDocument, currentPage: Int, readyPageCount: Int,
+         onSelect: @escaping (Int) -> Void) {
         self.document = document
         self.currentPage = currentPage
+        self.readyPageCount = readyPageCount
         self.onSelect = onSelect
         _provider = StateObject(wrappedValue:
             ThumbnailProvider(document: document, size: CGSize(width: 200, height: 280)))
@@ -26,15 +31,20 @@ struct ThumbnailGridView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(0..<document.pageCount, id: \.self) { index in
-                            ThumbnailCell(index: index,
-                                          isCurrent: index == currentPage,
-                                          provider: provider)
-                                .id(index)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    onSelect(index)
-                                    dismiss()
-                                }
+                            if index < readyPageCount {
+                                ThumbnailCell(index: index,
+                                              isCurrent: index == currentPage,
+                                              provider: provider)
+                                    .id(index)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        onSelect(index)
+                                        dismiss()
+                                    }
+                            } else {
+                                ThumbnailPlaceholder(index: index)
+                                    .id(index)
+                            }
                         }
                     }
                     .padding()
@@ -85,6 +95,37 @@ private struct ThumbnailCell: View {
         }
         .task(id: index) {
             if image == nil { image = await provider.thumbnail(for: index) }
+        }
+    }
+}
+
+/// Ячейка-заглушка для страниц, аудио которых ещё не готово.
+private struct ThumbnailPlaceholder: View {
+    let index: Int
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack {
+                Rectangle()
+                    .fill(Color(.secondarySystemBackground))
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.9)
+                    Text("загружается")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 100, height: 140)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color(.separator), lineWidth: 0.5)
+            }
+
+            Text("\(index + 1)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
         }
     }
 }

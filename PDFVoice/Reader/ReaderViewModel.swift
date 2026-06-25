@@ -12,7 +12,13 @@ final class ReaderViewModel: ObservableObject {
     @Published private(set) var bookmarks: [Bookmark] = []
     @Published private(set) var currentVisiblePage: Int = 0
     @Published private(set) var isLoadingRemainingPages = false
-    @Published private(set) var loadedPageCount: Int = 0
+    @Published private(set) var loadedPageCount: Int = 0 {
+        didSet { revealPages(upTo: loadedPageCount) }
+    }
+
+    /// Растущий документ: содержит только страницы [0, loadedPageCount).
+    /// PDFKitView показывает его — пользователь не может прокрутить на неготовую страницу.
+    let displayDocument = PDFDocument()
 
     let speech = SpeechEngine()
     let sleepTimer = SleepTimer()
@@ -23,6 +29,8 @@ final class ReaderViewModel: ObservableObject {
     private var nowPlaying: NowPlayingController?
     private var totalPageCount: Int = 0
     private var backgroundTask: Task<Void, Never>?
+    /// Полный исходный документ — источник страниц для displayDocument.
+    private var sourceDoc: PDFDocument?
 
     // Тип документа, устанавливается при load() однократно.
     private enum DocumentMode { case text, ocr, mixed }
@@ -77,6 +85,23 @@ final class ReaderViewModel: ObservableObject {
 
     func updateVisiblePage(_ page: Int) { currentVisiblePage = page }
 
+    /// Полное число страниц в исходном документе (включая ещё не загруженные).
+    var totalPages: Int { totalPageCount }
+
+    // MARK: - Растущий документ
+
+    /// Добавляет в displayDocument страницы вплоть до n-й (не включая),
+    /// копируя их из sourceDoc. Вызывается только с main thread (@MainActor).
+    private func revealPages(upTo n: Int) {
+        guard let src = sourceDoc else { return }
+        let target = min(n, src.pageCount)
+        while displayDocument.pageCount < target {
+            let i = displayDocument.pageCount
+            guard let p = src.page(at: i)?.copy() as? PDFPage else { break }
+            displayDocument.insert(p, at: i)
+        }
+    }
+
     // MARK: - Загрузка
 
     func load() {
@@ -85,6 +110,7 @@ final class ReaderViewModel: ObservableObject {
             return
         }
         totalPageCount = doc.pageCount
+        sourceDoc = doc
 
         // Дешёвая классификация — только плотность букв (page.string), без рендера thumbnail.
         // textDensityKind возвращает только .text или .ocr; .skip не выставляется здесь.

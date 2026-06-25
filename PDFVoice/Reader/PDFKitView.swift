@@ -14,6 +14,9 @@ struct PageJump: Equatable {
 /// страницы, а также выполняет команды перехода (скраббер/миниатюры).
 struct PDFKitView: UIViewRepresentable {
     let document: PDFDocument
+    /// Число готовых страниц в displayDocument (совпадает с document.pageCount,
+    /// но передаётся явно, чтобы updateUIView мог отреагировать на рост).
+    var readyPageCount: Int
     /// Текущее озвучиваемое предложение (для подсветки и авто-прокрутки).
     var highlight: Sentence?
     /// Все предложения — для хит-теста тапа.
@@ -56,6 +59,12 @@ struct PDFKitView: UIViewRepresentable {
         if view.document !== document {
             view.document = document
             context.coordinator.lastSentenceID = nil
+            context.coordinator.lastReadyCount = readyPageCount
+        } else if readyPageCount != context.coordinator.lastReadyCount {
+            // displayDocument получил новые страницы — сообщаем PDFView перерисовать
+            // без сброса позиции прокрутки.
+            context.coordinator.lastReadyCount = readyPageCount
+            view.layoutDocumentView()
         }
 
         // Команда перехода на страницу (скраббер/миниатюры) — приоритетнее подсветки.
@@ -100,6 +109,7 @@ struct PDFKitView: UIViewRepresentable {
         weak var pdfView: PDFView?
         var lastSentenceID: UUID?
         var lastJumpToken: Int = -1
+        var lastReadyCount: Int = 0
         /// Текущие подсветки-аннотации для OCR-страниц (чтобы снять при смене предложения).
         var ocrAnnotations: [(PDFPage, PDFAnnotation)] = []
 

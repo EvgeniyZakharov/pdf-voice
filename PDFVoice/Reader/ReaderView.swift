@@ -17,13 +17,13 @@ struct ReaderView: View {
     @State private var showThumbnails = false
     @State private var showBookmarks = false
     @State private var showSleepTimer = false
-    @State private var showPageLoadingBanner = false
 
     init(item: LibraryItem) {
         _model = StateObject(wrappedValue: ReaderViewModel(item: item, store: nil))
     }
 
-    private var pageCount: Int { model.document?.pageCount ?? 0 }
+    /// Скраббер и pageBar работают по числу готовых страниц.
+    private var pageCount: Int { model.loadedPageCount }
 
     /// Аудио готово к воспроизведению — есть хотя бы одно предложение.
     /// То же условие, по которому активна кнопка Play. Пока false — показываем
@@ -34,20 +34,9 @@ struct ReaderView: View {
         VStack(spacing: 0) {
             content
             if audioReady {
-                if model.document != nil, pageCount > 1 {
+                if pageCount > 1 {
                     Divider()
                     pageBar
-                }
-                if currentPage >= model.loadedPageCount && model.isLoadingRemainingPages {
-                    HStack(spacing: 6) {
-                        ProgressView().scaleEffect(0.8)
-                        Text("Страница \(currentPage + 1) ещё загружается…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(Color(.secondarySystemBackground))
                 }
                 Divider()
                 PlayerControls(model: model, showSleepTimer: $showSleepTimer)
@@ -57,7 +46,9 @@ struct ReaderView: View {
         .toolbar { toolbarItems }
         .sheet(isPresented: $showThumbnails) {
             if let document = model.document {
-                ThumbnailGridView(document: document, currentPage: currentPage) { requestJump(to: $0) }
+                ThumbnailGridView(document: document,
+                                  currentPage: currentPage,
+                                  readyPageCount: model.loadedPageCount) { requestJump(to: $0) }
             }
         }
         .sheet(isPresented: $showBookmarks) {
@@ -124,10 +115,17 @@ struct ReaderView: View {
                 isScrubbing = editing
                 if !editing { requestJump(to: Int(scrubValue) - 1) }
             }
-            Text("\(Int(scrubValue))/\(pageCount)")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(minWidth: 56, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("\(Int(scrubValue))/\(pageCount)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if model.totalPages > pageCount {
+                    Text("из \(model.totalPages)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(minWidth: 56, alignment: .trailing)
         }
         .padding(.horizontal)
         .padding(.vertical, 6)
@@ -151,9 +149,10 @@ struct ReaderView: View {
     private var content: some View {
         if let error = model.loadError {
             infoMessage(icon: "exclamationmark.triangle", text: error)
-        } else if let document = model.document, audioReady {
+        } else if audioReady {
             ZStack(alignment: .topLeading) {
-                PDFKitView(document: document,
+                PDFKitView(document: model.displayDocument,
+                           readyPageCount: model.loadedPageCount,
                            highlight: model.currentSentence,
                            sentences: model.speech.sentences,
                            pageJump: pageJump,
@@ -168,20 +167,12 @@ struct ReaderView: View {
                            onPageChange: { page in
                                currentPage = page
                                model.updateVisiblePage(page)
-                               if page >= model.loadedPageCount && model.isLoadingRemainingPages {
-                                   model.requestPriorityLoad(pageIndex: page)
-                               }
                            })
 
                 if let index = pendingIndex {
                     playHereBubble(for: index)
                         .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
                         .transition(.scale.combined(with: .opacity))
-                }
-
-                if currentPage >= model.loadedPageCount && model.isLoadingRemainingPages {
-                    pageLoadingBanner()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 }
 
                 if let progress = model.ocrProgress {
@@ -268,16 +259,6 @@ struct ReaderView: View {
                 .shadow(radius: 4, y: 2)
         }
         .buttonStyle(.plain)
-    }
-
-    private func pageLoadingBanner() -> some View {
-        Label("Загружается аудио для этой страницы…", systemImage: "waveform")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: Capsule())
-            .padding(.bottom, 12)
     }
 
     private func ocrProgressBanner(_ progress: Double) -> some View {
