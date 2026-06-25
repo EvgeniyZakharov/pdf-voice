@@ -194,9 +194,11 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
     private let profile: any LanguageProfile = RussianProfile()
 
-    private func render(_ s: Sentence) -> String {
-        let r = profile.expandForSpeech(s.rawText)
-        return r.isEmpty ? " " : r
+    private func render(_ s: Sentence) -> SpokenMarkup {
+        let m = profile.render(s.rawText)
+        return m.text.trimmingCharacters(in: .whitespaces).isEmpty
+            ? SpokenMarkup(text: " ", stresses: [])
+            : m
     }
 
     // MARK: - Вспомогательные

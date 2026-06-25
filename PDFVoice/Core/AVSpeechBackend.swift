@@ -26,7 +26,7 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     private var currentSentences: [Sentence] = []
     private var currentSpeed: Double = 1.0
     private var lastStartedIndex: Int = 0
-    private var currentRender: ((Sentence) -> String)?
+    private var currentRender: ((Sentence) -> SpokenMarkup)?
 
     override init() {
         super.init()
@@ -39,7 +39,7 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     // MARK: - SpeechBackend
 
     func play(sentences: [Sentence], from index: Int,
-              speed: Double, render: @escaping (Sentence) -> String) {
+              speed: Double, render: @escaping (Sentence) -> SpokenMarkup) {
         currentSentences = sentences
         currentSpeed = speed
         currentRender = render
@@ -47,7 +47,7 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         enqueue(from: index)
     }
 
-    func append(sentences: [Sentence], render: @escaping (Sentence) -> String) {
+    func append(sentences: [Sentence], render: @escaping (Sentence) -> SpokenMarkup) {
         guard !sentences.isEmpty else { return }
         guard synthesizer.isSpeaking || synthesizer.isPaused else { return }
         currentSentences.append(contentsOf: sentences)
@@ -101,9 +101,10 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         }
     }
 
-    private func enqueueOne(index: Int, render: (Sentence) -> String) {
+    private func enqueueOne(index: Int, render: (Sentence) -> SpokenMarkup) {
         let s = currentSentences[index]
-        let utterance = AVSpeechUtterance(string: render(s))
+        // AVSpeech ignores stress marks (Milena doesn't honour U+0301); use plain text only.
+        let utterance = AVSpeechUtterance(string: render(s).text)
         utterance.voice = voice
         utterance.rate = SpeechEngine.utteranceRate(for: currentSpeed)
         // headingPause: дополнительная пауза после заголовка главы/раздела.

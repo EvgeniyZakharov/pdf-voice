@@ -18,4 +18,9 @@ protocol LanguageProfile {
     /// непосредственно перед постановкой предложения в очередь синтезатора.
     /// Не влияет на диапазон подсветки.
     func expandForSpeech(_ sentence: String) -> String
+
+    /// Раскрывает текст через `expandForSpeech`, затем вычисляет UTF-16 смещения
+    /// ударных гласных для слов из словаря ударений.
+    /// AVSpeech-backend использует только `text`; Silero-backend вставляет «+» по `stresses`.
+    func render(_ raw: String) -> SpokenMarkup
 }

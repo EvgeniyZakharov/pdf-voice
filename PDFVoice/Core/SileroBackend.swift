@@ -24,7 +24,7 @@ final class SileroBackend: SpeechBackend {
     // MARK: - SpeechBackend
 
     func play(sentences: [Sentence], from index: Int,
-              speed: Double, render: @escaping (Sentence) -> String) {
+              speed: Double, render: @escaping (Sentence) -> SpokenMarkup) {
         stop()
         currentSentences = sentences
         currentSpeed = speed
@@ -32,7 +32,7 @@ final class SileroBackend: SpeechBackend {
         startQueue(from: index)
     }
 
-    func append(sentences: [Sentence], render: @escaping (Sentence) -> String) {
+    func append(sentences: [Sentence], render: @escaping (Sentence) -> SpokenMarkup) {
         guard !sentences.isEmpty else { return }
         currentSentences.append(contentsOf: sentences)
         currentRender = render
@@ -66,7 +66,7 @@ final class SileroBackend: SpeechBackend {
 
     private var currentSentences: [Sentence] = []
     private var currentSpeed: Double = 1.0
-    private var currentRender: ((Sentence) -> String)?
+    private var currentRender: ((Sentence) -> SpokenMarkup)?
 
     private func startQueue(from index: Int) {
         sileroTask = Task { [weak self] in
@@ -76,11 +76,25 @@ final class SileroBackend: SpeechBackend {
 
     // MARK: - Очередь с предзагрузкой
 
+    /// Вставляет «+» ПОСЛЕ каждой ударной гласной по UTF-16 смещениям из SpokenMarkup.
+    /// Вставка идёт с конца к началу, чтобы ранее вычисленные смещения не съезжали.
+    private static func applyStresses(_ markup: SpokenMarkup) -> String {
+        guard !markup.stresses.isEmpty else { return markup.text }
+        var utf16 = Array(markup.text.utf16)
+        let plus = "+".utf16.first!
+        for offset in markup.stresses.reversed() {
+            guard offset >= 0 && offset < utf16.count else { continue }
+            utf16.insert(plus, at: offset + 1)
+        }
+        return String(decoding: utf16, as: UTF16.self)
+    }
+
     private func runQueue(from startIndex: Int) async {
         func prefetch(_ index: Int) -> Task<Data, Error>? {
             guard currentSentences.indices.contains(index),
                   let render = currentRender else { return nil }
-            let text = render(currentSentences[index])
+            let markup = render(currentSentences[index])
+            let text = SileroBackend.applyStresses(markup)
             return Task.detached { [weak self] in
                 guard let self else { throw CancellationError() }
                 return try await self.fetchAudio(text)
