@@ -5,26 +5,30 @@ import PDFKit
 /// Одно предложение для озвучки + привязка к месту в PDF (для подсветки и авто-прокрутки).
 struct Sentence: Identifiable {
     let id = UUID()
-    /// Очищенный текст для синтезатора.
-    let text: String
+    /// Очищенный «сырой» текст — без раскрытия аббревиатур/чисел.
+    /// `RussianProfile.expandForSpeech` применяется при постановке в очередь синтезатора,
+    /// поэтому кэш хранит оригинал и улучшения лингвистики не инвалидируют его.
+    let rawText: String
     let pageIndex: Int
     /// Диапазон в исходной строке страницы (`PDFPage.string`) — для текстового слоя,
     /// подсветка через `page.selection(for:)`. nil для OCR-страниц.
     let range: NSRange?
     /// Боксы строк в координатах страницы — для OCR-страниц (подсветка аннотациями).
     let boxes: [CGRect]
-    /// Похоже ли предложение на заголовок главы/раздела. Вычисляется из «сырого»
-    /// текста (с цифрами) ДО раскрытия чисел словами, иначе детект «Глава 5»
-    /// перестал бы срабатывать. Хранится, чтобы пережить запись в кэш.
+    /// Похоже ли предложение на заголовок главы/раздела. Вычисляется из `rawText`
+    /// ДО раскрытия чисел словами, иначе детект «Глава 5» перестал бы срабатывать.
     let isHeading: Bool
+    /// Язык предложения — передаётся в кэш для возможного использования синтезатором.
+    let language: String
 
-    init(text: String, pageIndex: Int, range: NSRange? = nil, boxes: [CGRect] = [],
-         isHeading: Bool = false) {
-        self.text = text
+    init(rawText: String, pageIndex: Int, range: NSRange? = nil, boxes: [CGRect] = [],
+         isHeading: Bool = false, language: String = "ru") {
+        self.rawText = rawText
         self.pageIndex = pageIndex
         self.range = range
         self.boxes = boxes
         self.isHeading = isHeading
+        self.language = language
     }
 }
 
@@ -32,11 +36,13 @@ struct Sentence: Identifiable {
 /// OCR для сканов появится в M3; здесь — только текстовый слой (PDFKit).
 enum PDFTextExtractor {
 
+    private static let profile: any LanguageProfile = RussianProfile()
+
     /// Разбивает документ на предложения постранично.
     ///
     /// Конвейер: исходный текст страницы → строки → выброс колонтитулов/номеров
-    /// (`TextNormalizer`) → склейка в чистый текст с картой смещений → токенизация
-    /// предложений (`NLTokenizer`, кириллица) → раскрытие аббревиатур для озвучки.
+    /// (`TextPipeline`) → склейка в чистый текст с картой смещений → токенизация
+    /// предложений (`RussianProfile.sentenceRanges`) → раскрытие аббревиатур для озвучки.
     /// Диапазон каждого предложения маппится обратно в координаты исходной строки,
     /// чтобы `PDFPage.selection(for:)` корректно подсвечивал многострочные фрагменты.
     static func sentences(from document: PDFDocument) -> [Sentence] {
@@ -44,47 +50,43 @@ enum PDFTextExtractor {
         guard pageCount > 0 else { return [] }
 
         // 1. Строки всех страниц (для кросс-страничного детекта колонтитулов).
-        var allLines: [[TextNormalizer.PageLine]] = []
+        var allLines: [[TextPipeline.PageLine]] = []
         allLines.reserveCapacity(pageCount)
         for pi in 0..<pageCount {
             let raw = document.page(at: pi)?.string ?? ""
-            allLines.append(TextNormalizer.lines(of: raw))
+            allLines.append(TextPipeline.lines(of: raw))
         }
-        let boilerplate = TextNormalizer.detectBoilerplate(pages: allLines, pageCount: pageCount)
+        let boilerplate = TextPipeline.detectBoilerplate(pages: allLines, pageCount: pageCount)
 
         // 2. Чистка + токенизация постранично.
         var result: [Sentence] = []
-        let tokenizer = NLTokenizer(unit: .sentence)
 
         for pi in 0..<pageCount {
             let lines = allLines[pi]
             guard !lines.isEmpty else { continue }
 
-            let dropped = TextNormalizer.droppedIndices(lines: lines, boilerplate: boilerplate)
-            let (cleaned, origIndex) = TextNormalizer.cleanPage(lines, dropped: dropped)
+            let dropped = TextPipeline.droppedIndices(lines: lines, boilerplate: boilerplate)
+            let (cleaned, origIndex) = TextPipeline.cleanPage(lines, dropped: dropped)
             guard !cleaned.isEmpty else { continue }
 
             let cleanedUnits = Array(cleaned.utf16)
-            tokenizer.string = cleaned
-            tokenizer.enumerateTokens(in: cleaned.startIndex..<cleaned.endIndex) { range, _ in
+            for range in profile.sentenceRanges(in: cleaned) {
                 let ns = NSRange(range, in: cleaned)
-                guard ns.length > 0 else { return true }
+                guard ns.length > 0 else { continue }
 
                 // Обрезаем пробелы по краям токена (в координатах чистого текста).
                 var lo = ns.location
                 var hi = ns.location + ns.length - 1
                 while lo <= hi, cleanedUnits[lo] == 0x20 { lo += 1 }
                 while hi >= lo, cleanedUnits[hi] == 0x20 { hi -= 1 }
-                guard lo <= hi else { return true }
+                guard lo <= hi else { continue }
 
                 let rawSpoken = String(utf16CodeUnits: Array(cleanedUnits[lo...hi]), count: hi - lo + 1)
-                let heading = TextNormalizer.isHeadingText(rawSpoken)
-                let spoken = TextNormalizer.expandForSpeech(rawSpoken)
-                guard !spoken.isEmpty else { return true }
+                guard !rawSpoken.isEmpty else { continue }
+                let heading = profile.isHeading(rawSpoken)
 
                 let nsRange = NSRange(location: origIndex[lo], length: origIndex[hi] - origIndex[lo] + 1)
-                result.append(Sentence(text: spoken, pageIndex: pi, range: nsRange, isHeading: heading))
-                return true
+                result.append(Sentence(rawText: rawSpoken, pageIndex: pi, range: nsRange, isHeading: heading))
             }
         }
         return mergeCrossPage(result)
@@ -106,9 +108,9 @@ enum PDFTextExtractor {
             if let last = result.last,
                last.pageIndex != s.pageIndex,
                !last.isHeading, !s.isHeading,
-               !endsWithTerminator(last.text),
-               startsLowercased(s.text) {
-                result[result.count - 1] = Sentence(text: last.text + " " + s.text,
+               !endsWithTerminator(last.rawText),
+               startsLowercased(s.rawText) {
+                result[result.count - 1] = Sentence(rawText: last.rawText + " " + s.rawText,
                                                     pageIndex: last.pageIndex,
                                                     range: last.range,
                                                     boxes: last.boxes,
@@ -132,50 +134,46 @@ enum PDFTextExtractor {
         return first.isLowercase
     }
 
-    static func pageLines(_ document: PDFDocument) -> [[TextNormalizer.PageLine]] {
+    static func pageLines(_ document: PDFDocument) -> [[TextPipeline.PageLine]] {
         let pageCount = document.pageCount
-        var allLines: [[TextNormalizer.PageLine]] = []
+        var allLines: [[TextPipeline.PageLine]] = []
         allLines.reserveCapacity(pageCount)
         for pi in 0..<pageCount {
             let raw = document.page(at: pi)?.string ?? ""
-            allLines.append(TextNormalizer.lines(of: raw))
+            allLines.append(TextPipeline.lines(of: raw))
         }
         return allLines
     }
 
     static func extractSentences(pageRange: Range<Int>,
-                                  allLines: [[TextNormalizer.PageLine]],
+                                  allLines: [[TextPipeline.PageLine]],
                                   boilerplate: Set<String>,
                                   pageOffset: Int = 0) -> [Sentence] {
         var result: [Sentence] = []
-        let tokenizer = NLTokenizer(unit: .sentence)
 
         for pi in pageRange {
             guard pi < allLines.count else { continue }
             let lines = allLines[pi]
             guard !lines.isEmpty else { continue }
 
-            let dropped = TextNormalizer.droppedIndices(lines: lines, boilerplate: boilerplate)
-            let (cleaned, origIndex) = TextNormalizer.cleanPage(lines, dropped: dropped)
+            let dropped = TextPipeline.droppedIndices(lines: lines, boilerplate: boilerplate)
+            let (cleaned, origIndex) = TextPipeline.cleanPage(lines, dropped: dropped)
             guard !cleaned.isEmpty else { continue }
 
             let cleanedUnits = Array(cleaned.utf16)
-            tokenizer.string = cleaned
-            tokenizer.enumerateTokens(in: cleaned.startIndex..<cleaned.endIndex) { range, _ in
+            for range in profile.sentenceRanges(in: cleaned) {
                 let ns = NSRange(range, in: cleaned)
-                guard ns.length > 0 else { return true }
+                guard ns.length > 0 else { continue }
                 var lo = ns.location
                 var hi = ns.location + ns.length - 1
                 while lo <= hi, cleanedUnits[lo] == 0x20 { lo += 1 }
                 while hi >= lo, cleanedUnits[hi] == 0x20 { hi -= 1 }
-                guard lo <= hi else { return true }
+                guard lo <= hi else { continue }
                 let rawSpoken = String(utf16CodeUnits: Array(cleanedUnits[lo...hi]), count: hi - lo + 1)
-                let heading = TextNormalizer.isHeadingText(rawSpoken)
-                let spoken = TextNormalizer.expandForSpeech(rawSpoken)
-                guard !spoken.isEmpty else { return true }
+                guard !rawSpoken.isEmpty else { continue }
+                let heading = profile.isHeading(rawSpoken)
                 let nsRange = NSRange(location: origIndex[lo], length: origIndex[hi] - origIndex[lo] + 1)
-                result.append(Sentence(text: spoken, pageIndex: pi + pageOffset, range: nsRange, isHeading: heading))
-                return true
+                result.append(Sentence(rawText: rawSpoken, pageIndex: pi + pageOffset, range: nsRange, isHeading: heading))
             }
         }
         return mergeCrossPage(result)
@@ -198,8 +196,8 @@ enum PDFTextExtractor {
                 if ch.isLetter { letters += 1 }
             }
         }
-        guard nonSpace >= 40 else { return false }   // почти пусто — скан/картинка
+        guard nonSpace >= 40 else { return false }
         let ratio = Double(letters) / Double(nonSpace)
-        return ratio >= 0.35                          // ниже порога — слой «битый», в OCR
+        return ratio >= 0.35
     }
 }

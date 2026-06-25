@@ -37,3 +37,9 @@ targets:
           - audio
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Разрешаем незашифрованный HTTP только к локальной сети (Silero на
+        # http://localhost:8000). ATS по умолчанию блокирует cleartext HTTP —
+        # без этого исключения запрос к Silero не уходит. Произвольный HTTP в
+        # интернет НЕ разрешаем (NSAllowsArbitraryLoads не ставим).
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true

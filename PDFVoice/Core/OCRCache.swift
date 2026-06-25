@@ -19,7 +19,7 @@ enum OCRCache {
         let boxes: [[Double]]
 
         init(_ s: Sentence) {
-            text      = s.text
+            text      = s.rawText
             pageIndex = s.pageIndex
             rangeLoc  = s.range?.location
             rangeLen  = s.range?.length
@@ -32,7 +32,7 @@ enum OCRCache {
                 guard a.count == 4 else { return nil }
                 return CGRect(x: a[0], y: a[1], width: a[2], height: a[3])
             }
-            return Sentence(text: text, pageIndex: pageIndex, range: range, boxes: cgBoxes)
+            return Sentence(rawText: text, pageIndex: pageIndex, range: range, boxes: cgBoxes)
         }
     }
 

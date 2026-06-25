@@ -66,7 +66,7 @@ final class ReaderViewModel: ObservableObject {
         return speech.sentences[speech.currentIndex]
     }
 
-    var currentSentenceText: String { currentSentence?.text ?? "" }
+    var currentSentenceText: String { currentSentence?.rawText ?? "" }
 
     func updateVisiblePage(_ page: Int) { currentVisiblePage = page }
 
@@ -119,10 +119,10 @@ final class ReaderViewModel: ObservableObject {
     private func loadTextProgressively(_ doc: PDFDocument) {
         let pageCount = doc.pageCount
         let initialCount = min(15, pageCount)
-        let initialLines: [[TextNormalizer.PageLine]] = (0..<initialCount).map {
-            TextNormalizer.lines(of: doc.page(at: $0)?.string ?? "")
+        let initialLines: [[TextPipeline.PageLine]] = (0..<initialCount).map {
+            TextPipeline.lines(of: doc.page(at: $0)?.string ?? "")
         }
-        let quickBoilerplate = TextNormalizer.detectBoilerplate(
+        let quickBoilerplate = TextPipeline.detectBoilerplate(
             pages: initialLines, pageCount: initialCount
         )
         let savedIndex = item.currentSentenceIndex
@@ -162,12 +162,12 @@ final class ReaderViewModel: ObservableObject {
 
         backgroundTask = Task {
             // Читаем строки страниц off main thread через GCD.
-            let remainingLines: [[TextNormalizer.PageLine]] = await withCheckedContinuation { cont in
+            let remainingLines: [[TextPipeline.PageLine]] = await withCheckedContinuation { cont in
                 DispatchQueue.global(qos: .background).async {
-                    var lines: [[TextNormalizer.PageLine]] = []
+                    var lines: [[TextPipeline.PageLine]] = []
                     lines.reserveCapacity(totalPageCount - startPage)
                     for pi in startPage..<totalPageCount {
-                        lines.append(TextNormalizer.lines(of: doc.page(at: pi)?.string ?? ""))
+                        lines.append(TextPipeline.lines(of: doc.page(at: pi)?.string ?? ""))
                     }
                     cont.resume(returning: lines)
                 }
@@ -177,7 +177,7 @@ final class ReaderViewModel: ObservableObject {
 
             // Детект boilerplate off main thread.
             let boilerplate = await Task.detached(priority: .background) {
-                TextNormalizer.detectBoilerplate(pages: remainingLines, pageCount: remainingLines.count)
+                TextPipeline.detectBoilerplate(pages: remainingLines, pageCount: remainingLines.count)
             }.value
 
             var allSentences = prior
@@ -365,7 +365,7 @@ final class ReaderViewModel: ObservableObject {
         }
 
         guard let sentence = targetSentence else { return false }
-        let preview = String(sentence.text.prefix(80))
+        let preview = String(sentence.rawText.prefix(80))
         let bm = Bookmark(sentenceIndex: targetIndex,
                           pageIndex: sentence.pageIndex,
                           preview: preview)

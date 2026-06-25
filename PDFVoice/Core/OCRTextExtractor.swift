@@ -53,13 +53,12 @@ enum OCRTextExtractor {
                 let ns = NSRange(range, in: pageText)
                 let raw = (pageText as NSString).substring(with: ns)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                let spoken = TextNormalizer.expandForSpeech(raw)
-                guard !spoken.isEmpty else { return true }
+                guard !raw.isEmpty else { return true }
 
                 let boxes = lineRanges
                     .filter { NSIntersectionRange($0.0, ns).length > 0 }
                     .map { $0.1 }
-                result.append(Sentence(text: spoken, pageIndex: pi, boxes: boxes))
+                result.append(Sentence(rawText: raw, pageIndex: pi, boxes: boxes))
                 return true
             }
         }

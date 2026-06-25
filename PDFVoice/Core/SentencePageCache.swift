@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 
 struct SentenceCacheEntry: Codable {
+    let schemaVersion: Int?
     let loadedPageCount: Int
     let totalPageCount: Int
     let entries: [EncodedSentence]
@@ -10,21 +11,23 @@ struct SentenceCacheEntry: Codable {
 }
 
 struct EncodedSentence: Codable {
-    let text: String
+    let rawText: String
     let pageIndex: Int
     let rangeLoc: Int?
     let rangeLen: Int?
     let boxes: [[Double]]
     // Опционально: старые кэши без этого поля декодируются как nil -> false.
     let isHeading: Bool?
+    let language: String?
 
     init(_ s: Sentence) {
-        text      = s.text
+        rawText   = s.rawText
         pageIndex = s.pageIndex
         rangeLoc  = s.range?.location
         rangeLen  = s.range?.length
         boxes     = s.boxes.map { [$0.origin.x, $0.origin.y, $0.size.width, $0.size.height] }
         isHeading = s.isHeading
+        language  = s.language
     }
 
     func toSentence() -> Sentence {
@@ -33,22 +36,21 @@ struct EncodedSentence: Codable {
             guard a.count == 4 else { return nil }
             return CGRect(x: a[0], y: a[1], width: a[2], height: a[3])
         }
-        return Sentence(text: text, pageIndex: pageIndex, range: range, boxes: cgBoxes,
-                        isHeading: isHeading ?? false)
+        return Sentence(rawText: rawText, pageIndex: pageIndex, range: range, boxes: cgBoxes,
+                        isHeading: isHeading ?? false, language: language ?? "ru")
     }
 }
 
 enum SentencePageCache {
 
+    private static let currentSchemaVersion = 2
+
     static func load(for fileName: String) -> SentenceCacheEntry? {
         guard let data = try? Data(contentsOf: cacheURL(for: fileName)),
               let entry = try? JSONDecoder().decode(SentenceCacheEntry.self, from: data),
+              entry.schemaVersion == currentSchemaVersion,
               !entry.entries.isEmpty
         else {
-            if let sentences = OCRCache.load(for: fileName) {
-                let encoded = sentences.map { EncodedSentence($0) }
-                return SentenceCacheEntry(loadedPageCount: Int.max, totalPageCount: 0, entries: encoded)
-            }
             return nil
         }
         return entry
@@ -57,6 +59,7 @@ enum SentencePageCache {
     static func save(sentences: [Sentence], loadedPageCount: Int, totalPageCount: Int, for fileName: String) {
         try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let entry = SentenceCacheEntry(
+            schemaVersion: currentSchemaVersion,
             loadedPageCount: loadedPageCount,
             totalPageCount: totalPageCount,
             entries: sentences.map { EncodedSentence($0) }
