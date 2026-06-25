@@ -25,26 +25,33 @@ struct ReaderView: View {
 
     private var pageCount: Int { model.document?.pageCount ?? 0 }
 
+    /// Аудио готово к воспроизведению — есть хотя бы одно предложение.
+    /// То же условие, по которому активна кнопка Play. Пока false — показываем
+    /// экран подготовки, а НЕ читаемую страницу с мёртвой кнопкой.
+    private var audioReady: Bool { !model.speech.sentences.isEmpty }
+
     var body: some View {
         VStack(spacing: 0) {
             content
-            if model.document != nil, pageCount > 1 {
-                Divider()
-                pageBar
-            }
-            if currentPage >= model.loadedPageCount && model.isLoadingRemainingPages {
-                HStack(spacing: 6) {
-                    ProgressView().scaleEffect(0.8)
-                    Text("Страница \(currentPage + 1) ещё загружается…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            if audioReady {
+                if model.document != nil, pageCount > 1 {
+                    Divider()
+                    pageBar
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-                .background(Color(.secondarySystemBackground))
+                if currentPage >= model.loadedPageCount && model.isLoadingRemainingPages {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("Страница \(currentPage + 1) ещё загружается…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(Color(.secondarySystemBackground))
+                }
+                Divider()
+                PlayerControls(model: model, showSleepTimer: $showSleepTimer)
             }
-            Divider()
-            PlayerControls(model: model, showSleepTimer: $showSleepTimer)
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarItems }
@@ -144,7 +151,7 @@ struct ReaderView: View {
     private var content: some View {
         if let error = model.loadError {
             infoMessage(icon: "exclamationmark.triangle", text: error)
-        } else if let document = model.document {
+        } else if let document = model.document, audioReady {
             ZStack(alignment: .topLeading) {
                 PDFKitView(document: document,
                            highlight: model.currentSentence,
@@ -183,8 +190,32 @@ struct ReaderView: View {
                 }
             }
         } else {
-            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            preparingView
         }
+    }
+
+    /// Экран подготовки: показывается, пока аудио не готово (нет предложений).
+    /// Скрывает читаемую страницу, чтобы не создавать ложного впечатления готовности.
+    private var preparingView: some View {
+        VStack(spacing: 16) {
+            if let progress = model.ocrProgress {
+                ProgressView(value: progress)
+                    .frame(maxWidth: 220)
+                Text("Распознаём текст… \(Int(progress * 100))%")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text("Скан без текстового слоя — готовим озвучку")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ProgressView()
+                Text("Готовим озвучку…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
     }
 
     // MARK: - Меню голоса
