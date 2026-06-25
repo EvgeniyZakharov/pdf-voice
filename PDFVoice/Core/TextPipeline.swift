@@ -137,6 +137,24 @@ enum TextPipeline {
         return Set(counts.filter { $0.value >= threshold }.keys)
     }
 
+    /// Оконный детект колонтитулов для длинных документов: бегущие заголовки глав
+    /// повторяются в пределах главы, но редко на масштабе всего документа. Делим
+    /// страницы на окна и объединяем найденное в каждом окне.
+    static func detectBoilerplateWindowed(pages: [[PageLine]], windowSize: Int = 30) -> Set<String> {
+        guard pages.count > windowSize else {
+            return detectBoilerplate(pages: pages, pageCount: pages.count)
+        }
+        var result = Set<String>()
+        var start = 0
+        while start < pages.count {
+            let end = min(start + windowSize, pages.count)
+            let window = Array(pages[start..<end])
+            result.formUnion(detectBoilerplate(pages: window, pageCount: window.count))
+            start = end
+        }
+        return result
+    }
+
     /// Индексы строк страницы, которые надо выбросить.
     static func droppedIndices(lines: [PageLine], boilerplate: Set<String>) -> Set<Int> {
         let n = lines.count

@@ -24,6 +24,13 @@ final class ReaderViewModel: ObservableObject {
     private var totalPageCount: Int = 0
     private var backgroundTask: Task<Void, Never>?
 
+    // Тип документа, устанавливается при load() однократно.
+    private enum DocumentMode { case text, ocr, mixed }
+    private var documentMode: DocumentMode = .text
+
+    // Постраничная классификация для смешанного режима.
+    private var pageKinds: [PageKind] = []
+
     init(item: LibraryItem, store: DocumentStore?) {
         self.item = item
         self.store = store
@@ -79,12 +86,39 @@ final class ReaderViewModel: ObservableObject {
         }
         totalPageCount = doc.pageCount
 
-        if PDFTextExtractor.hasTextLayer(doc) {
+        // Дешёвая классификация — только плотность букв (page.string), без рендера thumbnail.
+        // textDensityKind возвращает только .text или .ocr; .skip не выставляется здесь.
+        var kinds: [PageKind] = []
+        kinds.reserveCapacity(doc.pageCount)
+        for pi in 0..<doc.pageCount {
+            if let page = doc.page(at: pi) {
+                kinds.append(textDensityKind(page))
+            } else {
+                kinds.append(.ocr)
+            }
+        }
+        pageKinds = kinds
+
+        let hasText = kinds.contains(.text)
+        let hasOCR  = kinds.contains(.ocr)
+
+        switch (hasText, hasOCR) {
+        case (true, false):
+            // Чисто текстовый — проверенный путь без изменений.
+            documentMode = .text
             loadText(doc)
-        } else {
+        case (false, _):
+            // Чисто OCR — проверенный путь без изменений.
+            documentMode = .ocr
             loadOCR(doc)
+        default:
+            // Смешанный: часть страниц с текстовым слоем, часть — сканы.
+            documentMode = .mixed
+            loadMixed(doc)
         }
     }
+
+    // MARK: - Чисто текстовый путь (без изменений)
 
     private func loadText(_ doc: PDFDocument) {
         let pageCount = doc.pageCount
@@ -228,6 +262,8 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Чисто OCR путь (без изменений)
+
     private func loadOCR(_ doc: PDFDocument) {
         let pageCount = doc.pageCount
 
@@ -317,12 +353,196 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Смешанный путь
+
+    /// Обрабатывает документ со страницами разных типов (.text/.ocr/.skip) в порядке
+    /// их номеров. Порядок предложений в speech.sentences всегда соответствует порядку
+    /// страниц — иначе подсветка и навигация ломаются.
+    ///
+    /// TODO §3.6: Конкурентный OCR-lane (параллельная обработка OCR-страниц с последующей
+    /// сборкой в правильном порядке) — бэклог. Сейчас обработка строго последовательна.
+    private func loadMixed(_ doc: PDFDocument) {
+        let pageCount = doc.pageCount
+        let fileName = item.fileName
+
+        if let cached = SentencePageCache.load(for: item.fileName) {
+            let sentences = cached.entries.map { $0.toSentence() }
+            document = doc
+            loadedPageCount = min(cached.loadedPageCount, pageCount)
+            finishLoading(sentences)
+
+            if !cached.isComplete && cached.loadedPageCount < pageCount {
+                isLoadingRemainingPages = true
+                startBackgroundMixedLoading(doc: doc, from: cached.loadedPageCount,
+                                            totalPageCount: pageCount, prior: sentences)
+            }
+            return
+        }
+
+        // Первые ~15 страниц — быстрый старт.
+        let initialCount = min(15, pageCount)
+        let kinds = pageKinds
+
+        Task {
+            let initial = await processMixedPages(doc: doc, pageRange: 0..<initialCount,
+                                                  kinds: kinds, boilerplate: nil)
+
+            document = doc
+            loadedPageCount = initialCount
+            if initial.isEmpty && initialCount == pageCount {
+                loadError = "Не удалось распознать текст на страницах."
+                return
+            }
+            finishLoading(initial)
+            SentencePageCache.save(sentences: initial, loadedPageCount: initialCount,
+                                   totalPageCount: pageCount, for: fileName)
+
+            guard initialCount < pageCount else { return }
+            isLoadingRemainingPages = true
+            startBackgroundMixedLoading(doc: doc, from: initialCount,
+                                        totalPageCount: pageCount, prior: initial)
+
+            let savedIndex = item.currentSentenceIndex
+            if savedIndex >= initial.count, savedIndex < speech.sentences.count, !speech.isSpeaking {
+                speech.seekSilent(to: savedIndex)
+            }
+        }
+    }
+
+    private func startBackgroundMixedLoading(doc: PDFDocument, from startPage: Int,
+                                             totalPageCount: Int, prior: [Sentence]) {
+        backgroundTask?.cancel()
+        let fileName = item.fileName
+        let savedIndex = item.currentSentenceIndex
+        let kinds = pageKinds
+
+        backgroundTask = Task {
+            var allSentences = prior
+            // OCR медленный — батчи меньше чем для текстового пути.
+            let batchSize = 10
+            var batchStart = startPage
+
+            while batchStart < totalPageCount {
+                if Task.isCancelled {
+                    let snap = allSentences
+                    Task.detached(priority: .background) {
+                        SentencePageCache.save(sentences: snap, loadedPageCount: batchStart,
+                                              totalPageCount: totalPageCount, for: fileName)
+                    }
+                    return
+                }
+
+                let batchEnd = min(batchStart + batchSize, totalPageCount)
+                let batch = await processMixedPages(doc: doc, pageRange: batchStart..<batchEnd,
+                                                    kinds: kinds, boilerplate: nil)
+
+                allSentences.append(contentsOf: batch)
+                speech.appendSentences(batch)
+                loadedPageCount = batchEnd
+
+                let snap = allSentences
+                Task.detached(priority: .background) {
+                    SentencePageCache.save(sentences: snap, loadedPageCount: batchEnd,
+                                          totalPageCount: totalPageCount, for: fileName)
+                }
+
+                batchStart = batchEnd
+            }
+
+            if savedIndex >= prior.count, savedIndex < speech.sentences.count, !speech.isSpeaking {
+                speech.seekSilent(to: savedIndex)
+            }
+            isLoadingRemainingPages = false
+        }
+    }
+
+    /// Обрабатывает диапазон страниц смешанного документа строго по порядку.
+    /// Текстовые страницы — через PDFTextExtractor, OCR-страницы — через OCRTextExtractor
+    /// по одной (pageRange pi..<pi+1). .skip пропускаются. Результат возвращается
+    /// в порядке страниц.
+    ///
+    /// `boilerplate` передаётся nil → вычисляется по текстовым строкам текущего батча.
+    /// Точность детекта колонтитулов ниже чем при полном документе — приемлемо для
+    /// смешанного режима, где страниц текстового слоя может быть мало.
+    private func processMixedPages(doc: PDFDocument,
+                                   pageRange: Range<Int>,
+                                   kinds: [PageKind],
+                                   boilerplate: Set<String>?) async -> [Sentence] {
+        var result: [Sentence] = []
+
+        // Собираем boilerplate по текстовым страницам батча, если не передан снаружи.
+        let effectiveBoilerplate: Set<String>
+        if let bp = boilerplate {
+            effectiveBoilerplate = bp
+        } else {
+            let textLines: [[TextPipeline.PageLine]] = pageRange.map { pi in
+                guard pi < kinds.count, kinds[pi] == .text else { return [] }
+                return TextPipeline.lines(of: doc.page(at: pi)?.string ?? "")
+            }
+            effectiveBoilerplate = await Task.detached(priority: .background) {
+                TextPipeline.detectBoilerplate(pages: textLines, pageCount: textLines.count)
+            }.value
+        }
+
+        for pi in pageRange {
+            guard pi < kinds.count else { continue }
+            switch kinds[pi] {
+            case .skip:
+                continue
+
+            case .text:
+                let lines = TextPipeline.lines(of: doc.page(at: pi)?.string ?? "")
+                guard !lines.isEmpty else { continue }
+                // Извлекаем предложения одной страницы через общий конвейер.
+                let pageSentences = await Task.detached(priority: .background) {
+                    PDFTextExtractor.extractSentences(
+                        pageRange: 0..<1,
+                        allLines: [lines],
+                        boilerplate: effectiveBoilerplate,
+                        pageOffset: pi
+                    )
+                }.value
+                result.append(contentsOf: pageSentences)
+
+            case .ocr:
+                // Ленивый blank-чек: рендерим thumbnail только здесь, off-main, прямо перед OCR.
+                // На этапе load() мы намеренно его пропустили, чтобы не рендерить 720 страниц
+                // пачкой на main thread.
+                guard let page = doc.page(at: pi) else { continue }
+                let blank = await Task.detached(priority: .background) {
+                    isBlankPage(page)
+                }.value
+                guard !blank else { continue }
+
+                let pageSentences = await OCRTextExtractor.sentences(
+                    from: doc,
+                    pageRange: pi..<(pi + 1)
+                ) { _, _ in }
+                result.append(contentsOf: pageSentences)
+            }
+        }
+
+        return result
+    }
+
+    // MARK: - Приоритетная загрузка (исправление бага: ветвление по типу документа)
+
     func requestPriorityLoad(pageIndex: Int) {
         guard pageIndex >= loadedPageCount, let doc = document else { return }
         backgroundTask?.cancel()
         isLoadingRemainingPages = true
-        startBackgroundTextLoading(doc: doc, from: loadedPageCount,
-                                   totalPageCount: totalPageCount, prior: speech.sentences)
+
+        switch documentMode {
+        case .text:
+            startBackgroundTextLoading(doc: doc, from: loadedPageCount,
+                                       totalPageCount: totalPageCount, prior: speech.sentences)
+        case .ocr:
+            runOCR(doc: doc, from: loadedPageCount,
+                   totalPageCount: totalPageCount, prior: speech.sentences)
+        case .mixed:
+            startBackgroundMixedLoading(doc: doc, from: loadedPageCount,
+                                        totalPageCount: totalPageCount, prior: speech.sentences)
+        }
     }
 
     private func finishLoading(_ sentences: [Sentence]) {
