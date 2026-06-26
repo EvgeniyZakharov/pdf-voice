@@ -4,14 +4,14 @@ struct OnboardingView: View {
     @Binding var isPresented: Bool
 
     private let steps: [(icon: String, color: Color, title: String, body: String)] = [
-        ("doc.badge.plus",   .teal,   "Добавьте PDF",
+        ("doc.badge.plus",   Theme.accent, "Добавьте PDF",
          "Нажмите + и выберите любой PDF-файл — книгу, статью, документ."),
-        ("play.circle.fill", .blue,   "Слушайте вслух",
+        ("play.circle.fill", Theme.accent, "Слушайте вслух",
          "Нажмите ▶ — приложение читает вслух с подсветкой текущего предложения. Работает офлайн."),
-        ("hand.tap.fill",    .indigo, "Читать отсюда",
+        ("hand.tap.fill",    Theme.accent, "Читать отсюда",
          "Тапните по любому предложению — появится кнопка «Отсюда». Чтение начнётся с выбранного места."),
-        ("slider.horizontal.3", .purple, "Настройте под себя",
-         "Выбирайте скорость, голос и устанавливайте таймер сна. Прогресс сохраняется автоматически.")
+        ("slider.horizontal.3", Theme.accent, "Настройте под себя",
+         "Выбирайте скорость и голос. Прогресс сохраняется автоматически.")
     ]
 
     @State private var page = 0

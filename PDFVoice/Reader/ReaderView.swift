@@ -16,7 +16,6 @@ struct ReaderView: View {
     @State private var jumpToken = 0
     @State private var showThumbnails = false
     @State private var showBookmarks = false
-    @State private var showSleepTimer = false
 
     init(item: LibraryItem) {
         _model = StateObject(wrappedValue: ReaderViewModel(item: item, store: nil))
@@ -39,7 +38,7 @@ struct ReaderView: View {
                     pageBar
                 }
                 Divider()
-                PlayerControls(model: model, showSleepTimer: $showSleepTimer)
+                PlayerControls(model: model)
             }
         }
         .navigationBarTitleDisplayMode(.inline)
@@ -54,18 +53,6 @@ struct ReaderView: View {
         .sheet(isPresented: $showBookmarks) {
             BookmarksView(model: model)
         }
-        .confirmationDialog("Таймер сна", isPresented: $showSleepTimer, titleVisibility: .visible) {
-            if model.sleepTimer.isActive {
-                Button("Отменить таймер (\(model.sleepTimer.remainingFormatted))", role: .destructive) {
-                    model.sleepTimer.cancel()
-                }
-            } else {
-                ForEach(SleepTimer.options, id: \.self) { min in
-                    Button("\(min) мин") { model.sleepTimer.start(minutes: min) }
-                }
-            }
-            Button("Отмена", role: .cancel) {}
-        }
         .onAppear {
             model.attach(store: store)
             model.applySettings(settings)
@@ -76,7 +63,6 @@ struct ReaderView: View {
         .onChange(of: settings.selectedVoice)      { _ in model.applySettings(settings) }
         .onChange(of: settings.sileroServerURL)    { _ in model.applySettings(settings); settings.probeSilero() }
         .onChange(of: settings.sileroAPIKey)       { _ in model.applySettings(settings) }
-        .onChange(of: settings.speed)              { _ in model.applySettings(settings) }
     }
 
     // MARK: - Тулбар
@@ -84,23 +70,14 @@ struct ReaderView: View {
     @ToolbarContentBuilder
     private var toolbarItems: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            // Таймер сна
-            Button {
-                showSleepTimer = true
-            } label: {
-                Image(systemName: model.sleepTimer.isActive ? "moon.fill" : "moon")
-                    .foregroundStyle(model.sleepTimer.isActive ? Color.indigo : Color.primary)
-            }
             // Закладки — открывает список; добавление через + внутри листа
             let hasBookmarkOnPage = model.bookmarks.contains(where: { $0.pageIndex == currentPage })
             Button {
                 showBookmarks = true
             } label: {
                 Image(systemName: hasBookmarkOnPage ? "bookmark.fill" : "bookmark")
-                    .foregroundStyle(hasBookmarkOnPage ? Color.accentColor : Color.primary)
+                    .foregroundStyle(hasBookmarkOnPage ? Theme.accent : Color.primary)
             }
-            // Голос
-            voiceMenu
         }
     }
 
@@ -141,6 +118,11 @@ struct ReaderView: View {
         let clamped = max(0, min(page, max(pageCount - 1, 0)))
         jumpToken += 1
         pageJump = PageJump(page: clamped, token: jumpToken)
+        // Двигаем источник истины сразу: при программном go(to:) нотификация
+        // .PDFViewPageChanged приходит ненадёжно/с задержкой, иначе скраббер
+        // «отстаёт» до ручного скролла. onChange(of: currentPage) сам учитывает
+        // isScrubbing, так что значение слайдера при перетаскивании не перебьётся.
+        currentPage = clamped
     }
 
     // MARK: - Контент PDF
@@ -168,6 +150,15 @@ struct ReaderView: View {
                                currentPage = page
                                model.updateVisiblePage(page)
                            })
+                    // Тёплая «бумага»: multiply тонирует белые страницы в крем,
+                    // чёрный текст остаётся читаемым. compositingGroup ограничивает
+                    // смешивание самим PDF.
+                    .compositingGroup()
+                    .overlay(
+                        Theme.pageBackground
+                            .blendMode(.multiply)
+                            .allowsHitTesting(false)
+                    )
 
                 if let index = pendingIndex {
                     playHereBubble(for: index)
@@ -209,40 +200,6 @@ struct ReaderView: View {
         .padding(32)
     }
 
-    // MARK: - Меню голоса
-
-    @ViewBuilder
-    private var voiceMenu: some View {
-        Menu {
-            Section("Системные") {
-                ForEach(VoiceCatalog.systemOptions()) { opt in
-                    voiceButton(opt)
-                }
-            }
-            if settings.sileroReachable {
-                Section("Silero · нейросеть") {
-                    ForEach(VoiceCatalog.sileroOptions()) { opt in
-                        voiceButton(opt)
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "person.wave.2")
-        }
-    }
-
-    private func voiceButton(_ opt: VoiceOption) -> some View {
-        Button {
-            settings.selectedVoice = opt.id
-        } label: {
-            if settings.selectedVoice == opt.id {
-                Label(opt.title, systemImage: "checkmark")
-            } else {
-                Text(opt.title)
-            }
-        }
-    }
-
     // MARK: - Вспомогательные вью
 
     private func playHereBubble(for index: Int) -> some View {
@@ -254,8 +211,8 @@ struct ReaderView: View {
                 .font(.subheadline.weight(.semibold))
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)
-                .background(.tint, in: Capsule())
-                .foregroundStyle(.white)
+                .background(Theme.accent, in: Capsule())
+                .foregroundStyle(Theme.onAccent)
                 .shadow(radius: 4, y: 2)
         }
         .buttonStyle(.plain)
@@ -294,56 +251,32 @@ struct ReaderView: View {
 
 private struct PlayerControls: View {
     @ObservedObject var model: ReaderViewModel
-    @Binding var showSleepTimer: Bool
     @ObservedObject private var speech: SpeechEngine
-    @ObservedObject private var sleepTimer: SleepTimer
 
-    init(model: ReaderViewModel, showSleepTimer: Binding<Bool>) {
+    init(model: ReaderViewModel) {
         _model = ObservedObject(wrappedValue: model)
-        _showSleepTimer = showSleepTimer
         _speech = ObservedObject(wrappedValue: model.speech)
-        _sleepTimer = ObservedObject(wrappedValue: model.sleepTimer)
     }
 
     var body: some View {
-        VStack(spacing: 10) {
-            if !model.currentSentenceText.isEmpty {
-                Text(model.currentSentenceText)
-                    .font(.callout)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .foregroundStyle(.secondary)
+        // Play строго по центру всей ширины, скорость — на левом краю.
+        ZStack {
+            Button { model.togglePlayPause() } label: {
+                Image(systemName: speech.isSpeaking ? "pause.fill" : "play.fill")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(Theme.onAccent)
+                    .frame(width: 62, height: 62)
+                    .background(Theme.accent, in: Circle())
+                    .shadow(color: Theme.accent.opacity(0.25), radius: 5, y: 2)
             }
-
-            ZStack {
-                // Транспорт по центру экрана.
-                HStack(spacing: 40) {
-                    Button { speech.skipBackward() } label: {
-                        Image(systemName: "backward.fill").font(.title2)
-                    }
-                    Button { model.togglePlayPause() } label: {
-                        Image(systemName: speech.isSpeaking ? "pause.circle.fill" : "play.circle.fill")
-                            .font(.system(size: 52))
-                    }
-                    Button { speech.skipForward() } label: {
-                        Image(systemName: "forward.fill").font(.title2)
-                    }
-                }
-                // Скорость слева, таймер сна справа — на одном уровне с play.
-                HStack {
-                    speedMenu
-                    Spacer()
-                    if sleepTimer.isActive {
-                        Button { showSleepTimer = true } label: {
-                            Label(sleepTimer.remainingFormatted, systemImage: "moon.fill")
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.indigo)
-                        }
-                    }
-                }
+            .buttonStyle(.plain)
+            HStack {
+                speedMenu
+                Spacer()
             }
         }
-        .padding()
+        .padding(.horizontal)
+        .padding(.vertical, 8)
         .disabled(speech.sentences.isEmpty)
     }
 
@@ -366,9 +299,10 @@ private struct PlayerControls: View {
                 Text(ReaderView.speedLabel(speech.speed))
             }
             .font(.subheadline.weight(.medium))
+            .foregroundStyle(Theme.accent)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(Color(.secondarySystemBackground), in: Capsule())
+            .background(Theme.accent.opacity(0.10), in: Capsule())
         }
     }
 }

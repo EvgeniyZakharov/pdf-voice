@@ -10,6 +10,7 @@ struct PDFVoiceApp: App {
             LibraryView()
                 .environmentObject(store)
                 .environmentObject(settings)
+                .tint(Theme.accent)
                 .preferredColorScheme(settings.appearance.colorScheme)
         }
     }

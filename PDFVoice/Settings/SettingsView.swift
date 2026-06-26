@@ -4,10 +4,15 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var previewer = VoicePreviewer()
 
     private let pauseOptions: [(String, Double)] = [
         ("Нет", 0), ("0.3 с", 0.3), ("0.5 с", 0.5), ("1 с", 1.0), ("1.5 с", 1.5)
     ]
+
+    private var voiceOptions: [VoiceOption] {
+        VoiceCatalog.options(sileroReachable: settings.sileroReachable)
+    }
 
     var body: some View {
         NavigationStack {
@@ -21,24 +26,12 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable)) { opt in
-                        Button {
-                            settings.selectedVoice = opt.id
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(opt.title).foregroundStyle(.primary)
-                                    Text(opt.subtitle)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if settings.selectedVoice == opt.id {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
+                    Picker("Голос", selection: $settings.selectedVoice) {
+                        ForEach(voiceOptions) { opt in
+                            Text(opt.title).tag(opt.id)
                         }
                     }
+                    .pickerStyle(.menu)
                 } header: {
                     Text("Голос")
                 } footer: {
@@ -47,37 +40,13 @@ struct SettingsView: View {
                          : "Голоса Silero появятся, когда подключится сервер (см. ниже).")
                 }
 
-                Section("Скорость по умолчанию") {
-                    ForEach(SpeechEngine.speedOptions, id: \.self) { option in
-                        Button {
-                            settings.speed = option
-                        } label: {
-                            HStack {
-                                Text(ReaderView.speedLabel(option))
-                                    .foregroundStyle(.primary)
-                                Spacer()
-                                if settings.speed == option {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
-                        }
-                    }
-                }
-
                 Section("Пауза между предложениями") {
-                    ForEach(pauseOptions, id: \.1) { label, value in
-                        Button {
-                            settings.pauseBetweenSentences = value
-                        } label: {
-                            HStack {
-                                Text(label).foregroundStyle(.primary)
-                                Spacer()
-                                if settings.pauseBetweenSentences == value {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
+                    Picker("Пауза", selection: $settings.pauseBetweenSentences) {
+                        ForEach(pauseOptions, id: \.1) { label, value in
+                            Text(label).tag(value)
                         }
                     }
+                    .pickerStyle(.menu)
                 }
 
                 Section {
@@ -137,6 +106,13 @@ struct SettingsView: View {
                 }
             }
             .onAppear { settings.probeSilero() }
+            .onChange(of: settings.selectedVoice) { id in
+                if let opt = voiceOptions.first(where: { $0.id == id }) {
+                    previewer.preview(opt, serverURL: settings.sileroServerURL,
+                                      apiKey: settings.sileroAPIKey)
+                }
+            }
+            .onDisappear { previewer.stop() }
         }
         // Применяем тему внутри листа, иначе смена видна только после переоткрытия.
         .preferredColorScheme(settings.appearance.colorScheme)

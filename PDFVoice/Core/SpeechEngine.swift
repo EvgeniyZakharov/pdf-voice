@@ -53,7 +53,17 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     var sileroServerURL: URL? = nil {
         didSet {
             sileroBackend.serverURL = sileroServerURL
-            active = sileroServerURL != nil ? sileroBackend : avBackend
+            let next: SpeechBackend = sileroServerURL != nil ? sileroBackend : avBackend
+            // Только при РЕАЛЬНОЙ смене backend'а: глушим уходящий, иначе он
+            // продолжит звучать (AVSpeech дочитывает очередь, Silero — свой цикл)
+            // и при следующем play/skip наложится второй голос.
+            guard next !== active else { return }
+            let wasSpeaking = isSpeaking
+            active.stop()
+            active = next
+            // Продолжаем с текущего предложения новым движком (как при смене
+            // голоса/скорости внутри одного backend'а), а не обрываем озвучку.
+            if wasSpeaking { play(from: currentIndex) }
         }
     }
 
@@ -153,6 +163,10 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     }
 
     func resume() {
+        // Категория .playback нужна для фона/экрана блокировки. Раньше её ставил
+        // только play(from:), а старт Silero через большую кнопку Play идёт по
+        // resume() → звук оставался в дефолтной soloAmbient и глох при сворачивании.
+        activateAudioSession()
         if sileroServerURL != nil {
             isSpeaking = true
             // Silero не поддерживает истинный pause/resume — перезапускаем с текущей позиции.

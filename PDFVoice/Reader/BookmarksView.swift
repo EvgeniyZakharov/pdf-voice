@@ -55,6 +55,11 @@ struct BookmarksView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "chevron.down")
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
                     Button {
                         if model.addBookmark() {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -69,9 +74,6 @@ struct BookmarksView: View {
                         Image(systemName: bookmarkAdded ? "checkmark" : "plus")
                             .animation(.easeInOut(duration: 0.15), value: bookmarkAdded)
                     }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Готово") { dismiss() }
                 }
             }
         }

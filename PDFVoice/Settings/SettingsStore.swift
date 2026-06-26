@@ -33,7 +33,6 @@ enum AppAppearance: String, CaseIterable, Identifiable {
 final class SettingsStore: ObservableObject {
     private let ud = UserDefaults.standard
 
-    @Published var speed: Double             { didSet { ud.set(speed,                    forKey: "pv.speed")  } }
     @Published var pauseBetweenSentences: Double { didSet { ud.set(pauseBetweenSentences, forKey: "pv.pause") } }
 
     /// Выбранный голос: "sys:<identifier>" (системный) или "silero:<speaker>".
@@ -48,7 +47,6 @@ final class SettingsStore: ObservableObject {
     @Published var sileroReachable: Bool = false
 
     init() {
-        speed                 = ud.object(forKey: "pv.speed")  as? Double ?? 1.0
         pauseBetweenSentences = ud.object(forKey: "pv.pause") as? Double ?? 0.3
         selectedVoice         = ud.string(forKey: "pv.selectedVoice") ?? VoiceCatalog.defaultSelection()
         sileroServerURL       = ud.string(forKey: "pv.sileroURL")     ?? "https://elementary-comm-bundle-chester.trycloudflare.com"

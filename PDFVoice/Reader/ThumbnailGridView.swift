@@ -85,13 +85,13 @@ private struct ThumbnailCell: View {
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .overlay {
                 RoundedRectangle(cornerRadius: 6)
-                    .stroke(isCurrent ? Color.accentColor : Color(.separator),
+                    .stroke(isCurrent ? Theme.accent : Color(.separator),
                             lineWidth: isCurrent ? 2.5 : 0.5)
             }
 
             Text("\(index + 1)")
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
+                .foregroundStyle(isCurrent ? Theme.accent : .secondary)
         }
         .task(id: index) {
             if image == nil { image = await provider.thumbnail(for: index) }

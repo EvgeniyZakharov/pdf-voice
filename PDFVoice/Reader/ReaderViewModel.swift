@@ -58,19 +58,20 @@ final class ReaderViewModel: ObservableObject {
     }
 
     func applySettings(_ settings: SettingsStore) {
-        speech.speed = settings.speed
         speech.pauseBetweenSentences = settings.pauseBetweenSentences
         speech.sileroAPIKey = settings.sileroAPIKey
 
         let sel = settings.selectedVoice
+        // Голос/спикер выставляем ДО переключения sileroServerURL: его didSet может
+        // авто-продолжить озвучку новым backend'ом, и тот должен быть уже настроен.
         if sel.hasPrefix("silero:"), !settings.sileroServerURL.isEmpty {
-            speech.sileroServerURL = URL(string: settings.sileroServerURL)
             speech.sileroSpeaker = String(sel.dropFirst("silero:".count))
+            speech.sileroServerURL = URL(string: settings.sileroServerURL)
         } else {
             // Системный голос (или откат на него, если Silero недоступен).
-            speech.sileroServerURL = nil
             let id = sel.hasPrefix("sys:") ? String(sel.dropFirst("sys:".count)) : sel
             if let v = AVSpeechSynthesisVoice(identifier: id) { speech.voice = v }
+            speech.sileroServerURL = nil
         }
     }
 

@@ -33,6 +33,7 @@ struct PDFKitView: UIViewRepresentable {
     func makeUIView(context: Context) -> PDFView {
         let view = PDFView()
         view.document = document
+        view.backgroundColor = Theme.pageBackgroundUI
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
@@ -55,6 +56,8 @@ struct PDFKitView: UIViewRepresentable {
 
     func updateUIView(_ view: PDFView, context: Context) {
         context.coordinator.parent = self
+        // Подписка на скролл для реактивного индикатора страницы (см. attach…).
+        context.coordinator.attachScrollTrackingIfNeeded()
 
         if view.document !== document {
             view.document = document
@@ -113,9 +116,49 @@ struct PDFKitView: UIViewRepresentable {
         /// Текущие подсветки-аннотации для OCR-страниц (чтобы снять при смене предложения).
         var ocrAnnotations: [(PDFPage, PDFAnnotation)] = []
 
+        /// KVO-наблюдение за contentOffset внутреннего scroll view PDFView.
+        private var scrollObservation: NSKeyValueObservation?
+        /// Последняя отправленная наверх страница — чтобы не дёргать @State зря.
+        private var lastReportedPage: Int = -1
+
         init(_ parent: PDFKitView) { self.parent = parent }
 
-        deinit { NotificationCenter.default.removeObserver(self) }
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+            scrollObservation?.invalidate()
+        }
+
+        /// Реактивное отслеживание скролла. `.PDFViewPageChanged` срабатывает
+        /// дискретно и с запозданием (только при «переключении» текущей страницы),
+        /// из-за чего ползунок и номер отставали. Наблюдаем contentOffset напрямую
+        /// и на каждый кадр скролла вычисляем страницу по центру вьюпорта.
+        func attachScrollTrackingIfNeeded() {
+            guard scrollObservation == nil,
+                  let pdfView,
+                  let scrollView = Coordinator.firstScrollView(in: pdfView) else { return }
+            scrollObservation = scrollView.observe(\.contentOffset, options: [.new]) {
+                [weak self] _, _ in self?.reportVisiblePage()
+            }
+        }
+
+        /// Определяет страницу по центру вьюпорта и сообщает наверх (с дедупом).
+        private func reportVisiblePage() {
+            guard let pdfView else { return }
+            let center = CGPoint(x: pdfView.bounds.midX, y: pdfView.bounds.midY)
+            guard let page = pdfView.page(for: center, nearest: true) else { return }
+            let index = parent.document.index(for: page)
+            guard index != NSNotFound, index != lastReportedPage else { return }
+            lastReportedPage = index
+            parent.onPageChange(index)
+        }
+
+        private static func firstScrollView(in view: UIView) -> UIScrollView? {
+            for sub in view.subviews {
+                if let sv = sub as? UIScrollView { return sv }
+                if let found = firstScrollView(in: sub) { return found }
+            }
+            return nil
+        }
 
         func clearOCRHighlight() {
             for (page, annotation) in ocrAnnotations {
@@ -125,9 +168,9 @@ struct PDFKitView: UIViewRepresentable {
         }
 
         @objc func pageChanged(_ note: Notification) {
-            guard let pdfView, let page = pdfView.currentPage else { return }
-            let index = parent.document.index(for: page)
-            if index != NSNotFound { parent.onPageChange(index) }
+            // Резервный путь: KVO-скролл обычно опережает эту нотификацию,
+            // но при программном go(to:) она может прийти первой.
+            reportVisiblePage()
         }
 
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
