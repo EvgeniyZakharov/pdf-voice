@@ -19,9 +19,11 @@ You are a backend/infra engineer responsible for the **Silero TTS server** — a
 
 ## How it works
 
-1. Loads `silero_tts` model from `snakers4/silero-models` via `torch.hub` (~200 MB, cached after first run)
+1. Loads `silero_tts` model from `snakers4/silero-models` via `torch.hub` (~200 MB, cached after first run; pass `trust_repo=True` so headless/systemd start doesn't hang on the trust prompt)
 2. Exposes `POST /synthesize` → returns WAV audio (24 kHz, mono, int16)
-3. iOS app calls this endpoint when `useSilero = true` in Settings
+3. The iOS app is hardwired to the production endpoint `https://tts.pdf-voice.com` and uses it whenever a Silero voice is selected; if the server is unreachable it silently falls back to the system voice.
+
+**Prod vs local:** the server runs 24/7 on a Hetzner box behind a Cloudflare named-tunnel (`tts.pdf-voice.com`), listening on `127.0.0.1` only. Reproducible deploy + systemd units live in `silero-server/deploy/` (`DEPLOY.md`). `start.sh` is for **local** dev only (binds `0.0.0.0:8000`), tested via curl — the app can't be pointed at a local server anymore (URL is a baked-in constant).
 
 ## API contract (do not break)
 

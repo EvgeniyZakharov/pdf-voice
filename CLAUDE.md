@@ -12,16 +12,16 @@ iOS-приложение для чтения PDF вслух. Мотивация:
 | PDF | PDFKit (рендер + текстовый слой) |
 | OCR для сканов | Vision (`VNRecognizeTextRequest`, ru-RU/en-US) |
 | TTS основной | `AVSpeechSynthesizer` (офлайн, бесплатно) |
-| TTS альтернативный | Silero — локальный Python-сервер (`silero-server/`) |
+| TTS нейросетевой | Silero — свой сервер `tts.pdf-voice.com` (`silero-server/`, деплой `silero-server/deploy/`) |
 | Хранилище | Codable JSON в Documents (не SwiftData — iOS 16.0 min) |
 | Сборка | XcodeGen → `.xcodeproj` не хранится в репо |
-| Bundle ID | `com.pollsar.pdfvoice` |
+| Bundle ID | `com.pdfvoice.app` |
 | Min iOS | 16.0 |
 
 Приоритетный язык озвучки — **русский** (Silero — основной движок для ударений, Milena — офлайн-фолбэк).
 
 См. также `ARCHITECTURE.md` (целевая архитектура + спайки) и `IMPLEMENTATION.md` (план фаз).
-Текущая ветка работ: **`feature/scalable-architecture`**.
+Работа идёт в **`main`** (ветка `feature/scalable-architecture` влита и удалена).
 
 ---
 
@@ -109,11 +109,16 @@ PDFVoice/
 
 **Базовое (M1–M5):** библиотека, читалка, подсветка по предложениям (`NLTokenizer`), выбор голоса, «Читать отсюда», скорости, скраббер + сетка миниатюр, фон + экран блокировки (`AVAudioSession(.playback)`, `MPNowPlayingInfoCenter`/`MPRemoteCommandCenter`, прерывания), OCR через Vision, закладки, Silero TTS.
 
-**Рефакторинг под масштабируемость (ветка `feature/scalable-architecture`):**
+**Рефакторинг под масштабируемость (влито в `main`):**
 - **Фаза 0a — швы:** late render (`rawText` + кэш v2); `LanguageProfile`+`TextPipeline`; `SpeechBackend` (AVSpeech/Silero за швом); ATS-фикс для Silero.
 - **Фаза 1 — русское качество:** ударения омографов (словарь 20 слов → `+` в Silero); склонение числительных по предлогу («от 2 до 5» → «от двух до пяти»); единицы («5 кг» → «пять килограммов») и контекстные аббревиатуры («г. Москва» → «город», «см.» vs «5 см»).
 - **Фаза 0b — робастность PDF:** постраничный `classifyPage`; единый конвейер очистки OCR (паритет с текстом); `loadMixed` для смешанных PDF; фикс `requestPriorityLoad` для OCR; оконный детект колонтитулов; под-строчные OCR-боксы.
 - **UX:** показ только готовых к озвучке страниц (`displayDocument`); синхронизация аудио ↔ показа страниц.
+
+**Прод и подготовка к релизу:**
+- **Silero на сервере:** вынесен из локального quick-tunnel на отдельную машину (Hetzner CX23) за постоянным HTTPS `https://tts.pdf-voice.com` (Cloudflare named-tunnel, без открытых портов). Деплой воспроизводим: `silero-server/deploy/` (`DEPLOY.md`, systemd-юниты, `benchmark.py`). CPU-torch, `WORKERS`/`TORCH_THREADS` под нагрузку.
+- **Приложение зашито на прод:** `sileroServerURL`/`sileroAPIKey` — константы, поля в Настройках убраны, подключение к нейроголосам автоматическое.
+- **Offline-fallback:** при недоступном сервере `SpeechEngine` беззвучно переходит на системный голос (`SpeechEvent.failed` → `fallBackToSystemVoice`), без обрыва чтения — снимает риск App Store.
 
 Все логические этапы проверены автономными Swift-харнессами (компиляция реальных файлов + ассерты) и golden-регрессией. Аудио/визуал проверяет пользователь вручную.
 
@@ -141,7 +146,7 @@ xcodebuild -project PDFVoice.xcodeproj -scheme PDFVoice \
 
 **Тест без GUI:** скопировать PDF + `library.json` в Documents контейнера:
 ```bash
-CONTAINER=$(xcrun simctl get_app_container booted com.pollsar.pdfvoice data)
+CONTAINER=$(xcrun simctl get_app_container booted com.pdfvoice.app data)
 cp mybook.pdf "$CONTAINER/Documents/"
 # сброс кэша → свежий проход извлечения/OCR:
 rm -rf "$CONTAINER/Documents/page-cache"
