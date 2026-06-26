@@ -36,8 +36,8 @@ struct SettingsView: View {
                     Text("Голос")
                 } footer: {
                     Text(settings.sileroReachable
-                         ? "Голоса Silero доступны — сервер подключён."
-                         : "Голоса Silero появятся, когда подключится сервер (см. ниже).")
+                         ? "Доступны улучшенные голоса (нейросеть)."
+                         : "Улучшенные голоса временно недоступны — используется системный голос.")
                 }
 
                 Section("Пауза между предложениями") {
@@ -47,40 +47,6 @@ struct SettingsView: View {
                         }
                     }
                     .pickerStyle(.menu)
-                }
-
-                Section {
-                    HStack {
-                        Text("Адрес сервера")
-                        Spacer()
-                        TextField("http://localhost:8000", text: $settings.sileroServerURL)
-                            .multilineTextAlignment(.trailing)
-                            .foregroundStyle(.secondary)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                    }
-                    HStack {
-                        Text("API-ключ")
-                        Spacer()
-                        SecureField("необязательно", text: $settings.sileroAPIKey)
-                            .multilineTextAlignment(.trailing)
-                            .foregroundStyle(.secondary)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                    }
-                    HStack {
-                        Label(settings.sileroReachable ? "Сервер подключён" : "Сервер недоступен",
-                              systemImage: settings.sileroReachable ? "checkmark.circle.fill" : "xmark.circle")
-                            .foregroundStyle(settings.sileroReachable ? .green : .secondary)
-                            .font(.subheadline)
-                        Spacer()
-                        Button("Проверить") { settings.probeSilero() }
-                            .font(.subheadline)
-                    }
-                } header: {
-                    Text("Сервер Silero")
-                } footer: {
-                    Text("Локально: запустите silero-server/start.sh. Удалённо: укажите HTTPS-адрес туннеля и API-ключ из silero-server/.api_key. Голоса Silero появятся в списке выше при успешном подключении.")
                 }
 
                 Section {

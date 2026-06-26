@@ -1,80 +1,43 @@
-# Silero TTS server — удалённый доступ
+# Silero TTS server
 
-Локальный сервер озвучки можно открыть в интернет, чтобы iPhone читал PDF
-голосами Silero откуда угодно. Безопасность держится на двух вещах:
+Сервер озвучки для PDF Voice: принимает текст, возвращает WAV голосами Silero (ru).
+Эндпоинты: `POST /synthesize` (требует `X-API-Key`), `GET /health` (открыт).
 
-- **HTTPS** — даёт Cloudflare Tunnel (iOS блокирует обычный http к внешним адресам).
-- **API-ключ** — заголовок `X-API-Key`, генерируется автоматически в `.api_key`.
+## Прод
 
-`/health` остаётся открытым (для проверок), `/synthesize` требует ключ.
+Сервер развёрнут на отдельной машине (Hetzner) и работает 24/7 за постоянным
+HTTPS-адресом **`https://tts.pdf-voice.com`** (Cloudflare Tunnel). Приложение зашито
+на этот адрес — никакой ручной настройки в Настройках больше нет.
 
----
+Полная инструкция по развёртыванию/пересозданию сервера: **[`deploy/DEPLOY.md`](deploy/DEPLOY.md)**.
+Обновить код на сервере:
+```bash
+rsync -av --exclude='.venv' --exclude='__pycache__' \
+  silero-server/ root@<IP>:/home/silero/silero-server/
+ssh root@<IP> 'systemctl restart silero'
+```
 
-## Быстрый старт (временный адрес, без домена)
+## Локальная разработка
 
-Подходит, чтобы попробовать прямо сейчас. Адрес меняется при каждом перезапуске.
+`start.sh` поднимает сервер на маке (`localhost:8000`) — чтобы обкатать правки
+`server.py` через `curl`, прежде чем катить на прод. В обычной работе не нужен.
 
 ```bash
-brew install cloudflared          # один раз
-
-# Терминал 1 — сервер озвучки:
 cd silero-server
-./start.sh                        # покажет API-ключ, держи его
+./start.sh                 # создаёт .venv, качает модель ~200MB, печатает API-ключ
 
-# Терминал 2 — туннель:
-cd silero-server
-./tunnel.sh                       # ищи в выводе https://<...>.trycloudflare.com
+# проверка в другом терминале:
+curl -s -X POST http://localhost:8000/synthesize \
+  -H "Content-Type: application/json" -H "X-API-Key: $(cat .api_key)" \
+  -d '{"text":"проверка","speaker":"xenia"}' -o test.wav
 ```
 
-В приложении → **Настройки → Нейросетевой голос**:
-- включить **Silero TTS**
-- **Адрес сервера**: `https://<...>.trycloudflare.com` (из вывода tunnel.sh)
-- **API-ключ**: значение из `silero-server/.api_key`
-
-Проверка с компьютера:
-```bash
-curl https://<...>.trycloudflare.com/health
-```
-
----
-
-## Постоянный адрес (свой домен на Cloudflare)
-
-Чтобы URL не менялся, нужен домен, добавленный в Cloudflare (бесплатный план ок).
-
-```bash
-cloudflared tunnel login                       # авторизация в браузере
-cloudflared tunnel create silero               # создаёт туннель + креды
-cloudflared tunnel route dns silero tts.твойдомен.com
-```
-
-Создай `~/.cloudflared/config.yml`:
-```yaml
-tunnel: silero
-credentials-file: /Users/<ты>/.cloudflared/<tunnel-id>.json
-ingress:
-  - hostname: tts.твойдомен.com
-    service: http://localhost:8000
-  - service: http_status:404
-```
-
-Запуск:
-```bash
-cloudflared tunnel run silero
-```
-
-Чтобы держался в фоне и переживал перезагрузку Mac:
-```bash
-sudo cloudflared service install
-```
-
-В приложении укажи `https://tts.твойдомен.com` и тот же API-ключ.
-
----
+> Приложение зашито на прод-адрес, поэтому направить его на локальный сервер
+> нельзя — локально тестируем сервер только через `curl`.
 
 ## Заметки
 
-- Silero v3 — CPU-only, синтез быстрый; отдельный GPU не нужен.
-- Синтез идёт на твоём Mac — он должен быть включён, пока ты слушаешь.
-- Сменить ключ: удали `.api_key` и перезапусти `start.sh` (потом обнови ключ в приложении).
-- Хочешь снова чисто локально без авторизации — удали `.api_key` (тогда `SILERO_API_KEY` пуст и проверка ключа выключается).
+- Silero v3 — CPU-only, синтез быстрый; GPU не нужен.
+- Авторизация: `X-API-Key`. Локально ключ генерится в `.api_key`; на проде — в `.env`
+  (`SILERO_API_KEY`), см. `deploy/DEPLOY.md`. Пустой ключ → проверка выключена.
+- Голоса: `aidar`, `baya`, `kseniya`, `xenia`, `eugene`.

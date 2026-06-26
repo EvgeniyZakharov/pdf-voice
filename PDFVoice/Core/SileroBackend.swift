@@ -115,7 +115,10 @@ final class SileroBackend: SpeechBackend {
             } catch is CancellationError {
                 return
             } catch {
-                onEvent?(.finishedAll)
+                // Сервер недоступен/ответил ошибкой → координатор откатится на
+                // системный голос с этого предложения. На отмене (stop/переключение
+                // backend'а) — молчим, иначе откат сработал бы ложно.
+                if !Task.isCancelled { onEvent?(.failed(i)) }
                 return
             }
             guard !Task.isCancelled else { return }
@@ -153,7 +156,12 @@ final class SileroBackend: SpeechBackend {
             req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
         }
         req.httpBody = try JSONEncoder().encode(SileroRequest(text: text, speaker: speaker))
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        // Не-200 (нет сети → URLSession бросит сам; 401/500 → бросаем тут) уводит
+        // в путь отката на системный голос, а не в тихий пропуск предложения.
+        if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+            throw URLError(.badServerResponse)
+        }
         return data
     }
 

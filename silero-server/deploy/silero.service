@@ -1,0 +1,28 @@
+[Unit]
+Description=Silero TTS server (PDF Voice)
+After=network.target
+
+[Service]
+Type=simple
+User=silero
+WorkingDirectory=/home/silero/silero-server
+EnvironmentFile=/home/silero/silero-server/.env
+# Слушаем ТОЛЬКО localhost — наружу трафик пускает cloudflared, порт 8000 не торчит в интернет.
+# --workers ${WORKERS}: число параллельных процессов-воркеров (значение из .env).
+# Каждый воркер грузит свою копию модели (~1.8 ГБ RAM) → следи за памятью при росте WORKERS.
+ExecStart=/home/silero/silero-server/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers ${WORKERS}
+Restart=always
+RestartSec=3
+
+# Перезапуск при падении и подъём после reboot обеспечивает systemd.
+# Первый старт скачает модель (~200MB) — служба «прогреется» за минуту-две.
+
+# Базовое усиление безопасности.
+# ВНИМАНИЕ: НЕ ставить ProtectHome=read-only — torch скачивает модель в
+# /home/silero/.cache/torch при первом старте, иначе «Read-only file system».
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

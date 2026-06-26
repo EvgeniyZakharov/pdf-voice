@@ -97,7 +97,7 @@ PDFVoice/
 
 **AVSpeechSynthesizer — очередь сразу:** все utterances ставятся разом (в `AVSpeechBackend`). Убирает повторное чтение. Смена скорости/голоса = пере-наполнение очереди (AVSpeech не умеет менять темп посреди предложения — отсюда рестарт текущего; у Silero темп меняется на лету).
 
-**Silero и ATS:** сервер по HTTP localhost — в `Info.plist` нужен `NSAppTransportSecurity.NSAllowsLocalNetworking` (иначе iOS блокирует cleartext). Сервер требует `X-API-Key` (ключ в `silero-server/.api_key`).
+**Silero и ATS:** прод по HTTPS (`tts.pdf-voice.com`) проходит ATS по умолчанию. `NSAppTransportSecurity.NSAllowsLocalNetworking` в `Info.plist` оставлен для локальной разработки (cleartext http к localhost). Сервер требует `X-API-Key` (прод — `.env`, локально — `.api_key`).
 
 **Миниатюры:** последовательный рендер на 1 фоновой очереди + копия PDFDocument по URL.
 
@@ -160,11 +160,15 @@ rm -rf "$CONTAINER/Documents/page-cache"
 
 ## Silero TTS
 
-```bash
-cd silero-server && ./start.sh   # создаёт .venv, скачивает модель ~200MB
-```
+**Прод:** сервер развёрнут на Hetzner, работает 24/7 за `https://tts.pdf-voice.com`
+(Cloudflare Tunnel). Приложение зашито на этот адрес (`SettingsStore.sileroServerURL`/`sileroAPIKey`
+— константы, поля в Настройках убраны). Развёртывание: `silero-server/deploy/DEPLOY.md`.
+При недоступном сервере `SpeechEngine` беззвучно откатывается на системный голос
+(событие `SpeechEvent.failed` → `fallBackToSystemVoice`).
 
-Сервер на `http://0.0.0.0:8000`. В Settings приложения: включить Silero + URL. Голоса: aidar, baya, kseniya, xenia, eugene.
+**Локальная разработка:** `cd silero-server && ./start.sh` поднимает сервер на
+`localhost:8000` для обкатки правок `server.py` через curl (см. `silero-server/README.md`).
+Голоса: aidar, baya, kseniya, xenia, eugene.
 
 ---
 

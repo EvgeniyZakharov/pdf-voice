@@ -13,7 +13,14 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 app = FastAPI()
+# Внутри одного процесса синтез строго последовательный (один torch не любит
+# параллельный apply_tts). Параллелизм даёт несколько процессов: uvicorn --workers N.
 executor = ThreadPoolExecutor(max_workers=1)
+
+# Потоки torch НА ПРОЦЕСС. Цель: WORKERS * TORCH_THREADS ≈ числу vCPU, иначе
+# воркеры переподпишут ядра и синтез замедлится у всех. По умолчанию 2.
+torch.set_num_threads(int(os.environ.get("TORCH_THREADS", "2")))
+print(f"[pid {os.getpid()}] torch threads = {torch.get_num_threads()}")
 
 SAMPLE_RATE = 24000
 SPEAKERS = ["aidar", "baya", "kseniya", "xenia", "eugene"]
@@ -39,6 +46,7 @@ model, _ = torch.hub.load(
     model="silero_tts",
     language="ru",
     speaker="v3_1_ru",
+    trust_repo=True,  # не спрашивать интерактивно (служба без stdin → иначе Aborted!)
 )
 print("Модель загружена. Сервер готов.")
 

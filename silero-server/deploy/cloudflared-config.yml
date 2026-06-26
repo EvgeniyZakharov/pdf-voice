@@ -1,0 +1,14 @@
+# Конфиг named-туннеля Cloudflare для Silero.
+# Положить на сервере в:  /home/silero/.cloudflared/config.yml
+#
+# <TUNNEL-UUID> — подставится автоматически шагами из DEPLOY.md
+# (cloudflared tunnel create silero вернёт UUID и создаст credentials-файл).
+
+tunnel: <TUNNEL-UUID>
+credentials-file: /home/silero/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: tts.pdf-voice.com
+    service: http://127.0.0.1:8000
+  # всё остальное — 404 (обязательный «catch-all» в конце)
+  - service: http_status:404

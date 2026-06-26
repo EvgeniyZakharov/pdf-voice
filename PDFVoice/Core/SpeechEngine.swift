@@ -115,8 +115,20 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
                 self.spokenWordRange = r
             case .finishedAll:
                 self.isSpeaking = false
+            case .failed(let i):
+                self.fallBackToSystemVoice(from: i)
             }
         }
+    }
+
+    /// Silero-сервер недоступен: беззвучно переключаемся на системный голос и
+    /// продолжаем озвучку с того же предложения. Присвоение `sileroServerURL = nil`
+    /// в своём didSet остановит Silero, сделает active = avBackend и (т.к. isSpeaking
+    /// ещё true) доиграет очередь с `currentIndex` системным движком.
+    private func fallBackToSystemVoice(from index: Int) {
+        guard active === sileroBackend else { isSpeaking = false; return }
+        currentIndex = clamp(index)
+        sileroServerURL = nil
     }
 
     private func handleAudioInterruption(_ notification: Notification) {

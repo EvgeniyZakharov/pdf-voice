@@ -61,8 +61,6 @@ struct ReaderView: View {
         }
         .onDisappear { model.endSession() }
         .onChange(of: settings.selectedVoice)      { _ in model.applySettings(settings) }
-        .onChange(of: settings.sileroServerURL)    { _ in model.applySettings(settings); settings.probeSilero() }
-        .onChange(of: settings.sileroAPIKey)       { _ in model.applySettings(settings) }
     }
 
     // MARK: - Тулбар
@@ -259,17 +257,29 @@ private struct PlayerControls: View {
     }
 
     var body: some View {
-        // Play строго по центру всей ширины, скорость — на левом краю.
+        // Транспорт (пред. / play / след. предложение) по центру, скорость слева.
         ZStack {
-            Button { model.togglePlayPause() } label: {
-                Image(systemName: speech.isSpeaking ? "pause.fill" : "play.fill")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(Theme.onAccent)
-                    .frame(width: 62, height: 62)
-                    .background(Theme.accent, in: Circle())
-                    .shadow(color: Theme.accent.opacity(0.25), radius: 5, y: 2)
+            HStack(spacing: 24) {
+                Button { speech.skipBackward() } label: {
+                    Image(systemName: "gobackward")
+                        .font(.system(size: 26))
+                        .foregroundStyle(Theme.accent)
+                }
+                Button { model.togglePlayPause() } label: {
+                    Image(systemName: speech.isSpeaking ? "pause.fill" : "play.fill")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(Theme.onAccent)
+                        .frame(width: 62, height: 62)
+                        .background(Theme.accent, in: Circle())
+                        .shadow(color: Theme.accent.opacity(0.25), radius: 5, y: 2)
+                }
+                .buttonStyle(.plain)
+                Button { speech.skipForward() } label: {
+                    Image(systemName: "goforward")
+                        .font(.system(size: 26))
+                        .foregroundStyle(Theme.accent)
+                }
             }
-            .buttonStyle(.plain)
             HStack {
                 speedMenu
                 Spacer()

@@ -37,8 +37,11 @@ final class SettingsStore: ObservableObject {
 
     /// Выбранный голос: "sys:<identifier>" (системный) или "silero:<speaker>".
     @Published var selectedVoice: String  { didSet { ud.set(selectedVoice,   forKey: "pv.selectedVoice") } }
-    @Published var sileroServerURL: String { didSet { ud.set(sileroServerURL, forKey: "pv.sileroURL")     } }
-    @Published var sileroAPIKey: String   { didSet { ud.set(sileroAPIKey,    forKey: "pv.sileroAPIKey")  } }
+
+    /// Продакшн-сервер Silero. Зашит в приложение — пользователь его не настраивает,
+    /// подключение к улучшенным голосам происходит автоматически.
+    let sileroServerURL = "https://tts.pdf-voice.com"
+    let sileroAPIKey    = "n8tJPX6qpWSpLH7GRNWwCCcb0JQoQCZX"
 
     @Published var appearance: AppAppearance { didSet { ud.set(appearance.rawValue, forKey: "pv.appearance") } }
     @Published var libraryLayout: LibraryLayout { didSet { ud.set(libraryLayout.rawValue, forKey: "pv.libraryLayout") } }
@@ -49,10 +52,13 @@ final class SettingsStore: ObservableObject {
     init() {
         pauseBetweenSentences = ud.object(forKey: "pv.pause") as? Double ?? 0.3
         selectedVoice         = ud.string(forKey: "pv.selectedVoice") ?? VoiceCatalog.defaultSelection()
-        sileroServerURL       = ud.string(forKey: "pv.sileroURL")     ?? "https://elementary-comm-bundle-chester.trycloudflare.com"
-        sileroAPIKey          = ud.string(forKey: "pv.sileroAPIKey")  ?? "fTf4NSY-CgBp6EueBT0yyEDKa6VtUO_v"
         appearance            = AppAppearance(rawValue: ud.string(forKey: "pv.appearance") ?? "") ?? .system
         libraryLayout         = LibraryLayout(rawValue: ud.string(forKey: "pv.libraryLayout") ?? "") ?? .list
+
+        // Чистим старые сохранённые адрес/ключ — раньше настраивались вручную,
+        // теперь сервер вшит в приложение.
+        ud.removeObject(forKey: "pv.sileroURL")
+        ud.removeObject(forKey: "pv.sileroAPIKey")
     }
 
     /// Пингует Silero-сервер и обновляет `sileroReachable`.

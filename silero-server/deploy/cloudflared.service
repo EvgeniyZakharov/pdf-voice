@@ -1,0 +1,15 @@
+[Unit]
+Description=cloudflared tunnel (PDF Voice Silero)
+After=network.target
+
+[Service]
+Type=simple
+User=silero
+# Запуск named-туннеля под пользователем silero с нашим конфигом.
+# cert.pem и credentials .json лежат в /home/silero/.cloudflared (создаются в §5).
+ExecStart=/usr/bin/cloudflared tunnel --config /home/silero/.cloudflared/config.yml run silero
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
