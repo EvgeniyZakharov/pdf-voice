@@ -84,3 +84,91 @@ OCR-страницы — низкоприоритетная очередь, не
 `requestPriorityLoad` для OCR-документов (`ReaderViewModel.swift:320`).
 - **Тест:** симулятор — на смешанном PDF текст доступен сразу, сканы дочитываются
   фоном; прыжок на нераспознанную страницу OCR-книги не даёт немой страницы.
+
+---
+
+# Фаза 2 — Мультиформат (TXT, FB2, EPUB, DOCX; DjVu опц.)
+
+## Статус: MF0–MF3 реализованы ✅ (TXT/FB2/EPUB/DOCX), сборка зелёная, харнессы пройдены
+
+- **MF0** (фундамент): `BookFormat`, `Sentence.charOffset`, `LibraryItem.format` (вычисляемое из имени — без миграции), `importBook` с сохранением расширения, пикер на все форматы.
+- **MF1** (TXT): `PlainTextSource` (UTF-8/CP1251), `ReflowReaderView` (TextKit: подсветка диапазоном, авто-скролл, тап). Проверено пользователем в симуляторе ✅.
+- **MF2** (FB2): `FB2Source` (XMLParser, главы по `<title>`, пропуск сносок).
+- **MF3** (EPUB+DOCX): свой `ZipArchive` (Compression, **без ZIPFoundation** — ноль зависимостей), `EPUBSource` (container→OPF→spine→XHTML, лёгкий HTML-стриппер), `DOCXSource`.
+- Инвариант выравнивания подсветки (`chapterOffsets[pageIndex]+charOffset == rawText`) проверен харнессами на синтетике И реальном crime.epub (28 900 предложений).
+
+**Решение vs план:** ZIPFoundation НЕ добавлялась — минимальный read-only zip-ридер на системном `Compression` (метод stored/deflate) в духе проекта (минимум зависимостей, воспроизводимая сборка). Кэш v3 для reflow пока не делался (парсинг быстрый; пересмотреть, если крупные EPUB будут парситься заметно медленно).
+
+**Риск к проверке:** крупный EPUB (crime.epub ~1.17 млн символов) рендерится одним `NSAttributedString` в `UITextView` — возможна задержка лейаута TextKit1. Митигация (бэклог): рендер по главам / TextKit2 / ленивая подгрузка.
+
+### Исходный детальный план фаз ниже.
+
+## Статус (старое): в работе (M-формат)
+
+Цель: «полноценная читалка» — добавить reflowable-форматы поверх существующего
+PDF-движка. Ключевая ось масштабирования — **формат извлечения** (`DocumentSource`)
+и **рендерер** (paged PDFKit vs reflow TextKit). Всё ниже `Sentence` —
+формат-независимо (`appendSentences` → `TextPipeline`/`RussianProfile`).
+
+**Решение по рендерингу (подтверждено пользователем):** настоящий reflow-рендерер
+(TextKit/UITextView), не convert-to-PDF. 4 из 4 текстовых форматов требуют reflow.
+
+### Важная находка анализа (корректность)
+Прогрессивная постраничная машинерия (`displayDocument`, `loadedPageCount`,
+`revealPages`, `sourceDoc`) завязана на `PDFDocument`/`PDFPage.copy()` — для reflow
+её НЕ используем. Reflow: парсим книгу целиком (текст быстрый, в отличие от OCR),
+рендерим всё содержимое, кладём предложения разом/по главам. `pageIndex` для reflow =
+**логический индекс главы** (тот же слот в `Bookmark.pageIndex`). `ThumbnailGridView`/
+скраббер — PDF-only; для reflow вместо них оглавление по главам.
+
+### MF0. Формат-шов (рефакторинг, PDF-путь не меняется)
+- `BookFormat` (enum + детекция по UTI/расширению).
+- `LibraryItem.format: BookFormat` (Codable, дефолт `.pdf` — обратная совместимость
+  старых `library.json`).
+- `Sentence.charOffset: Int?` (аддитивно; reflow-локатор, PDF живёт на `range`/`boxes`).
+- Протокол `DocumentSource` (`loadContent`/`sentences`); `PDFDocumentSource` оборачивает
+  текущие `PDFTextExtractor`/`OCRTextExtractor`.
+- `DocumentStore.importPDF` → обобщённый `import(from:)` (сохраняет оригинальное
+  расширение); `LibraryView.fileImporter` — список UTI по форматам.
+- `ReaderViewModel`: верхнеуровневый режим `paged` vs `reflow`; роутинг в `load()` по
+  `format`, а не «валиден ли PDFDocument».
+- Кэш v3 (`SentencePageCache schemaVersion=3`): для reflow хранит
+  `rawText, charOffset, chapterIndex, isHeading, language` (без `range`/`boxes`).
+- **Тест:** golden-регрессия — поток предложений PDF побайтно идентичен; сборка зелёная;
+  старая `library.json` без `format` декодируется (дефолт `.pdf`).
+
+### MF1. TXT + ReflowRenderer (валидирует весь reflow-стек)
+- `PlainTextSource` (детекция кодировки UTF-8/Windows-1251).
+- `ReflowRenderer` (UITextView/TextKit, скролл-режим): рендер `BookContent`, подсветка
+  фоном `NSAttributedString` на диапазоне предложения (`charOffset`+длина), авто-скролл,
+  тап → ближайший символьный индекс → предложение.
+- **Тест:** харнесс на парсинг/кодировки + поток предложений; подсветку/скролл/тап —
+  симулятор (qa-tester).
+
+### MF2. FB2 (приоритет — рунет, без зависимостей)
+- `FB2Source` на `XMLParser`: `<section>/<p>` → абзацы, `<title>` → `isHeading` +
+  глава, `<body name="notes">` → сноски (в конец/пропуск).
+- Бонус: оглавление по главам + название главы в Now-Playing.
+- **Тест:** харнесс на реальном FB2 (главы, заголовки, кодировка).
+
+### MF3. EPUB + DOCX (общая zip-зависимость)
+- Зависимость: **ZIPFoundation** через SPM (`project.yml` → `packages`). Закрывает оба.
+- `EPUBSource`: `container.xml` → OPF → `spine` → XHTML → текст/атрибуты (лёгкий парсер
+  или `NSAttributedString(data:.html)` — main-thread/медленно, осторожно с перфом).
+- `DOCXSource`: `word/document.xml` → `<w:p>/<w:t>` → абзацы.
+- **Тест:** харнесс на тестовых epub/docx; рендер/подсветка — симулятор.
+
+### MF4. DjVu (опционально, отдельное решение)
+Fixed-layout скан → ложится на paged/OCR-путь, не reflow. В iOS нет нативного декодера
+→ обёртка над DjVuLibre (C++, тяжело) либо рендер страниц в изображения → Vision-OCR.
+Брать только если в аудитории реально много DjVu; иначе отложить.
+
+### Сквозное (после форматов)
+Настройки reflow (размер шрифта, тема, межстрочный); навигация по главам + глава в
+Now-Playing. UI: единая библиотека, бейдж формата на обложке, фильтр по формату,
+индикатор готовности (распространить «%» с OCR на парсинг).
+
+### Риски
+Перф `NSAttributedString.html` (main-thread); кодировки TXT/FB2 (Windows-1251);
+ZIPFoundation + XcodeGen; синхронизация подсветки в reflow (новая механика);
+инвалидация при смене шрифта (поэтому кэш хранит логический `charOffset`).

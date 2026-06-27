@@ -20,6 +20,16 @@ final class ReaderViewModel: ObservableObject {
     /// PDFKitView показывает его — пользователь не может прокрутить на неготовую страницу.
     let displayDocument = PDFDocument()
 
+    // MARK: - Reflow (TXT/FB2/EPUB/DOCX)
+    /// Логическая модель reflow-книги (nil для PDF). Наличие → показываем ReflowReaderView.
+    @Published private(set) var bookContent: BookContent?
+    /// Плоский текст книги для TextKit-рендера (см. `BookContent.flatten`).
+    private(set) var reflowFlatText: String = ""
+    /// Глобальные смещения начала глав — для маппинга подсветки предложения.
+    private(set) var reflowChapterOffsets: [Int] = []
+    /// Перетекающий ли формат — развилка слоя отображения в `ReaderView`.
+    var isReflowable: Bool { item.format.isReflowable }
+
     let speech = SpeechEngine()
     let sleepTimer = SleepTimer()
 
@@ -106,6 +116,11 @@ final class ReaderViewModel: ObservableObject {
     // MARK: - Загрузка
 
     func load() {
+        // Reflow-форматы не имеют PDFDocument — ветка ДО PDF-гарда.
+        if item.format.isReflowable {
+            loadReflow()
+            return
+        }
         guard let doc = PDFDocument(url: item.fileURL) else {
             loadError = "Не удалось открыть PDF."
             return
@@ -142,6 +157,55 @@ final class ReaderViewModel: ObservableObject {
             // Смешанный: часть страниц с текстовым слоем, часть — сканы.
             documentMode = .mixed
             loadMixed(doc)
+        }
+    }
+
+    // MARK: - Reflow-путь (TXT/FB2/EPUB/DOCX)
+
+    /// Парсит reflow-книгу целиком off-main (текст быстрый — в отличие от OCR,
+    /// постраничная прогрессия не нужна), затем кладёт предложения в плеер.
+    /// Постраничная машинерия displayDocument/loadedPageCount НЕ используется.
+    private func loadReflow() {
+        let format = item.format
+        let url = item.fileURL
+
+        Task {
+            let parsed: ReflowParse? = await Task.detached(priority: .userInitiated) {
+                guard let source = Self.reflowSource(for: format, url: url) else { return nil }
+                guard let content = try? source.parse(), !content.isEmpty else { return nil }
+                let sentences = ReflowExtractor.sentences(from: content)
+                let flat = content.flatten()
+                return ReflowParse(content: content, sentences: sentences,
+                                   text: flat.text, chapterOffsets: flat.chapterOffsets)
+            }.value
+
+            guard let parsed, !parsed.sentences.isEmpty else {
+                loadError = "Не удалось извлечь текст из файла."
+                return
+            }
+
+            bookContent = parsed.content
+            reflowFlatText = parsed.text
+            reflowChapterOffsets = parsed.chapterOffsets
+            totalPageCount = parsed.content.chapters.count
+            finishLoading(parsed.sentences)
+        }
+    }
+
+    private struct ReflowParse {
+        let content: BookContent
+        let sentences: [Sentence]
+        let text: String
+        let chapterOffsets: [Int]
+    }
+
+    nonisolated private static func reflowSource(for format: BookFormat, url: URL) -> ReflowSource? {
+        switch format {
+        case .txt: return PlainTextSource(url: url)
+        case .fb2: return FB2Source(url: url)
+        case .epub: return EPUBSource(url: url)
+        case .docx: return DOCXSource(url: url)
+        default: return nil   // .pdf/.djvu — не reflow
         }
     }
 

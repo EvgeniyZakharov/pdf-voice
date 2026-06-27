@@ -20,13 +20,15 @@ final class DocumentStore: ObservableObject {
 
     // MARK: - Импорт
 
-    /// Копирует выбранный пользователем PDF внутрь Documents и добавляет в библиотеку.
+    /// Копирует выбранную пользователем книгу внутрь Documents и добавляет в библиотеку.
+    /// Сохраняет оригинальное расширение — оно определяет `LibraryItem.format`.
     @discardableResult
-    func importPDF(from sourceURL: URL) throws -> LibraryItem {
+    func importBook(from sourceURL: URL) throws -> LibraryItem {
         let needsScope = sourceURL.startAccessingSecurityScopedResource()
         defer { if needsScope { sourceURL.stopAccessingSecurityScopedResource() } }
 
-        let destName = "\(UUID().uuidString).pdf"
+        let ext = sourceURL.pathExtension.isEmpty ? "pdf" : sourceURL.pathExtension.lowercased()
+        let destName = "\(UUID().uuidString).\(ext)"
         let destURL = DocumentStore.documentsDirectory.appendingPathComponent(destName)
         try fileManager.copyItem(at: sourceURL, to: destURL)
 

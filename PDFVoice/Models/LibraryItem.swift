@@ -50,4 +50,8 @@ struct LibraryItem: Codable, Identifiable, Hashable {
     var fileURL: URL {
         DocumentStore.documentsDirectory.appendingPathComponent(fileName)
     }
+
+    /// Формат книги выводится из расширения `fileName` — единый источник истины,
+    /// без миграции `library.json` (старые записи `uuid.pdf` → `.pdf`).
+    var format: BookFormat { BookFormat.detect(fileName: fileName) }
 }

@@ -130,6 +130,51 @@ struct ReaderView: View {
         if let error = model.loadError {
             infoMessage(icon: "exclamationmark.triangle", text: error)
         } else if audioReady {
+            if model.isReflowable {
+                reflowContent
+            } else {
+                pdfContent
+            }
+        } else {
+            preparingView
+        }
+    }
+
+    // MARK: - Контент reflow (TXT/FB2/EPUB/DOCX)
+
+    private var reflowContent: some View {
+        ZStack(alignment: .topLeading) {
+            ReflowReaderView(text: model.reflowFlatText,
+                             chapterOffsets: model.reflowChapterOffsets,
+                             highlight: model.currentSentence,
+                             sentences: model.speech.sentences,
+                             onTap: { index, point in
+                                 if let index {
+                                     tapPoint = point
+                                     withAnimation(.easeOut(duration: 0.12)) { pendingIndex = index }
+                                 } else {
+                                     withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+                                 }
+                             })
+                .compositingGroup()
+                .overlay(
+                    Theme.pageBackground
+                        .blendMode(.multiply)
+                        .allowsHitTesting(false)
+                )
+
+            if let index = pendingIndex {
+                playHereBubble(for: index)
+                    .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
+    }
+
+    // MARK: - Контент PDF
+
+    @ViewBuilder
+    private var pdfContent: some View {
             ZStack(alignment: .topLeading) {
                 PDFKitView(document: model.displayDocument,
                            readyPageCount: model.loadedPageCount,
@@ -169,9 +214,6 @@ struct ReaderView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 }
             }
-        } else {
-            preparingView
-        }
     }
 
     /// Экран подготовки: показывается, пока аудио не готово (нет предложений).

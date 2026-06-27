@@ -50,7 +50,7 @@ struct LibraryView: View {
                 OnboardingView(isPresented: $showOnboarding)
             }
             .fileImporter(isPresented: $showingImporter,
-                          allowedContentTypes: [.pdf],
+                          allowedContentTypes: BookFormat.importContentTypes,
                           allowsMultipleSelection: false) { result in
                 handleImport(result)
             }
@@ -150,7 +150,7 @@ struct LibraryView: View {
         case .success(let urls):
             guard let url = urls.first else { return }
             do {
-                try store.importPDF(from: url)
+                try store.importBook(from: url)
             } catch {
                 importError = error.localizedDescription
             }

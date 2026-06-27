@@ -20,15 +20,20 @@ struct Sentence: Identifiable {
     let isHeading: Bool
     /// Язык предложения — передаётся в кэш для возможного использования синтезатором.
     let language: String
+    /// Reflow-локатор: смещение начала предложения (UTF-16) в тексте главы/секции.
+    /// Используется ReflowRenderer (TextKit) вместо PDF-привязок `range`/`boxes`.
+    /// Для PDF-форматов остаётся nil; для reflow `pageIndex` несёт индекс главы.
+    let charOffset: Int?
 
     init(rawText: String, pageIndex: Int, range: NSRange? = nil, boxes: [CGRect] = [],
-         isHeading: Bool = false, language: String = "ru") {
+         isHeading: Bool = false, language: String = "ru", charOffset: Int? = nil) {
         self.rawText = rawText
         self.pageIndex = pageIndex
         self.range = range
         self.boxes = boxes
         self.isHeading = isHeading
         self.language = language
+        self.charOffset = charOffset
     }
 }
 
