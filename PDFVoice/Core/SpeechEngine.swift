@@ -181,9 +181,13 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         activateAudioSession()
         if sileroServerURL != nil {
             isSpeaking = true
-            // Silero не поддерживает истинный pause/resume — перезапускаем с текущей позиции.
-            active.play(sentences: sentences, from: currentIndex,
-                        speed: speed, render: render(_:))
+            if sileroBackend.isPausedMidClip {
+                // Клип жив, currentTime сохранён — продолжаем с места остановки.
+                sileroBackend.resume()
+            } else {
+                active.play(sentences: sentences, from: currentIndex,
+                            speed: speed, render: render(_:))
+            }
         } else {
             // AVSpeech: если синтезатор на паузе — продолжаем; иначе — play с начала.
             if avBackend.isPaused {
@@ -209,6 +213,20 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
     func skipForward()  { play(from: currentIndex + 1) }
     func skipBackward() { play(from: currentIndex - 1) }
+
+    /// Перейти к предложению, сохранив текущее play/pause.
+    /// Играет → продолжить с новой позиции; на паузе → только переставить позицию
+    /// (@Published currentIndex → highlight/авто-скролл) и персистировать прогресс.
+    func seek(to index: Int) {
+        guard !sentences.isEmpty else { return }
+        let i = clamp(index)
+        if isSpeaking {
+            play(from: i)
+        } else {
+            currentIndex = i
+            onIndexChange?(i)
+        }
+    }
 
     /// Перемещает курсор без запуска воспроизведения.
     func seekSilent(to index: Int) {

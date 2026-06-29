@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
+<description><title-info>
+<book-title>Тестовая книга FB2</book-title>
+<author><first-name>Иван</first-name><last-name>Тестов</last-name></author>
+<lang>ru</lang>
+</title-info></description>
+<body>
+<title><p>Тестовая книга FB2</p></title>
+<section>
+<title><p>Глава первая</p></title>
+<p>Первое предложение первой главы. Второе предложение для проверки разбиения.</p>
+<p>Новый абзац. Здесь ещё одна фраза с вопросом?</p>
+</section>
+<section>
+<title><p>Глава вторая</p></title>
+<p>Текст второй главы начинается тут. И заканчивается здесь.</p>
+</section>
+</body>
+</FictionBook>

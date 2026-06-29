@@ -16,6 +16,28 @@ struct ReaderView: View {
     @State private var jumpToken = 0
     @State private var showThumbnails = false
     @State private var showBookmarks = false
+    // Reflow-навигация (не делим состояние с pageBar)
+    @State private var showChapters = false
+
+    // MARK: - Follow-режим (reflow)
+    /// Текущая позиция скролла reflow-вьюшки (0…1); НЕ привязана к позиции озвучки.
+    @State private var reflowScrollFraction = 0.0
+    /// Индекс главы у верха вьюпорта (из onScroll репорта).
+    @State private var reflowTopChapter = 0
+    /// Инкрементируется перед каждой новой командой, чтобы updateUIView её применил.
+    @State private var reflowCommandToken = 0
+    /// Тегированная команда для ReflowReaderView (nil = нет активной команды).
+    @State private var reflowCommand: ReflowCommand? = nil
+
+    // MARK: - Follow-режим (PDF)
+    /// Инкрементируется при необходимости вернуться к чтению в PDF-вьюшке.
+    @State private var pdfReturnToken = 0
+
+    // MARK: - Кнопка возврата (общая для reflow и PDF)
+    /// Показывать полупрозрачную кнопку «Вернуться к чтению».
+    @State private var showReturnButton = false
+    /// Пользователь сейчас тащит reflow-слайдер — гасит обратную связь от onScroll.
+    @State private var isReflowScrubbing = false
 
     init(item: LibraryItem) {
         _model = StateObject(wrappedValue: ReaderViewModel(item: item, store: nil))
@@ -33,7 +55,10 @@ struct ReaderView: View {
         VStack(spacing: 0) {
             content
             if audioReady {
-                if pageCount > 1 {
+                if model.isReflowable {
+                    Divider()
+                    reflowBar
+                } else if pageCount > 1 {
                     Divider()
                     pageBar
                 }
@@ -52,6 +77,9 @@ struct ReaderView: View {
         }
         .sheet(isPresented: $showBookmarks) {
             BookmarksView(model: model)
+        }
+        .sheet(isPresented: $showChapters) {
+            ChapterListView(model: model)
         }
         .onAppear {
             model.attach(store: store)
@@ -112,6 +140,50 @@ struct ReaderView: View {
         }
     }
 
+    // MARK: - Навигация reflow
+
+    private var reflowBar: some View {
+        HStack(spacing: 14) {
+            if model.hasChapters {
+                Button { showChapters = true } label: {
+                    Image(systemName: "list.bullet")
+                        .font(.body)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .accessibilityLabel("Содержание")
+            }
+            // Слайдер привязан к позиции СКРОЛЛА, не к позиции озвучки.
+            // Реактивный: прокручивает вид ВЖИВУЮ во время перетаскивания.
+            // model.seek() НЕ вызывается: аудио переключается только по «Читать отсюда».
+            Slider(value: $reflowScrollFraction, in: 0...1) { editing in
+                isReflowScrubbing = editing
+            }
+            .accessibilityValue("\(Int(reflowScrollFraction * 100)) процентов")
+            .onChange(of: reflowScrollFraction) { value in
+                // Команду шлём только когда тащит пользователь — иначе обновление
+                // фракции из onScroll (скролл/озвучка) ушло бы в ложную прокрутку.
+                if isReflowScrubbing {
+                    reflowCommandToken += 1
+                    reflowCommand = .scrollToFraction(value, token: reflowCommandToken)
+                }
+            }
+
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("\(Int(reflowScrollFraction * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if model.hasChapters {
+                    Text("Гл. \(reflowTopChapter + 1)/\(model.chapterCount)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(minWidth: 64, alignment: .trailing)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+    }
+
     private func requestJump(to page: Int) {
         let clamped = max(0, min(page, max(pageCount - 1, 0)))
         jumpToken += 1
@@ -123,7 +195,19 @@ struct ReaderView: View {
         currentPage = clamped
     }
 
-    // MARK: - Контент PDF
+    // MARK: - Возврат к чтению
+
+    /// Прокрутить к текущей подсветке и возобновить следование.
+    private func returnToReading() {
+        if model.isReflowable {
+            reflowCommandToken += 1
+            reflowCommand = .returnToReading(token: reflowCommandToken)
+        } else {
+            pdfReturnToken += 1
+        }
+    }
+
+    // MARK: - Контент
 
     @ViewBuilder
     private var content: some View {
@@ -155,7 +239,14 @@ struct ReaderView: View {
                                  } else {
                                      withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
                                  }
-                             })
+                             },
+                             onScroll: { f, ch, vis, following in
+                                 // Пока юзер тащит слайдер — он источник истины, не перебиваем.
+                                 if !isReflowScrubbing { reflowScrollFraction = f }
+                                 reflowTopChapter = ch
+                                 withAnimation { showReturnButton = !following && !vis }
+                             },
+                             command: reflowCommand)
                 .compositingGroup()
                 .overlay(
                     Theme.pageBackground
@@ -169,51 +260,85 @@ struct ReaderView: View {
                     .transition(.scale.combined(with: .opacity))
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            returnButton
+        }
     }
 
     // MARK: - Контент PDF
 
     @ViewBuilder
     private var pdfContent: some View {
-            ZStack(alignment: .topLeading) {
-                PDFKitView(document: model.displayDocument,
-                           readyPageCount: model.loadedPageCount,
-                           highlight: model.currentSentence,
-                           sentences: model.speech.sentences,
-                           pageJump: pageJump,
-                           onTap: { index, point in
-                               if let index {
-                                   tapPoint = point
-                                   withAnimation(.easeOut(duration: 0.12)) { pendingIndex = index }
-                               } else {
-                                   withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
-                               }
-                           },
-                           onPageChange: { page in
-                               currentPage = page
-                               model.updateVisiblePage(page)
-                           })
-                    // Тёплая «бумага»: multiply тонирует белые страницы в крем,
-                    // чёрный текст остаётся читаемым. compositingGroup ограничивает
-                    // смешивание самим PDF.
-                    .compositingGroup()
-                    .overlay(
-                        Theme.pageBackground
-                            .blendMode(.multiply)
-                            .allowsHitTesting(false)
-                    )
+        ZStack(alignment: .topLeading) {
+            PDFKitView(document: model.displayDocument,
+                       readyPageCount: model.loadedPageCount,
+                       highlight: model.currentSentence,
+                       sentences: model.speech.sentences,
+                       pageJump: pageJump,
+                       onTap: { index, point in
+                           if let index {
+                               tapPoint = point
+                               withAnimation(.easeOut(duration: 0.12)) { pendingIndex = index }
+                           } else {
+                               withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+                           }
+                       },
+                       onPageChange: { page in
+                           currentPage = page
+                           model.updateVisiblePage(page)
+                       },
+                       onFollowChanged: { vis, following in
+                           withAnimation { showReturnButton = !following && !vis }
+                       },
+                       returnToReadingToken: pdfReturnToken)
+                // Тёплая «бумага»: multiply тонирует белые страницы в крем,
+                // чёрный текст остаётся читаемым. compositingGroup ограничивает
+                // смешивание самим PDF.
+                .compositingGroup()
+                .overlay(
+                    Theme.pageBackground
+                        .blendMode(.multiply)
+                        .allowsHitTesting(false)
+                )
 
-                if let index = pendingIndex {
-                    playHereBubble(for: index)
-                        .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
-                        .transition(.scale.combined(with: .opacity))
-                }
-
-                if let progress = model.ocrProgress {
-                    ocrProgressBanner(progress)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                }
+            if let index = pendingIndex {
+                playHereBubble(for: index)
+                    .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
+                    .transition(.scale.combined(with: .opacity))
             }
+
+            if let progress = model.ocrProgress {
+                ocrProgressBanner(progress)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            returnButton
+        }
+    }
+
+    // MARK: - Кнопка возврата к чтению
+
+    /// Полупрозрачная круглая кнопка, появляющаяся когда:
+    /// - следование за чтением приостановлено (!isFollowing)
+    /// - текущая подсветка не видна во вьюпорте (!highlightVisible)
+    @ViewBuilder
+    private var returnButton: some View {
+        if showReturnButton {
+            Button { returnToReading() } label: {
+                Image(systemName: "text.viewfinder")
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay(Circle().stroke(Theme.accent.opacity(0.5), lineWidth: 1))
+                    .foregroundStyle(Theme.accent)
+                    .opacity(0.85)
+            }
+            .accessibilityLabel("Вернуться к чтению")
+            .padding(.trailing, 16)
+            .padding(.bottom, 12)
+            .transition(.scale.combined(with: .opacity))
+        }
     }
 
     /// Экран подготовки: показывается, пока аудио не готово (нет предложений).
@@ -246,16 +371,24 @@ struct ReaderView: View {
         Button {
             model.speech.play(from: index)
             withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+            // После «Читать отсюда» возобновляем следование — вид должен ехать
+            // за новой позицией чтения, а не оставаться там, где пользователь тапнул.
+            if model.isReflowable {
+                reflowCommandToken += 1
+                reflowCommand = .returnToReading(token: reflowCommandToken)
+            } else {
+                pdfReturnToken += 1
+            }
         } label: {
-            Label("Отсюда", systemImage: "play.fill")
-                .font(.subheadline.weight(.semibold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(Theme.accent, in: Capsule())
+            Image(systemName: "play.fill")
+                .font(.subheadline.weight(.bold))
+                .frame(width: 44, height: 44)
+                .background(Theme.accent, in: Circle())
                 .foregroundStyle(Theme.onAccent)
                 .shadow(radius: 4, y: 2)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("Читать отсюда")
     }
 
     private func ocrProgressBanner(_ progress: Double) -> some View {

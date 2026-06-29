@@ -27,6 +27,11 @@ struct PDFKitView: UIViewRepresentable {
     var onTap: (Int?, CGPoint) -> Void
     /// Сообщает наверх текущую страницу при прокрутке.
     var onPageChange: (Int) -> Void
+    /// Сообщает наверх: видима ли подсветка и активно ли следование.
+    /// Вызывается после каждого изменения подсветки и при ручном взаимодействии.
+    var onFollowChanged: (Bool, Bool) -> Void = { _, _ in }
+    /// При смене токена: проскролл к текущей подсветке и возобновление следования.
+    var returnToReadingToken: Int = 0
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -70,12 +75,30 @@ struct PDFKitView: UIViewRepresentable {
             view.layoutDocumentView()
         }
 
-        // Команда перехода на страницу (скраббер/миниатюры) — приоритетнее подсветки.
+        // Возврат к чтению: кнопка возврата или «Читать отсюда» (приоритет выше pageJump).
+        if returnToReadingToken != context.coordinator.lastReturnToken {
+            context.coordinator.lastReturnToken = returnToReadingToken
+            if let sentence = highlight, let page = document.page(at: sentence.pageIndex) {
+                if let range = sentence.range, let selection = page.selection(for: range) {
+                    view.go(to: selection)
+                } else if !sentence.boxes.isEmpty {
+                    var union = CGRect.null
+                    for box in sentence.boxes { union = union.union(box) }
+                    if !union.isNull { view.go(to: union, on: page) }
+                }
+            }
+            context.coordinator.isFollowing = true
+            context.coordinator.reportFollowChanged()
+        }
+
+        // Команда перехода на страницу (скраббер/миниатюры) → browse-режим.
         if let jump = pageJump,
            jump.token != context.coordinator.lastJumpToken,
            let page = document.page(at: jump.page) {
             context.coordinator.lastJumpToken = jump.token
             view.go(to: page)
+            context.coordinator.isFollowing = false
+            context.coordinator.reportFollowChanged()
         }
 
         // Подсветку перестраиваем только при смене предложения (не на каждое слово).
@@ -89,7 +112,8 @@ struct PDFKitView: UIViewRepresentable {
             // Текстовый слой — нативная подсветка выделением.
             selection.color = UIColor.systemYellow.withAlphaComponent(0.45)
             view.highlightedSelections = [selection]
-            view.go(to: selection)
+            // Авто-прокрутка только при активном следовании.
+            if context.coordinator.isFollowing { view.go(to: selection) }
         } else if !sentence.boxes.isEmpty {
             // OCR — подсветка аннотациями по боксам строк.
             view.highlightedSelections = nil
@@ -101,10 +125,13 @@ struct PDFKitView: UIViewRepresentable {
                 context.coordinator.ocrAnnotations.append((page, annotation))
                 union = union.union(box)
             }
-            if !union.isNull { view.go(to: union, on: page) }
+            if !union.isNull, context.coordinator.isFollowing { view.go(to: union, on: page) }
         } else {
             view.highlightedSelections = nil
         }
+
+        // Уведомляем родителя о состоянии следования после применения подсветки.
+        context.coordinator.reportFollowChanged()
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
@@ -115,6 +142,10 @@ struct PDFKitView: UIViewRepresentable {
         var lastReadyCount: Int = 0
         /// Текущие подсветки-аннотации для OCR-страниц (чтобы снять при смене предложения).
         var ocrAnnotations: [(PDFPage, PDFAnnotation)] = []
+        /// Активно ли следование вида за текущим предложением.
+        var isFollowing = true
+        /// Токен последнего выполненного returnToReading (дедупликация).
+        var lastReturnToken: Int = 0
 
         /// KVO-наблюдение за contentOffset внутреннего scroll view PDFView.
         private var scrollObservation: NSKeyValueObservation?
@@ -139,6 +170,40 @@ struct PDFKitView: UIViewRepresentable {
             scrollObservation = scrollView.observe(\.contentOffset, options: [.new]) {
                 [weak self] _, _ in self?.reportVisiblePage()
             }
+            // Детект ручного взаимодействия (pan/pinch) для паузы следования.
+            // Надёжнее, чем переопределять делегат PDFView (внутренний делегат PDFKit).
+            scrollView.panGestureRecognizer.addTarget(self, action: #selector(userInteracted(_:)))
+            scrollView.pinchGestureRecognizer?.addTarget(self, action: #selector(userInteracted(_:)))
+        }
+
+        /// Вычисляет, видима ли текущая подсветка в PDFView.
+        /// Возвращает true если подсветки нет — кнопку возврата показывать не надо.
+        func computeHighlightVisible() -> Bool {
+            guard let pdfView, let sentence = parent.highlight else { return true }
+            guard let page = parent.document.page(at: sentence.pageIndex) else { return true }
+            if let range = sentence.range, let selection = page.selection(for: range) {
+                let boundsInView = pdfView.convert(selection.bounds(for: page), from: page)
+                return pdfView.bounds.intersects(boundsInView)
+            } else if !sentence.boxes.isEmpty {
+                for box in sentence.boxes {
+                    let boxInView = pdfView.convert(box, from: page)
+                    if pdfView.bounds.intersects(boxInView) { return true }
+                }
+                return false
+            }
+            return true
+        }
+
+        func reportFollowChanged() {
+            let vis = computeHighlightVisible()
+            parent.onFollowChanged(vis, isFollowing)
+        }
+
+        /// Срабатывает при начале pan или pinch — пользователь вручную скроллит/зумирует.
+        @objc func userInteracted(_ gesture: UIGestureRecognizer) {
+            guard gesture.state == .began else { return }
+            isFollowing = false
+            reportFollowChanged()
         }
 
         /// Определяет страницу по центру вьюпорта и сообщает наверх (с дедупом).

@@ -30,6 +30,11 @@ final class ReaderViewModel: ObservableObject {
     /// Перетекающий ли формат — развилка слоя отображения в `ReaderView`.
     var isReflowable: Bool { item.format.isReflowable }
 
+    // Предрасчитанный индекс первого предложения каждой главы.
+    // chapterFirstSentence[ch] = индекс в speech.sentences; count == chapterCount.
+    // Заполняется однократно в finishLoading для reflow-пути.
+    private var chapterFirstSentence: [Int] = []
+
     let speech = SpeechEngine()
     let sleepTimer = SleepTimer()
 
@@ -98,6 +103,44 @@ final class ReaderViewModel: ObservableObject {
 
     /// Полное число страниц в исходном документе (включая ещё не загруженные).
     var totalPages: Int { totalPageCount }
+
+    // MARK: - Reflow навигация
+
+    /// Прогресс чтения по позиции озвучки (0...1).
+    /// Считается от speech.currentIndex, а не от пиксельного скролла — единственный
+    /// источник истины совпадает с currentSentenceIndex и переживает смену шрифта.
+    var reflowProgress: Double {
+        let n = speech.sentences.count
+        guard n > 1 else { return 0 }
+        return Double(speech.currentIndex) / Double(n - 1)
+    }
+
+    var chapterCount: Int { bookContent?.chapters.count ?? 0 }
+    /// Показывать кнопку «Содержание» только если глав > 1 (у TXT обычно одна).
+    var hasChapters: Bool { chapterCount > 1 }
+    /// Индекс текущей главы: в reflow-пути sentence.pageIndex == индекс главы.
+    var currentChapterIndex: Int { currentSentence?.pageIndex ?? 0 }
+
+    var chapterTitles: [String] {
+        (bookContent?.chapters.enumerated().map { i, ch in
+            let t = ch.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (t?.isEmpty == false) ? t! : "Глава \(i + 1)"
+        }) ?? []
+    }
+
+    /// Перейти к дробной позиции книги, сохранив play/pause.
+    func seek(toFraction f: Double) {
+        let n = speech.sentences.count
+        guard n > 0 else { return }
+        let idx = Int((f * Double(n - 1)).rounded())
+        speech.seek(to: idx)
+    }
+
+    /// Перейти к началу главы, сохранив play/pause.
+    func seekToChapter(_ chapter: Int) {
+        guard chapterFirstSentence.indices.contains(chapter) else { return }
+        speech.seek(to: chapterFirstSentence[chapter])
+    }
 
     // MARK: - Растущий документ
 
@@ -648,6 +691,26 @@ final class ReaderViewModel: ObservableObject {
     }
 
     private func finishLoading(_ sentences: [Sentence]) {
+        if isReflowable {
+            let n = bookContent?.chapters.count ?? 0
+            // Для каждого ch ищем первый индекс предложения где s.pageIndex == ch.
+            // Пустым главам выставляем ближайшую следующую позицию (backward pass).
+            var mapping = [Int](repeating: 0, count: n)
+            var found   = [Bool](repeating: false, count: n)
+            for (idx, s) in sentences.enumerated() {
+                let ch = s.pageIndex
+                if ch < n && !found[ch] {
+                    mapping[ch] = idx
+                    found[ch] = true
+                }
+            }
+            var fallback = sentences.isEmpty ? 0 : sentences.count - 1
+            for i in stride(from: n - 1, through: 0, by: -1) {
+                if !found[i] { mapping[i] = fallback }
+                else { fallback = mapping[i] }
+            }
+            chapterFirstSentence = mapping
+        }
         speech.load(sentences: sentences, startIndex: item.currentSentenceIndex)
         nowPlaying = NowPlayingController(speech: speech, title: item.title)
     }

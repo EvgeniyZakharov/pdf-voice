@@ -20,6 +20,10 @@ final class SileroBackend: SpeechBackend {
 
     private var audioPlayer: AVAudioPlayer?
     private var sileroTask: Task<Void, Never>?
+    /// true когда pause() остановил воспроизведение посреди клипа (плеер жив, currentTime сохранён).
+    private(set) var isPausedMidClip = false
+    /// Индекс предложения, чей клип сейчас играет (или последним играл).
+    private var queueIndex = 0
 
     // MARK: - SpeechBackend
 
@@ -41,12 +45,28 @@ final class SileroBackend: SpeechBackend {
 
     func pause() {
         sileroTask?.cancel()
-        audioPlayer?.stop()
-        audioPlayer = nil
+        sileroTask = nil
+        audioPlayer?.pause()
+        // Плеер не nil — currentTime сохраняется для resume().
+        isPausedMidClip = audioPlayer.map { $0.currentTime > 0 && $0.currentTime < $0.duration } ?? false
     }
 
     func resume() {
-        // Вызывается координатором после pause(); он сам вызывает play(from:) с нужным индексом.
+        guard isPausedMidClip, let player = audioPlayer else { return }
+        isPausedMidClip = false
+        let resumeIndex = queueIndex
+        sileroTask = Task { [weak self] in
+            guard let self else { return }
+            player.play()
+            // Оставшееся время клипа в стеновых секундах (контент / скорость).
+            let remaining = max(0, player.duration - player.currentTime) / Double(max(0.5, currentSpeed))
+            let extra = currentSentences.indices.contains(resumeIndex) && currentSentences[resumeIndex].isHeading ? headingPause : 0
+            let pauseAfter = max(0, pauseBetweenSentences) + max(0, extra)
+            do { try await Task.sleep(nanoseconds: UInt64((remaining + pauseAfter) * 1_000_000_000)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            await self.runQueue(from: resumeIndex + 1)
+        }
     }
 
     func stop() {
@@ -54,6 +74,7 @@ final class SileroBackend: SpeechBackend {
         sileroTask = nil
         audioPlayer?.stop()
         audioPlayer = nil
+        isPausedMidClip = false
     }
 
     func setSpeed(_ speed: Double) {
@@ -108,6 +129,7 @@ final class SileroBackend: SpeechBackend {
                 pending?.cancel()
                 return
             }
+            self.queueIndex = i
             onEvent?(.didStart(i))
             let data: Data
             do {
