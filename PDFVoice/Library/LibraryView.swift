@@ -4,13 +4,15 @@ import UniformTypeIdentifiers
 struct LibraryView: View {
     @EnvironmentObject private var store: DocumentStore
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var coordinator: PlaybackCoordinator
+    @State private var path: [LibraryItem] = []
     @State private var showingImporter = false
     @State private var importError: String?
     @State private var showSettings = false
     @State private var showOnboarding = !UserDefaults.standard.bool(forKey: "pv.onboarded")
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             Group {
                 if store.items.isEmpty {
                     emptyState
@@ -18,6 +20,15 @@ struct LibraryView: View {
                     gridView
                 } else {
                     listView
+                }
+            }
+            // Мини-плеер живёт на корневом экране библиотеки; при пуше ReaderView он
+            // естественно перекрыт. safeAreaInset резервирует место — список не прячется.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if let active = coordinator.active {
+                    MiniPlayerView(model: active,
+                                   onOpen: { path.append(active.libraryItem) },
+                                   onClose: { coordinator.stop() })
                 }
             }
             .navigationTitle("Библиотека")
@@ -139,6 +150,7 @@ struct LibraryView: View {
 
     private func deleteButton(_ item: LibraryItem) -> some View {
         Button(role: .destructive) {
+            coordinator.stopIfActive(item.id)
             store.delete(item)
         } label: {
             Label("Удалить", systemImage: "trash")
@@ -160,6 +172,9 @@ struct LibraryView: View {
     }
 
     private func deleteItems(_ offsets: IndexSet) {
-        offsets.map { store.items[$0] }.forEach(store.delete)
+        offsets.map { store.items[$0] }.forEach { item in
+            coordinator.stopIfActive(item.id)
+            store.delete(item)
+        }
     }
 }

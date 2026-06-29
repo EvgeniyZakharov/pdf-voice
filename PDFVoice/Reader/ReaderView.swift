@@ -2,10 +2,28 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
+/// Тонкий резолвер сессии: тело читалки переехало в `ReaderScreen`. Сама сессия
+/// (`ReaderViewModel`) принадлежит `PlaybackCoordinator` и переживает уход с экрана —
+/// поэтому здесь `@ObservedObject`, а не `@StateObject` (см. specs/R2).
 struct ReaderView: View {
-    @EnvironmentObject private var store: DocumentStore
+    let item: LibraryItem
+    @EnvironmentObject private var coordinator: PlaybackCoordinator
+
+    var body: some View {
+        if let model = coordinator.active, model.itemID == item.id {
+            ReaderScreen(model: model)
+        } else {
+            // Книга ещё не открыта в координаторе — стартуем и ждём один кадр.
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onAppear { coordinator.open(item) }
+        }
+    }
+}
+
+private struct ReaderScreen: View {
     @EnvironmentObject private var settings: SettingsStore
-    @StateObject private var model: ReaderViewModel
+    @ObservedObject var model: ReaderViewModel
 
     @State private var pendingIndex: Int?
     @State private var tapPoint: CGPoint = .zero
@@ -38,10 +56,6 @@ struct ReaderView: View {
     @State private var showReturnButton = false
     /// Пользователь сейчас тащит reflow-слайдер — гасит обратную связь от onScroll.
     @State private var isReflowScrubbing = false
-
-    init(item: LibraryItem) {
-        _model = StateObject(wrappedValue: ReaderViewModel(item: item, store: nil))
-    }
 
     /// Скраббер и pageBar работают по числу готовых страниц.
     private var pageCount: Int { model.loadedPageCount }
@@ -81,13 +95,9 @@ struct ReaderView: View {
         .sheet(isPresented: $showChapters) {
             ChapterListView(model: model)
         }
-        .onAppear {
-            model.attach(store: store)
-            model.applySettings(settings)
-            model.load()
-            settings.probeSilero()
-        }
-        .onDisappear { model.endSession() }
+        // Сессия (attach/applySettings/load) поднята в PlaybackCoordinator.open — здесь
+        // НЕ грузим и НЕ завершаем её: при уходе в библиотеку аудио продолжает играть (R2).
+        .onAppear { settings.probeSilero() }
         .onChange(of: settings.selectedVoice)      { _ in model.applySettings(settings) }
     }
 
@@ -412,8 +422,11 @@ struct ReaderView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Статические хелперы (используются SettingsView)
+}
 
+// MARK: - Статические хелперы (используются SettingsView и PlayerControls)
+
+extension ReaderView {
     static func speedLabel(_ value: Double) -> String {
         let str = value == value.rounded() ? String(Int(value)) : String(value)
         return str + "×"

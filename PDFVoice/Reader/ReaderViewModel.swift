@@ -54,6 +54,11 @@ final class ReaderViewModel: ObservableObject {
     // Постраничная классификация для смешанного режима.
     private var pageKinds: [PageKind] = []
 
+    /// Идентификатор книги — координатор сравнивает сессии по нему.
+    var itemID: UUID { item.id }
+    /// Книга сессии — для мини-плеера (обложка/заголовок) и возврата в читалку.
+    var libraryItem: LibraryItem { item }
+
     init(item: LibraryItem, store: DocumentStore?) {
         self.item = item
         self.store = store
