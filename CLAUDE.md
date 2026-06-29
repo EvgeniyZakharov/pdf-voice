@@ -42,7 +42,8 @@ PDFVoice/
 │   │                                колонтитулы (detectBoilerplate + Windowed), номера страниц
 │   ├── SpeechBackend.swift        — протокол движка синтеза + SpeechEvent + SpokenMarkup
 │   ├── AVSpeechBackend.swift      — AVSpeechSynthesizer (enqueue-all); ударения U+0301 игнорит
-│   ├── SileroBackend.swift        — Silero (fetch-play-loop); ударения рендерит как «+» после гласной
+│   ├── SileroBackend.swift        — Silero (fetch-play-loop); истинный pause/resume (AVAudioPlayer
+│   │                                pause→продолжение с позиции); ударения как «+» после гласной
 │   ├── SpeechEngine.swift         — КООРДИНАТОР: выбор backend, очередь-намерение, подсветка
 │   │                                из событий, Now-Playing, прерывания; render на воспроизведении
 │   ├── TTSProvider.swift          — протокол-шов (load/play/pause/...)
@@ -55,10 +56,15 @@ PDFVoice/
 │   ├── NowPlayingController.swift — экран блокировки, MPRemoteCommandCenter
 │   └── SleepTimer.swift
 ├── Reader/
-│   ├── ReaderViewModel.swift     — загрузка: классификация → text/ocr/mixed, прогрессивно,
-│   │                                displayDocument (показ только готовых страниц)
-│   ├── ReaderView.swift          — UI читалки; preparingView; показ только готовых страниц
-│   ├── PDFKitView.swift          — UIViewRepresentable; растущий displayDocument; подсветка
+│   ├── ReaderViewModel.swift     — загрузка: классификация → text/ocr/mixed/reflow, прогрессивно,
+│   │                                displayDocument; reflow: bookContent/chapterOffsets, seek, главы
+│   ├── ReaderView.swift          — UI читалки; pageBar (PDF) / reflowBar (ползунок+%+Содержание);
+│   │                                кнопка «Вернуться к чтению»; playHereBubble (иконка ▶)
+│   ├── PDFKitView.swift          — UIViewRepresentable PDF; растущий displayDocument; подсветка;
+│   │                                follow-режим (go(to:) под isFollowing)
+│   ├── ReflowReaderView.swift    — UITextView (TextKit 1) для reflow; подсветка диапазоном;
+│   │                                тап→ближайшее предложение; follow-режим + ReflowCommand
+│   ├── ChapterListView.swift     — лист «Содержание» (главы reflow), переход без принуд. play
 │   ├── BookmarksView.swift       — список закладок
 │   └── ThumbnailGridView.swift   — сетка миниатюр; плейсхолдеры для неготовых страниц
 ├── Library/  (LibraryView, DocumentStore, BookCoverView)
@@ -97,6 +103,12 @@ PDFVoice/
 
 **AVSpeechSynthesizer — очередь сразу:** все utterances ставятся разом (в `AVSpeechBackend`). Убирает повторное чтение. Смена скорости/голоса = пере-наполнение очереди (AVSpeech не умеет менять темп посреди предложения — отсюда рестарт текущего; у Silero темп меняется на лету).
 
+**Silero истинный pause/resume:** `SileroBackend.pause()` ставит `AVAudioPlayer.pause()` (сохраняет `currentTime`), `resume()` доигрывает текущий клип с места и продолжает очередь с `queueIndex+1`. `SpeechEngine.resume()` различает «пауза посреди предложения» (`isPausedMidClip` → продолжить) и «старт» (`play(from:)`). Раньше Silero перечитывал предложение с начала.
+
+**Reflow-рендер и навигация (R4):** reflow-форматы (TXT/FB2/EPUB/DOCX) рендерятся в `ReflowReaderView` — один `UITextView` (TextKit 1, `usingTextLayoutManager:false` — нужен `textStorage` для подсветки) с плоским текстом книги (`BookContent.flatten`). Навигация — `reflowBar` (не `pageBar`): ползунок = позиция ПРОКРУТКИ, «%» книги, «Содержание» (`ChapterListView`) при глав>1. «Страница N/M» в reflow нет (текст перетекает). Тап → БЛИЖАЙШЕЕ предложение (`closestPosition` + минимальная дистанция до диапазона; строгое `NSLocationInRange` промахивалось на зазорах `\n\n` между абзацами/главами).
+
+**Развязка «позиция чтения» ↔ «позиция просмотра» (R17, reflow и PDF):** вид следует за подсветкой только при `isFollowing`. Ручной скролл / зум (PDF) / драг ползунка → `isFollowing=false` → смена предложения НЕ дёргает вид. Полупрозрачная кнопка «Вернуться к чтению» (справа внизу) показывается, когда читаемое предложение ушло из вида; тап → скролл к подсветке + следование. Аудио/позиция чтения переключается ТОЛЬКО явно (тап «Отсюда» ▶ / skip) — ползунок reflow аудио НЕ двигает (скроллит вид). Детект ручного жеста: reflow — `UITextViewDelegate.scrollViewWillBeginDragging`; PDF — target на `panGestureRecognizer`/`pinchGestureRecognizer`. **Инвариант:** по умолчанию (юзер не вмешался) следование идентично прежнему; PDF-пагинация/`pageBar`/миниатюры не тронуты.
+
 **Silero и ATS:** прод по HTTPS (`tts.pdf-voice.com`) проходит ATS по умолчанию. `NSAppTransportSecurity.NSAllowsLocalNetworking` в `Info.plist` оставлен для локальной разработки (cleartext http к localhost). Сервер требует `X-API-Key` (прод — `.env`, локально — `.api_key`).
 
 **Миниатюры:** последовательный рендер на 1 фоновой очереди + копия PDFDocument по URL.
@@ -115,12 +127,17 @@ PDFVoice/
 - **Фаза 0b — робастность PDF:** постраничный `classifyPage`; единый конвейер очистки OCR (паритет с текстом); `loadMixed` для смешанных PDF; фикс `requestPriorityLoad` для OCR; оконный детект колонтитулов; под-строчные OCR-боксы.
 - **UX:** показ только готовых к озвучке страниц (`displayDocument`); синхронизация аудио ↔ показа страниц.
 
+**Читалка reflow-форматов и UX озвучки (idb-проверено на EPUB/FB2/PDF):**
+- **R4 — навигация reflow:** `reflowBar` (ползунок=скролл + «%» + «Содержание»/главы), `ChapterListView`, `seek` без принуд. play. PDF-`pageBar` не тронут.
+- **R17 — развязка чтения/просмотра:** follow-режим (`isFollowing`) + кнопка «Вернуться к чтению»; ползунок reflow скроллит вид (реактивно), аудио не дёргает.
+- **Фиксы:** тап «Отсюда» в reflow (ближайшее предложение + `closestPosition` + координаты пузырька при прокрутке); истинный pause/resume Silero (не перечитывает предложение); пузырёк «Отсюда» → иконка-кнопка ▶.
+
 **Прод и подготовка к релизу:**
 - **Silero на сервере:** вынесен из локального quick-tunnel на отдельную машину (Hetzner CX23) за постоянным HTTPS `https://tts.pdf-voice.com` (Cloudflare named-tunnel, без открытых портов). Деплой воспроизводим: `silero-server/deploy/` (`DEPLOY.md`, systemd-юниты, `benchmark.py`). CPU-torch, `WORKERS`/`TORCH_THREADS` под нагрузку.
 - **Приложение зашито на прод:** `sileroServerURL`/`sileroAPIKey` — константы, поля в Настройках убраны, подключение к нейроголосам автоматическое.
 - **Offline-fallback:** при недоступном сервере `SpeechEngine` беззвучно переходит на системный голос (`SpeechEvent.failed` → `fallBackToSystemVoice`), без обрыва чтения — снимает риск App Store.
 
-Все логические этапы проверены автономными Swift-харнессами (компиляция реальных файлов + ассерты) и golden-регрессией. Аудио/визуал проверяет пользователь вручную.
+Все логические этапы проверены автономными Swift-харнессами (компиляция реальных файлов + ассерты) и golden-регрессией. UI/визуал и интерактив (тап, скролл, кнопки) проверяются в симуляторе через **idb** (accessibility-дерево + тап/свайп) + скриншоты `simctl`. Аудио на слух проверяет пользователь.
 
 ---
 
@@ -158,8 +175,13 @@ rm -rf "$CONTAINER/Documents/page-cache"
 **Проверка логики без симулятора** (быстро, без GUI): компилировать нужные `Core/`-файлы
 напрямую через `swiftc` + harness с `main.swift` и ассертами. Тексто-чистка/лингвистика
 тестируются так (см. историю: golden-регрессия, тесты ударений/числительных, OCR на
-реальных страницах через Vision). Аудио и визуал PDFView — только глазами/слухом в
-симуляторе (пользователь).
+реальных страницах через Vision).
+
+**UI/интерактив в симуляторе через `idb`** (установлен; CLI на PATH `/opt/homebrew/bin/idb`):
+`idb ui describe-all --udid <UDID>` — accessibility-дерево (искать элемент по `AXLabel`, брать
+центр `frame`); `idb ui tap/swipe` — тап/скролл без угадывания координат; `xcrun simctl io
+booted screenshot` — скриншот. Так проверяются тап «Отсюда», скролл/ползунок, кнопка возврата
+и т.п. Аудио на слух — только пользователь.
 
 ---
 
