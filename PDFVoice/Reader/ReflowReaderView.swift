@@ -291,7 +291,14 @@ struct ReflowReaderView: UIViewRepresentable {
             let fraction = max(0, min(1, tv.contentOffset.y / maxY))
             let topChapter = computeTopChapter(tv)
             let visible = isReturning ? true : computeHighlightVisible(tv)
-            parent.onScroll(fraction, topChapter, visible, isFollowing)
+            let isFollowing = self.isFollowing
+            // Захват onScroll по значению (struct-замыкание): вычисления сделаны
+            // синхронно, но ВЫЗОВ колбэка выносим за проход updateUIView — иначе
+            // мутация @State родителя внутри рендера даёт «undefined behavior».
+            let callback = parent.onScroll
+            DispatchQueue.main.async {
+                callback(fraction, topChapter, visible, isFollowing)
+            }
         }
 
         // MARK: - UIScrollViewDelegate (через UITextViewDelegate)
