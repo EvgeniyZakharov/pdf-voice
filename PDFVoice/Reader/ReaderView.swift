@@ -94,7 +94,9 @@ private struct ReaderScreen: View {
         }
         .sheet(isPresented: $showChapters) {
             ChapterListView(model: model) { chapter in
-                // Прыжок к главе скроллит ВИД (browse), без запуска озвучки — как PDF.
+                // Тап по главе = переход ПОЗИЦИИ ЧТЕНИЯ (как закладка): играет → озвучка
+                // продолжается с главы; на паузе → курсор переставлен без принудительного play.
+                model.seekToChapter(chapter)
                 reflowCommandToken += 1
                 reflowCommand = .scrollToChapter(chapter, token: reflowCommandToken)
             }

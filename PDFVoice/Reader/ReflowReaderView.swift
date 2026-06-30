@@ -106,9 +106,9 @@ struct ReflowReaderView: UIViewRepresentable {
                         context.coordinator.reportScroll(tv)
                     }
                 case .scrollToChapter(let ch, _):
-                    // Прыжок к главе = навигация ВИДА (browse), без запуска озвучки —
-                    // как тап по миниатюре в PDF. Аудио/позицию чтения не трогаем.
-                    context.coordinator.isFollowing = false
+                    // Переход позиции чтения: вид следует за новой подсветкой,
+                    // play/pause сохраняется методом seekToChapter.
+                    context.coordinator.isFollowing = true
                     let offsets = chapterOffsets
                     if offsets.indices.contains(ch) {
                         context.coordinator.scrollCharToTop(offsets[ch], animated: false)
