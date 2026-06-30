@@ -16,7 +16,8 @@ enum Theme {
     /// Контрастный цвет поверх акцента (глиф на кнопке play, текст на пузырьке).
     static let onAccent = Color(UIColor { $0.userInterfaceStyle == .dark ? warmDark : warmLight })
 
-    /// Кремовая «бумага» книги (#F4ECDC — `--w-surface-bg` сайта).
+    /// Кремовая «бумага» PDF (#F4ECDC — `--w-surface-bg` сайта). Reflow-страница
+    /// использует `ReadingTheme.pageBackgroundUI` (тема чтения); PDF — всегда эту.
     static let pageBackground = Color(red: 244.0/255, green: 236.0/255, blue: 220.0/255)
     static let pageBackgroundUI = UIColor(red: 244.0/255, green: 236.0/255, blue: 220.0/255, alpha: 1)
 }

@@ -21,7 +21,6 @@ struct PDFVoiceApp: App {
                 .environmentObject(settings)
                 .environmentObject(coordinator)
                 .tint(Theme.accent)
-                .preferredColorScheme(settings.appearance.colorScheme)
         }
     }
 }

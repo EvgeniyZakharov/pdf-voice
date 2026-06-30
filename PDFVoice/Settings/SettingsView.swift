@@ -80,7 +80,8 @@ struct SettingsView: View {
             }
             .onDisappear { previewer.stop() }
         }
-        // Применяем тему внутри листа, иначе смена видна только после переоткрытия.
-        .preferredColorScheme(settings.appearance.colorScheme)
+        // Тема задаётся глобально через .appearanceOverride на корне приложения
+        // (overrideUserInterfaceStyle окна) — на sheet'ах надёжнее, чем
+        // .preferredColorScheme, который застревал при возврате на «Системную».
     }
 }

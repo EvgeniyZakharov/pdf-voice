@@ -106,6 +106,21 @@ private struct ReaderScreen: View {
     @ToolbarContentBuilder
     private var toolbarItems: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            // Фон чтения — только для reflow (на PDF тема не влияет). Смена на лету:
+            // ReflowReaderView.updateUIView перекрашивает фон/текст без переоткрытия книги.
+            if model.isReflowable {
+                Menu {
+                    Picker("Фон чтения", selection: $settings.readingTheme) {
+                        ForEach(ReadingTheme.allCases) { theme in
+                            Text(theme.title).tag(theme)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "circle.lefthalf.filled")
+                }
+                .accessibilityLabel("Фон чтения")
+            }
+
             // Закладки — открывает список; добавление через + внутри листа
             let hasBookmarkOnPage = model.bookmarks.contains(where: { $0.pageIndex == currentPage })
             Button {
@@ -256,13 +271,11 @@ private struct ReaderScreen: View {
                                  reflowTopChapter = ch
                                  withAnimation { showReturnButton = !following && !vis }
                              },
-                             command: reflowCommand)
-                .compositingGroup()
-                .overlay(
-                    Theme.pageBackground
-                        .blendMode(.multiply)
-                        .allowsHitTesting(false)
-                )
+                             command: reflowCommand,
+                             theme: settings.readingTheme)
+                // Фон reflow задаёт сама тема (ReadingTheme.pageBackgroundUI) — кремового
+                // multiply-оверлея здесь нет (он тонировал бы светлую/тёмную темы). PDF
+                // свой оверлей сохраняет (см. pdfContent).
 
             if let index = pendingIndex {
                 playHereBubble(for: index)

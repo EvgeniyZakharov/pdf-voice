@@ -32,6 +32,8 @@ struct LibraryView: View {
                 }
             }
             .navigationTitle("Библиотека")
+            // Холодный старт: didSet appearance не срабатывает на значении из init.
+            .onAppear { AppearanceController.apply(settings.appearance) }
             .navigationDestination(for: LibraryItem.self) { item in
                 ReaderView(item: item)
             }

@@ -43,7 +43,14 @@ final class SettingsStore: ObservableObject {
     let sileroServerURL = "https://tts.pdf-voice.com"
     let sileroAPIKey    = "n8tJPX6qpWSpLH7GRNWwCCcb0JQoQCZX"
 
-    @Published var appearance: AppAppearance { didSet { ud.set(appearance.rawValue, forKey: "pv.appearance") } }
+    @Published var appearance: AppAppearance {
+        didSet {
+            ud.set(appearance.rawValue, forKey: "pv.appearance")
+            AppearanceController.apply(appearance)   // живое применение к окну (sheet'ы тоже)
+        }
+    }
+    /// Тема страницы чтения (reflow). Независима от `appearance`. По умолчанию — сепия.
+    @Published var readingTheme: ReadingTheme { didSet { ud.set(readingTheme.rawValue, forKey: "pv.readingTheme") } }
     @Published var libraryLayout: LibraryLayout { didSet { ud.set(libraryLayout.rawValue, forKey: "pv.libraryLayout") } }
 
     /// Доступен ли Silero-сервер (не сохраняется — определяется ping'ом /health).
@@ -53,6 +60,7 @@ final class SettingsStore: ObservableObject {
         pauseBetweenSentences = ud.object(forKey: "pv.pause") as? Double ?? 0.3
         selectedVoice         = ud.string(forKey: "pv.selectedVoice") ?? VoiceCatalog.defaultSelection()
         appearance            = AppAppearance(rawValue: ud.string(forKey: "pv.appearance") ?? "") ?? .system
+        readingTheme          = ReadingTheme(rawValue: ud.string(forKey: "pv.readingTheme") ?? "") ?? .sepia
         libraryLayout         = LibraryLayout(rawValue: ud.string(forKey: "pv.libraryLayout") ?? "") ?? .list
 
         // Чистим старые сохранённые адрес/ключ — раньше настраивались вручную,

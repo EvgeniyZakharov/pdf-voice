@@ -32,6 +32,8 @@ struct ReflowReaderView: UIViewRepresentable {
     var onScroll: (Double, Int, Bool, Bool) -> Void = { _, _, _, _ in }
     /// Тегированная команда от родителя; применяется в updateUIView при смене токена.
     var command: ReflowCommand? = nil
+    /// Тема страницы (фон + текст + подсветка). Применяется на лету в updateUIView.
+    var theme: ReadingTheme = .sepia
 
     private static let fontSize: CGFloat = 19
 
@@ -43,10 +45,11 @@ struct ReflowReaderView: UIViewRepresentable {
         let tv = UITextView(usingTextLayoutManager: false)
         tv.isEditable = false
         tv.isSelectable = false          // тап обрабатываем сами (play-here)
-        tv.backgroundColor = Theme.pageBackgroundUI
+        tv.backgroundColor = theme.pageBackgroundUI
         tv.alwaysBounceVertical = true
         tv.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 48, right: 20)
-        tv.attributedText = Coordinator.makeAttributed(text)
+        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI)
+        context.coordinator.lastTheme = theme
         // Coordinator становится делегатом скролла для детекта ручного взаимодействия.
         tv.delegate = context.coordinator
 
@@ -62,7 +65,17 @@ struct ReflowReaderView: UIViewRepresentable {
 
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
-            tv.attributedText = Coordinator.makeAttributed(text)
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI)
+            context.coordinator.lastHighlightID = nil
+            context.coordinator.lastRange = nil
+        }
+
+        // Смена темы чтения на лету: фон + перекраска текста. Re-attribute сбрасывает
+        // подсветку — обнуляем трекинг, чтобы блок ниже применил её заново нужным цветом.
+        if context.coordinator.lastTheme != theme {
+            context.coordinator.lastTheme = theme
+            tv.backgroundColor = theme.pageBackgroundUI
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI)
             context.coordinator.lastHighlightID = nil
             context.coordinator.lastRange = nil
         }
@@ -104,6 +117,8 @@ struct ReflowReaderView: UIViewRepresentable {
         var lastText: String
         var lastHighlightID: UUID?
         var lastRange: NSRange?
+        /// Последняя применённая тема — для перекраски в updateUIView при смене.
+        var lastTheme: ReadingTheme = .sepia
         /// Активно ли следование вида за текущим предложением.
         var isFollowing = true
         /// Токен последней применённой команды (дедупликация в updateUIView).
@@ -114,13 +129,13 @@ struct ReflowReaderView: UIViewRepresentable {
             self.lastText = parent.text
         }
 
-        static func makeAttributed(_ text: String) -> NSAttributedString {
+        static func makeAttributed(_ text: String, color: UIColor) -> NSAttributedString {
             let para = NSMutableParagraphStyle()
             para.lineSpacing = 5
             para.paragraphSpacing = 10
             return NSAttributedString(string: text, attributes: [
                 .font: UIFont.systemFont(ofSize: ReflowReaderView.fontSize),
-                .foregroundColor: UIColor.label,
+                .foregroundColor: color,
                 .paragraphStyle: para,
             ])
         }
@@ -145,7 +160,7 @@ struct ReflowReaderView: UIViewRepresentable {
             let range = globalRange(for: s)
             if let range {
                 storage.addAttribute(.backgroundColor,
-                                     value: UIColor.systemYellow.withAlphaComponent(0.4),
+                                     value: parent.theme.highlightUI,
                                      range: range)
             }
             lastRange = range
