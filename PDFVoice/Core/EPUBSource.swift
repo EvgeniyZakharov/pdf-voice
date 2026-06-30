@@ -108,10 +108,15 @@ enum HTMLText {
         s = stripTags(s)
         s = decodeEntities(s)
 
-        let lines = s.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+        // .whitespacesAndNewlines (а не .whitespaces): HTML с CRLF оставляет строки из
+        // одного «\r» (U+000D). .whitespaces его НЕ триммит → пустые абзацы выживали как
+        // непустые строки → огромные пустые отступы. .whitespacesAndNewlines включает \r.
+        let lines = s.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        return (lines.joined(separator: "\n\n"), heading)
+        // Абзацы — одинарным «\n»: зазор даёт paragraphSpacing рендерера. Двойной
+        // «\n\n» создавал пустой абзац высотой в строку → огромные отступы.
+        return (lines.joined(separator: "\n"), heading)
     }
 
     private static func stripTags(_ s: String) -> String {

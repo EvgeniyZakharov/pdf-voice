@@ -7,8 +7,26 @@ struct PlainTextSource: ReflowSource {
 
     func parse() throws -> BookContent {
         let data = try Data(contentsOf: url)
-        let text = Self.decode(data)
+        let text = Self.normalize(Self.decode(data))
         return BookContent(chapters: [BookChapter(title: nil, text: text)])
+    }
+
+    /// Приводит «сырой» TXT к абзацам, разделённым одинарным «\n» (зазор даёт
+    /// paragraphSpacing рендерера). Абзацы в TXT разделены пустой строкой; внутри
+    /// абзаца переносы строк «мягкие» (хард-врап) — разворачиваем их в пробел.
+    /// Без этого пустые строки давали огромные отступы, а хард-врап — рваный текст.
+    static func normalize(_ raw: String) -> String {
+        let unified = raw.replacingOccurrences(of: "\r\n", with: "\n")
+                         .replacingOccurrences(of: "\r", with: "\n")
+        let paragraphs = unified.components(separatedBy: "\n\n")
+            .map { para in
+                para.split(separator: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " ")
+            }
+            .filter { !$0.isEmpty }
+        return paragraphs.joined(separator: "\n")
     }
 
     /// Порядок проб важен: UTF-8 строгий (отвергает невалидные последовательности),

@@ -22,7 +22,9 @@ struct DOCXSource: ReflowSource {
             throw NSError(domain: "DOCX", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "DOCX без текста"])
         }
-        return BookContent(chapters: [BookChapter(title: nil, text: paras.joined(separator: "\n\n"))])
+        // Абзацы — одинарным «\n» (зазор от paragraphSpacing); «\n\n» давал пустой
+        // абзац высотой в строку → огромные отступы между абзацами.
+        return BookContent(chapters: [BookChapter(title: nil, text: paras.joined(separator: "\n"))])
     }
 }
 

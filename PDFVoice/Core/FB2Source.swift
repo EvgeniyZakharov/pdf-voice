@@ -116,7 +116,9 @@ private final class FB2Delegate: NSObject, XMLParserDelegate {
             // как isHeading при токенизации. Также сохраняем в BookChapter.title (TOC).
             var blocks = ch.paras
             if let t = ch.title, !t.isEmpty { blocks.insert(t, at: 0) }
-            return BookChapter(title: ch.title, text: blocks.joined(separator: "\n\n"))
+            // Абзацы — одинарным «\n» (зазор от paragraphSpacing); «\n\n» давал
+            // пустой абзац высотой в строку → огромные отступы между абзацами.
+            return BookChapter(title: ch.title, text: blocks.joined(separator: "\n"))
         }
         return BookContent(chapters: result)
     }
