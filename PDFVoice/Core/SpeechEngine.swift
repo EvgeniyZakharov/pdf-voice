@@ -25,7 +25,10 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
     @Published var voice: AVSpeechSynthesisVoice? = SpeechEngine.bestRussianVoice() {
         didSet {
-            guard isSpeaking, voice !== oldValue, sileroServerURL == nil else { return }
+            // Всегда синхронизируем avBackend.voice, даже если Silero активен —
+            // чтобы fallback на системный голос сразу взял актуальный голос.
+            // avBackend.setVoice пере-наполняет очередь только если синтезатор играет/на паузе.
+            guard voice !== oldValue else { return }
             avBackend.setVoice(voice)
         }
     }
