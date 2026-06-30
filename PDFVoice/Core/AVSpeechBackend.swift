@@ -3,10 +3,15 @@ import Foundation
 
 /// Backend синтеза речи на базе системного AVSpeechSynthesizer.
 ///
-/// Все оставшиеся предложения ставятся в очередь синтезатора разом — он сам
-/// проигрывает их подряд. Это исключает повторное чтение, которое возникало
-/// при ручной схеме «доречь следующее в didFinish». Подсветка ведётся по
-/// делегату `didStart`. Перемотка/смена скорости/голоса пере-наполняют очередь с позиции.
+/// Оконная очередь (WINDOW_SIZE предложений): вместо постановки всего массива разом
+/// держим в синтезаторе окно ~50 предложений и дозаполняем его по мере воспроизведения
+/// через didFinish (рефилл). Это устраняет многосекундный фриз при первом Play на
+/// reflow-книгах (FB2/EPUB могут содержать десятки тысяч предложений).
+///
+/// Инвариант «нет повторного чтения» сохранён: рефилл всегда добавляет строго следующие
+/// за windowEnd предложения — очередь синтезатора никогда не обнуляется между рефиллами,
+/// только дополняется. finishedAll отправляется ровно когда заканчивается предложение
+/// с индексом currentSentences.count - 1 (не раньше и не позже).
 @MainActor
 final class AVSpeechBackend: NSObject, SpeechBackend {
 
@@ -27,6 +32,14 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     private var currentSpeed: Double = 1.0
     private var lastStartedIndex: Int = 0
     private var currentRender: ((Sentence) -> SpokenMarkup)?
+
+    // Оконная очередь: в синтезаторе держим не более windowSize предложений.
+    // Рефилл запускается из didFinish, когда до конца окна остаётся refillMargin предложений.
+    private static let windowSize   = 50
+    private static let refillMargin = 20
+    /// Индекс последнего предложения, поставленного в очередь синтезатора.
+    /// -1 означает «очередь пуста / не инициализирована».
+    private var windowEnd: Int = -1
 
     override init() {
         super.init()
@@ -50,13 +63,20 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     func append(sentences: [Sentence], render: @escaping (Sentence) -> SpokenMarkup) {
         guard !sentences.isEmpty else { return }
         guard synthesizer.isSpeaking || synthesizer.isPaused else { return }
+        let oldCount = currentSentences.count
         currentSentences.append(contentsOf: sentences)
-        // render-замыкание обновляем: новые предложения используют актуальный render.
         currentRender = render
-        let appendStart = currentSentences.count - sentences.count
-        for i in appendStart..<currentSentences.count {
+        // Расширяем окно только если предыдущий «конец очереди» уже был поставлен
+        // в синтезатор (windowEnd == oldCount - 1). Если нет — didFinish-рефилл
+        // доберётся до новых предложений самостоятельно по мере воспроизведения.
+        guard windowEnd == oldCount - 1 else { return }
+        let appendStart = windowEnd + 1
+        let appendEnd = min(windowEnd + AVSpeechBackend.windowSize, currentSentences.count - 1)
+        guard appendStart <= appendEnd else { return }
+        for i in appendStart...appendEnd {
             enqueueOne(index: i, render: render)
         }
+        windowEnd = appendEnd
     }
 
     func pause() {
@@ -72,6 +92,7 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
             synthesizer.stopSpeaking(at: .immediate)
         }
         indexForUtterance.removeAll()
+        windowEnd = -1
     }
 
     func setSpeed(_ speed: Double) {
@@ -89,16 +110,20 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
 
     // MARK: - Внутренняя очередь
 
+    /// Сбрасывает синтезатор и ставит окно [start, start+windowSize) предложений.
     private func enqueue(from start: Int) {
         if synthesizer.isSpeaking || synthesizer.isPaused {
             synthesizer.stopSpeaking(at: .immediate)
         }
         indexForUtterance.removeAll()
+        windowEnd = -1
         guard currentSentences.indices.contains(start),
               let render = currentRender else { return }
-        for i in start..<currentSentences.count {
+        let end = min(start + AVSpeechBackend.windowSize - 1, currentSentences.count - 1)
+        for i in start...end {
             enqueueOne(index: i, render: render)
         }
+        windowEnd = end
     }
 
     private func enqueueOne(index: Int, render: (Sentence) -> SpokenMarkup) {
@@ -132,18 +157,29 @@ extension AVSpeechBackend: AVSpeechSynthesizerDelegate {
         Task { @MainActor in
             guard let index = self.indexForUtterance[ObjectIdentifier(utterance)] else { return }
             self.indexForUtterance[ObjectIdentifier(utterance)] = nil
+
+            // finishedAll — только когда дочитано последнее предложение книги.
             if index >= self.currentSentences.count - 1 {
                 self.onEvent?(.finishedAll)
+                return
             }
-        }
-    }
 
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
-                                       willSpeakRangeOfSpeechString characterRange: NSRange,
-                                       utterance: AVSpeechUtterance) {
-        Task { @MainActor in
-            if let r = Range(characterRange, in: utterance.speechString) {
-                self.onEvent?(.didWord(r))
+            // Рефилл окна: когда до конца поставленной в очередь части осталось
+            // refillMargin предложений — добавляем следующие windowSize.
+            // Условие index >= windowEnd - refillMargin гарантирует однократный рефилл
+            // на нужном рубеже: после рефилла windowEnd прыгает на windowSize вперёд,
+            // и следующий didFinish попадает под условие лишь спустя windowSize - refillMargin
+            // предложений (т.е. двойного рефилла не бывает).
+            if self.windowEnd < self.currentSentences.count - 1,
+               index >= self.windowEnd - AVSpeechBackend.refillMargin {
+                guard let render = self.currentRender else { return }
+                let refillStart = self.windowEnd + 1
+                let refillEnd = min(self.windowEnd + AVSpeechBackend.windowSize,
+                                    self.currentSentences.count - 1)
+                for i in refillStart...refillEnd {
+                    self.enqueueOne(index: i, render: render)
+                }
+                self.windowEnd = refillEnd
             }
         }
     }
