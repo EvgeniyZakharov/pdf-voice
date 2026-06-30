@@ -102,10 +102,13 @@ struct LibraryView: View {
                                       fixedSize: CGSize(width: 40, height: 56))
                         VStack(alignment: .leading, spacing: 4) {
                             Text(item.title).font(.body).lineLimit(2)
-                            if let opened = item.lastOpened {
-                                Text("Открыто \(opened.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                            HStack(spacing: 6) {
+                                FormatBadge(format: item.format)
+                                if let opened = item.lastOpened {
+                                    Text("Открыто \(opened.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
@@ -133,6 +136,10 @@ struct LibraryView: View {
                         NavigationLink(value: item) {
                             VStack(spacing: 6) {
                                 BookCoverView(fileURL: item.fileURL, fileName: item.fileName)
+                                    .overlay(alignment: .bottomLeading) {
+                                        FormatBadge(format: item.format)
+                                            .padding(6)
+                                    }
                                 Text(item.title)
                                     .font(.caption)
                                     .lineLimit(2)
