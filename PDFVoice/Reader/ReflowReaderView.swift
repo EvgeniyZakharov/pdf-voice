@@ -7,6 +7,7 @@ import UIKit
 enum ReflowCommand: Equatable {
     case scrollToFraction(Double, token: Int)
     case returnToReading(token: Int)
+    case scrollToChapter(Int, token: Int)
 }
 
 /// SwiftUI-обёртка над `UITextView` для reflow-форматов (TXT/FB2/EPUB/DOCX):
@@ -86,6 +87,7 @@ struct ReflowReaderView: UIViewRepresentable {
             switch cmd {
             case .scrollToFraction(_, let t): token = t
             case .returnToReading(let t): token = t
+            case .scrollToChapter(_, let t): token = t
             }
             if token != context.coordinator.lastCommandToken {
                 context.coordinator.lastCommandToken = token
@@ -96,10 +98,21 @@ struct ReflowReaderView: UIViewRepresentable {
                     context.coordinator.isFollowing = false
                     context.coordinator.reportScroll(tv)
                 case .returnToReading:
-                    if let range = context.coordinator.lastRange {
-                        tv.scrollRangeToVisible(range)
-                    }
+                    // Центрируем подсветку и едем к ней плавно за 0.3 c (не прыжок).
                     context.coordinator.isFollowing = true
+                    if let range = context.coordinator.lastRange {
+                        context.coordinator.scrollRangeToCenter(range, animated: true)
+                    } else {
+                        context.coordinator.reportScroll(tv)
+                    }
+                case .scrollToChapter(let ch, _):
+                    // Прыжок к главе = навигация ВИДА (browse), без запуска озвучки —
+                    // как тап по миниатюре в PDF. Аудио/позицию чтения не трогаем.
+                    context.coordinator.isFollowing = false
+                    let offsets = chapterOffsets
+                    if offsets.indices.contains(ch) {
+                        context.coordinator.scrollCharToTop(offsets[ch], animated: false)
+                    }
                     context.coordinator.reportScroll(tv)
                 }
             }
@@ -123,6 +136,9 @@ struct ReflowReaderView: UIViewRepresentable {
         var isFollowing = true
         /// Токен последней применённой команды (дедупликация в updateUIView).
         var lastCommandToken: Int = -1
+        /// Идёт ли программная анимация возврата к чтению — гасит ложный показ кнопки
+        /// возврата на время проезда к подсветке.
+        var isReturning = false
 
         init(_ parent: ReflowReaderView) {
             self.parent = parent
@@ -170,6 +186,57 @@ struct ReflowReaderView: UIViewRepresentable {
             reportScroll(tv)
         }
 
+        // MARK: - Программная прокрутка (возврат к чтению / прыжок к главе)
+
+        /// Прямоугольник символьного диапазона в координатах контента (с инсетами).
+        private func contentRect(forCharRange range: NSRange) -> CGRect? {
+            guard let tv = textView else { return nil }
+            let total = tv.textStorage.length
+            guard range.location >= 0, range.location < total else { return nil }
+            let clamped = NSRange(location: range.location,
+                                  length: min(max(range.length, 1), total - range.location))
+            let lm = tv.layoutManager
+            let glyphRange = lm.glyphRange(forCharacterRange: clamped, actualCharacterRange: nil)
+            var rect = lm.boundingRect(forGlyphRange: glyphRange, in: tv.textContainer)
+            rect.origin.y += tv.textContainerInset.top
+            rect.origin.x += tv.textContainerInset.left
+            return rect
+        }
+
+        /// Прокрутка к заданному y контента. Анимация — ровно 0.3 c (не «прыжок»);
+        /// на время анимации isReturning гасит кнопку возврата.
+        private func scroll(toContentY y: CGFloat, animated: Bool) {
+            guard let tv = textView else { return }
+            let maxY = max(0, tv.contentSize.height - tv.bounds.height)
+            let clamped = max(0, min(y, maxY))
+            if animated {
+                isReturning = true
+                UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut]) {
+                    tv.contentOffset = CGPoint(x: 0, y: clamped)
+                } completion: { [weak self] _ in
+                    guard let self, let tv = self.textView else { return }
+                    self.isReturning = false
+                    self.reportScroll(tv)
+                }
+            } else {
+                tv.setContentOffset(CGPoint(x: 0, y: clamped), animated: false)
+            }
+        }
+
+        /// Центрирует диапазон по вертикали во вьюпорте (для «вернуться к чтению»).
+        func scrollRangeToCenter(_ range: NSRange, animated: Bool) {
+            guard let tv = textView, let rect = contentRect(forCharRange: range) else { return }
+            scroll(toContentY: rect.midY - tv.bounds.height / 2, animated: animated)
+        }
+
+        /// Ставит символ (начало главы) к верху вьюпорта (для прыжка по оглавлению).
+        func scrollCharToTop(_ charIndex: Int, animated: Bool) {
+            guard let tv = textView,
+                  let rect = contentRect(forCharRange: NSRange(location: charIndex, length: 1))
+            else { return }
+            scroll(toContentY: rect.minY - tv.textContainerInset.top, animated: animated)
+        }
+
         /// Видима ли область текущей подсветки во вьюпорте (координаты контента).
         /// Возвращает true если подсветки нет — кнопка возврата не нужна.
         func computeHighlightVisible(_ tv: UITextView) -> Bool {
@@ -203,7 +270,7 @@ struct ReflowReaderView: UIViewRepresentable {
             let maxY = max(1.0, tv.contentSize.height - tv.bounds.height)
             let fraction = max(0, min(1, tv.contentOffset.y / maxY))
             let topChapter = computeTopChapter(tv)
-            let visible = computeHighlightVisible(tv)
+            let visible = isReturning ? true : computeHighlightVisible(tv)
             parent.onScroll(fraction, topChapter, visible, isFollowing)
         }
 

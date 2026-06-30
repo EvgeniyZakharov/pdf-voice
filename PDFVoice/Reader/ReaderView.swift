@@ -93,7 +93,11 @@ private struct ReaderScreen: View {
             BookmarksView(model: model)
         }
         .sheet(isPresented: $showChapters) {
-            ChapterListView(model: model)
+            ChapterListView(model: model) { chapter in
+                // Прыжок к главе скроллит ВИД (browse), без запуска озвучки — как PDF.
+                reflowCommandToken += 1
+                reflowCommand = .scrollToChapter(chapter, token: reflowCommandToken)
+            }
         }
         // Сессия (attach/applySettings/load) поднята в PlaybackCoordinator.open — здесь
         // НЕ грузим и НЕ завершаем её: при уходе в библиотеку аудио продолжает играть (R2).
@@ -265,11 +269,13 @@ private struct ReaderScreen: View {
                                      withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
                                  }
                              },
-                             onScroll: { f, ch, vis, following in
+                             onScroll: { f, ch, vis, _ in
                                  // Пока юзер тащит слайдер — он источник истины, не перебиваем.
                                  if !isReflowScrubbing { reflowScrollFraction = f }
                                  reflowTopChapter = ch
-                                 withAnimation { showReturnButton = !following && !vis }
+                                 // Кнопка возврата — ВСЕГДА, когда подсветка не видна
+                                 // (раньше пряталась при isFollowing, хотя текст не виден).
+                                 withAnimation { showReturnButton = !vis }
                              },
                              command: reflowCommand,
                              theme: settings.readingTheme)
@@ -310,8 +316,9 @@ private struct ReaderScreen: View {
                            currentPage = page
                            model.updateVisiblePage(page)
                        },
-                       onFollowChanged: { vis, following in
-                           withAnimation { showReturnButton = !following && !vis }
+                       onFollowChanged: { vis, _ in
+                           // То же правило, что в reflow: показываем, когда подсветка не видна.
+                           withAnimation { showReturnButton = !vis }
                        },
                        returnToReadingToken: pdfReturnToken)
                 // Тёплая «бумага»: multiply тонирует белые страницы в крем,
