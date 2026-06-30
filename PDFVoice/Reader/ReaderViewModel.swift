@@ -111,15 +111,6 @@ final class ReaderViewModel: ObservableObject {
 
     // MARK: - Reflow навигация
 
-    /// Прогресс чтения по позиции озвучки (0...1).
-    /// Считается от speech.currentIndex, а не от пиксельного скролла — единственный
-    /// источник истины совпадает с currentSentenceIndex и переживает смену шрифта.
-    var reflowProgress: Double {
-        let n = speech.sentences.count
-        guard n > 1 else { return 0 }
-        return Double(speech.currentIndex) / Double(n - 1)
-    }
-
     var chapterCount: Int { bookContent?.chapters.count ?? 0 }
     /// Показывать кнопку «Содержание» только если глав > 1 (у TXT обычно одна).
     var hasChapters: Bool { chapterCount > 1 }
@@ -177,7 +168,6 @@ final class ReaderViewModel: ObservableObject {
         sourceDoc = doc
 
         // Дешёвая классификация — только плотность букв (page.string), без рендера thumbnail.
-        // textDensityKind возвращает только .text или .ocr; .skip не выставляется здесь.
         var kinds: [PageKind] = []
         kinds.reserveCapacity(doc.pageCount)
         for pi in 0..<doc.pageCount {
@@ -505,7 +495,7 @@ final class ReaderViewModel: ObservableObject {
 
     // MARK: - Смешанный путь
 
-    /// Обрабатывает документ со страницами разных типов (.text/.ocr/.skip) в порядке
+    /// Обрабатывает документ со страницами разных типов (.text/.ocr) в порядке
     /// их номеров. Порядок предложений в speech.sentences всегда соответствует порядку
     /// страниц — иначе подсветка и навигация ломаются.
     ///
@@ -608,8 +598,7 @@ final class ReaderViewModel: ObservableObject {
 
     /// Обрабатывает диапазон страниц смешанного документа строго по порядку.
     /// Текстовые страницы — через PDFTextExtractor, OCR-страницы — через OCRTextExtractor
-    /// по одной (pageRange pi..<pi+1). .skip пропускаются. Результат возвращается
-    /// в порядке страниц.
+    /// по одной (pageRange pi..<pi+1). Результат возвращается в порядке страниц.
     ///
     /// `boilerplate` передаётся nil → вычисляется по текстовым строкам текущего батча.
     /// Точность детекта колонтитулов ниже чем при полном документе — приемлемо для
@@ -637,9 +626,6 @@ final class ReaderViewModel: ObservableObject {
         for pi in pageRange {
             guard pi < kinds.count else { continue }
             switch kinds[pi] {
-            case .skip:
-                continue
-
             case .text:
                 let lines = TextPipeline.lines(of: doc.page(at: pi)?.string ?? "")
                 guard !lines.isEmpty else { continue }

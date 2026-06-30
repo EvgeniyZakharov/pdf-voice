@@ -2,10 +2,10 @@ import CoreGraphics
 import PDFKit
 import UIKit
 
-enum PageKind { case text, ocr, skip }
+enum PageKind { case text, ocr }
 
 /// Дешёвая классификация: только плотность букв из текстового слоя, без рендера.
-/// Возвращает .text или .ocr — никогда .skip.
+/// Возвращает .text или .ocr.
 /// Вызывать можно на main thread; page.string не рендерит thumbnail.
 func textDensityKind(_ page: PDFPage) -> PageKind {
     let s = page.string ?? ""
@@ -16,14 +16,6 @@ func textDensityKind(_ page: PDFPage) -> PageKind {
         if ratio >= 0.35 { return .text }
     }
     return .ocr
-}
-
-/// Полная классификация: плотность + blank-чек (рендер 48×48).
-/// Использовать ТОЛЬКО off main thread или лениво перед OCR конкретной страницы.
-func classifyPage(_ page: PDFPage) -> PageKind {
-    let kind = textDensityKind(page)
-    guard kind == .ocr else { return .text }
-    return isBlankPage(page) ? .skip : .ocr
 }
 
 /// Рендерит страницу в маленький (48×48) thumbnail и проверяет разброс яркости.

@@ -139,17 +139,6 @@ enum PDFTextExtractor {
         return first.isLowercase
     }
 
-    static func pageLines(_ document: PDFDocument) -> [[TextPipeline.PageLine]] {
-        let pageCount = document.pageCount
-        var allLines: [[TextPipeline.PageLine]] = []
-        allLines.reserveCapacity(pageCount)
-        for pi in 0..<pageCount {
-            let raw = document.page(at: pi)?.string ?? ""
-            allLines.append(TextPipeline.lines(of: raw))
-        }
-        return allLines
-    }
-
     static func extractSentences(pageRange: Range<Int>,
                                   allLines: [[TextPipeline.PageLine]],
                                   boilerplate: Set<String>,
@@ -184,25 +173,4 @@ enum PDFTextExtractor {
         return mergeCrossPage(result)
     }
 
-    /// Пригоден ли текстовый слой для озвучки.
-    ///
-    /// Недостаточно проверить «есть ли символы»: у части PDF шрифт без корректной
-    /// кодировки (нет ToUnicode CMap), и PDFKit извлекает только цифры/пунктуацию/
-    /// латиницу, теряя кириллицу — получается мусор вроде «88.8 159.7 ( HERSON )».
-    /// Поэтому требуем достаточную ПЛОТНОСТЬ БУКВ. Если её нет — документ уходит в OCR
-    /// (битый файл: ~1% букв; нормальный: ~95%).
-    static func hasTextLayer(_ document: PDFDocument) -> Bool {
-        var letters = 0
-        var nonSpace = 0
-        for i in 0..<min(document.pageCount, 5) {
-            guard let s = document.page(at: i)?.string else { continue }
-            for ch in s where !ch.isWhitespace {
-                nonSpace += 1
-                if ch.isLetter { letters += 1 }
-            }
-        }
-        guard nonSpace >= 40 else { return false }
-        let ratio = Double(letters) / Double(nonSpace)
-        return ratio >= 0.35
-    }
 }

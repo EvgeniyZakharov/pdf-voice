@@ -41,11 +41,6 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         }
     }
 
-    let availableRussianVoices: [AVSpeechSynthesisVoice] =
-        AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language == "ru-RU" }
-            .sorted { $0.quality.rawValue > $1.quality.rawValue }
-
     var onIndexChange: ((Int) -> Void)?
 
     // MARK: - Silero-конфиг (сеттеры переключают active backend)
