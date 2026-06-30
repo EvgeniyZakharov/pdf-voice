@@ -49,7 +49,7 @@ struct ReflowReaderView: UIViewRepresentable {
         tv.backgroundColor = theme.pageBackgroundUI
         tv.alwaysBounceVertical = true
         tv.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 48, right: 20)
-        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI)
+        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
         context.coordinator.lastTheme = theme
         // Coordinator становится делегатом скролла для детекта ручного взаимодействия.
         tv.delegate = context.coordinator
@@ -66,7 +66,7 @@ struct ReflowReaderView: UIViewRepresentable {
 
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
-            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI)
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
             context.coordinator.lastHighlightID = nil
             context.coordinator.lastRange = nil
         }
@@ -76,7 +76,7 @@ struct ReflowReaderView: UIViewRepresentable {
         if context.coordinator.lastTheme != theme {
             context.coordinator.lastTheme = theme
             tv.backgroundColor = theme.pageBackgroundUI
-            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI)
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
             context.coordinator.lastHighlightID = nil
             context.coordinator.lastRange = nil
         }
@@ -145,15 +145,35 @@ struct ReflowReaderView: UIViewRepresentable {
             self.lastText = parent.text
         }
 
-        static func makeAttributed(_ text: String, color: UIColor) -> NSAttributedString {
+        static func makeAttributed(_ text: String, color: UIColor,
+                                   sentences: [Sentence], chapterOffsets: [Int]) -> NSAttributedString {
             let para = NSMutableParagraphStyle()
             para.lineSpacing = 5
             para.paragraphSpacing = 10
-            return NSAttributedString(string: text, attributes: [
+            let result = NSMutableAttributedString(string: text, attributes: [
                 .font: UIFont.systemFont(ofSize: ReflowReaderView.fontSize),
                 .foregroundColor: color,
                 .paragraphStyle: para,
             ])
+
+            // Заголовки — крупнее и жирнее, с отбивкой сверху. Меняем только АТРИБУТЫ
+            // на диапазоне (символы те же) → offsets подсветки/навигации не ломаются.
+            let headingPara = NSMutableParagraphStyle()
+            headingPara.lineSpacing = 3
+            headingPara.paragraphSpacing = 8
+            headingPara.paragraphSpacingBefore = 18
+            let headingFont = UIFont.systemFont(ofSize: ReflowReaderView.fontSize + 5, weight: .bold)
+            let total = (text as NSString).length
+            for s in sentences where s.isHeading {
+                guard chapterOffsets.indices.contains(s.pageIndex) else { continue }
+                let base = chapterOffsets[s.pageIndex] + (s.charOffset ?? 0)
+                let len = (s.rawText as NSString).length
+                guard base >= 0, len > 0, base + len <= total else { continue }
+                let range = NSRange(location: base, length: len)
+                result.addAttribute(.font, value: headingFont, range: range)
+                result.addAttribute(.paragraphStyle, value: headingPara, range: range)
+            }
+            return result
         }
 
         /// Глобальный UTF-16 диапазон предложения в плоском тексте книги.
