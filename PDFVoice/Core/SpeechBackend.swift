@@ -4,8 +4,6 @@ import Foundation
 enum SpeechEvent {
     /// Начато аудио предложения с указанным индексом.
     case didStart(Int)
-    /// Синтезатор перешёл к следующему слову (только AVSpeech).
-    case didWord(Range<String.Index>)
     /// Вся очередь дочитана до конца.
     case finishedAll
     /// Backend не смог получить аудио для предложения с указанным индексом

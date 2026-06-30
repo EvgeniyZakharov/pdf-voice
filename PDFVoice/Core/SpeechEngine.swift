@@ -14,7 +14,6 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     @Published private(set) var sentences: [Sentence] = []
     @Published private(set) var currentIndex: Int = 0
     @Published private(set) var isSpeaking: Bool = false
-    @Published private(set) var spokenWordRange: Range<String.Index>?
 
     /// Пауза после каждого предложения (секунды).
     @Published var pauseBetweenSentences: Double = 0.3 {
@@ -105,9 +104,6 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
             case .didStart(let i):
                 self.currentIndex = i
                 self.onIndexChange?(i)
-                self.spokenWordRange = nil
-            case .didWord(let r):
-                self.spokenWordRange = r
             case .finishedAll:
                 self.isSpeaking = false
             case .failed(let i):
@@ -201,7 +197,6 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     func stop() {
         active.stop()
         isSpeaking = false
-        spokenWordRange = nil
     }
 
     // MARK: - Навигация
