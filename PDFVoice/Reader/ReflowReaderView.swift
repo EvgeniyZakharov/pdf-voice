@@ -35,6 +35,11 @@ struct ReflowReaderView: UIViewRepresentable {
     var command: ReflowCommand? = nil
     /// Тема страницы (фон + текст + подсветка). Применяется на лету в updateUIView.
     var theme: ReadingTheme = .sepia
+    /// Сколько места снизу (от края экрана) должно оставаться свободным от текста
+    /// при прокрутке в конец: высота плавающей стеклянной панели плеера + зазор.
+    /// Сам текст-вью растянут под панель (ignoresSafeArea) — текст уходит под стекло
+    /// и размывается им, а не обрезается жёсткой кромкой.
+    var bottomClearance: CGFloat = 0
 
     private static let fontSize: CGFloat = 19
 
@@ -43,7 +48,7 @@ struct ReflowReaderView: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         // TextKit 1: UITextInput.closestPosition работает в обоих, но textStorage
         // (addAttribute для подсветки) доступен только в TextKit 1.
-        let tv = UITextView(usingTextLayoutManager: false)
+        let tv = InsetAwareTextView(usingTextLayoutManager: false)
         tv.isEditable = false
         tv.isSelectable = false          // тап обрабатываем сами (play-here)
         tv.backgroundColor = theme.pageBackgroundUI
@@ -58,11 +63,16 @@ struct ReflowReaderView: UIViewRepresentable {
                                          action: #selector(Coordinator.handleTap(_:)))
         tv.addGestureRecognizer(tap)
         context.coordinator.textView = tv
+        // Safe area приходит после встраивания в окно — пересчитываем инсет тогда.
+        tv.onSafeAreaChange = { [weak coordinator = context.coordinator] in
+            coordinator?.updateBottomInset()
+        }
         return tv
     }
 
     func updateUIView(_ tv: UITextView, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.updateBottomInset()
 
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
@@ -93,8 +103,9 @@ struct ReflowReaderView: UIViewRepresentable {
                 context.coordinator.lastCommandToken = token
                 switch cmd {
                 case .scrollToFraction(let f, _):
-                    let maxY = max(0, tv.contentSize.height - tv.bounds.height)
-                    tv.setContentOffset(CGPoint(x: 0, y: f * maxY), animated: false)
+                    let minY = -tv.adjustedContentInset.top
+                    let maxY = max(minY, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
+                    tv.setContentOffset(CGPoint(x: 0, y: minY + f * (maxY - minY)), animated: false)
                     context.coordinator.isFollowing = false
                     context.coordinator.reportScroll(tv)
                 case .returnToReading:
@@ -143,6 +154,17 @@ struct ReflowReaderView: UIViewRepresentable {
         init(_ parent: ReflowReaderView) {
             self.parent = parent
             self.lastText = parent.text
+        }
+
+        /// Нижний inset прокрутки: чтобы конец книги можно было дочитать НАД
+        /// плавающей панелью. Автоматическая подстройка UIScrollView уже
+        /// добавляет safe area (home-индикатор) — доводим до bottomClearance.
+        func updateBottomInset() {
+            guard let tv = textView else { return }
+            let extra = max(0, parent.bottomClearance - tv.safeAreaInsets.bottom)
+            if abs(tv.contentInset.bottom - extra) > 0.5 {
+                tv.contentInset.bottom = extra
+            }
         }
 
         static func makeAttributed(_ text: String, color: UIColor,
@@ -227,8 +249,9 @@ struct ReflowReaderView: UIViewRepresentable {
         /// на время анимации isReturning гасит кнопку возврата.
         private func scroll(toContentY y: CGFloat, animated: Bool) {
             guard let tv = textView else { return }
-            let maxY = max(0, tv.contentSize.height - tv.bounds.height)
-            let clamped = max(0, min(y, maxY))
+            let minY = -tv.adjustedContentInset.top
+            let maxY = max(minY, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
+            let clamped = max(minY, min(y, maxY))
             if animated {
                 isReturning = true
                 UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut]) {
@@ -257,25 +280,36 @@ struct ReflowReaderView: UIViewRepresentable {
             scroll(toContentY: rect.minY - tv.textContainerInset.top, animated: animated)
         }
 
-        /// Видима ли область текущей подсветки во вьюпорте (координаты контента).
+        /// Видима ли область текущей подсветки во вьюпорте.
         /// Возвращает true если подсветки нет — кнопка возврата не нужна.
+        ///
+        /// Считаем через ВИДИМЫЙ символьный диапазон: раскладываем только видимую
+        /// область (дёшево) и проверяем пересечение с диапазоном подсветки. Прежняя
+        /// версия звала `boundingRect(forGlyphRange:)` на ДАЛЁКОМ диапазоне подсветки —
+        /// это форсировало вёрстку всего текста выше неё на КАЖДЫЙ тик скролла, из-за
+        /// чего ползунок тормозил на больших книгах.
         func computeHighlightVisible(_ tv: UITextView) -> Bool {
             guard let range = lastRange else { return true }
             let lm = tv.layoutManager
-            let glyphRange = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
-            var rect = lm.boundingRect(forGlyphRange: glyphRange, in: tv.textContainer)
-            // Конвертируем из координат text-container в координаты контента.
-            rect.origin.y += tv.textContainerInset.top
-            rect.origin.x += tv.textContainerInset.left
-            let visible = CGRect(x: 0, y: tv.contentOffset.y,
-                                 width: tv.bounds.width, height: tv.bounds.height)
-            return visible.intersects(rect)
+            let inset = tv.textContainerInset
+            // Зона за плавающей панелью (adjustedContentInset.bottom) не считается
+            // видимой: текст там размыт стеклом.
+            let visibleRect = CGRect(x: 0,
+                                     y: tv.contentOffset.y - inset.top,
+                                     width: tv.bounds.width,
+                                     height: tv.bounds.height - tv.adjustedContentInset.bottom)
+            let visGlyphs = lm.glyphRange(forBoundingRect: visibleRect, in: tv.textContainer)
+            let visChars = lm.characterRange(forGlyphRange: visGlyphs, actualGlyphRange: nil)
+            return NSIntersectionRange(visChars, range).length > 0
         }
 
         /// Индекс главы у верха вьюпорта (последний chapterOffset ≤ charIndex вверху).
         func computeTopChapter(_ tv: UITextView) -> Int {
             let inset = tv.textContainerInset
-            let point = CGPoint(x: inset.left + 1, y: tv.contentOffset.y + inset.top + 1)
+            // «Верх вьюпорта» — ниже прозрачного навбара (adjustedContentInset.top),
+            // текст теперь тянется и под него.
+            let point = CGPoint(x: inset.left + 1,
+                                y: tv.contentOffset.y + tv.adjustedContentInset.top + 1)
             guard let pos = tv.closestPosition(to: point) else { return 0 }
             let charIndex = tv.offset(from: tv.beginningOfDocument, to: pos)
             let offsets = parent.chapterOffsets
@@ -287,8 +321,9 @@ struct ReflowReaderView: UIViewRepresentable {
         }
 
         func reportScroll(_ tv: UITextView) {
-            let maxY = max(1.0, tv.contentSize.height - tv.bounds.height)
-            let fraction = max(0, min(1, tv.contentOffset.y / maxY))
+            let minY = -tv.adjustedContentInset.top
+            let maxY = max(minY + 1, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
+            let fraction = max(0, min(1, (tv.contentOffset.y - minY) / (maxY - minY)))
             let topChapter = computeTopChapter(tv)
             let visible = isReturning ? true : computeHighlightVisible(tv)
             let isFollowing = self.isFollowing
@@ -356,5 +391,16 @@ struct ReflowReaderView: UIViewRepresentable {
             }
             parent.onTap(bestIndex, viewPoint)
         }
+    }
+}
+
+/// UITextView с колбэком на смену safe area: нижний inset прокрутки зависит от
+/// высоты home-индикатора, которая известна только после встраивания в окно.
+final class InsetAwareTextView: UITextView {
+    var onSafeAreaChange: (() -> Void)?
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        onSafeAreaChange?()
     }
 }

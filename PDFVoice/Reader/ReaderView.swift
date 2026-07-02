@@ -54,8 +54,15 @@ private struct ReaderScreen: View {
     // MARK: - Кнопка возврата (общая для reflow и PDF)
     /// Показывать полупрозрачную кнопку «Вернуться к чтению».
     @State private var showReturnButton = false
+    /// Измеренная высота плавающей панели плеера — reflow-текст получает такой
+    /// нижний inset прокрутки, чтобы конец книги читался над стеклом.
+    @State private var panelHeight: CGFloat = 0
     /// Пользователь сейчас тащит reflow-слайдер — гасит обратную связь от onScroll.
     @State private var isReflowScrubbing = false
+    /// Последняя доля, пришедшая ИЗ onScroll (эхо собственного скролла вида).
+    /// Отличает её от изменения слайдера пользователем — в т.ч. через
+    /// accessibility-регулировку, где onEditingChanged не вызывается.
+    @State private var lastReportedFraction = 0.0
 
     /// Скраббер и pageBar работают по числу готовых страниц.
     private var pageCount: Int { model.loadedPageCount }
@@ -66,20 +73,22 @@ private struct ReaderScreen: View {
     private var audioReady: Bool { !model.speech.sentences.isEmpty }
 
     var body: some View {
-        VStack(spacing: 0) {
-            content
-            if audioReady {
-                if model.isReflowable {
-                    Divider()
-                    reflowBar
-                } else if pageCount > 1 {
-                    Divider()
-                    pageBar
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Плеер — плавающая стеклянная панель поверх нижней кромки;
+            // safeAreaInset резервирует место, страница не прячется под ней.
+            .safeAreaInset(edge: .bottom, spacing: 8) {
+                if audioReady {
+                    playerPanel
                 }
-                Divider()
-                PlayerControls(model: model)
             }
-        }
+            .onPreferenceChange(PanelHeightKey.self) { panelHeight = $0 }
+        // Фон читалки = фон СТРАНИЦЫ (не хрома): панель плеера и верхние кнопки
+        // висят прямо над «бумагой», без отдельной полосы фона за ними.
+        .background(pageBackdrop.ignoresSafeArea())
+        // Верхний бар прозрачный: кнопки тулбара (стекло на iOS 26) висят
+        // прямо над фоном, без полосы-подложки.
+        .toolbarBackground(.hidden, for: .navigationBar)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarItems }
         .sheet(isPresented: $showThumbnails) {
@@ -105,6 +114,13 @@ private struct ReaderScreen: View {
         // НЕ грузим и НЕ завершаем её: при уходе в библиотеку аудио продолжает играть (R2).
         .onAppear { settings.probeSilero() }
         .onChange(of: settings.selectedVoice)      { _ in model.applySettings(settings) }
+        // Озвучка перешла на другое предложение — пузырёк «Читать отсюда»
+        // больше не актуален, прячем (иначе висел поверх текста).
+        .onChange(of: model.currentSentence?.id) { _ in
+            if pendingIndex != nil {
+                withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+            }
+        }
     }
 
     // MARK: - Тулбар
@@ -191,9 +207,12 @@ private struct ReaderScreen: View {
             }
             .accessibilityValue("\(Int(reflowScrollFraction * 100)) процентов")
             .onChange(of: reflowScrollFraction) { value in
-                // Команду шлём только когда тащит пользователь — иначе обновление
-                // фракции из onScroll (скролл/озвучка) ушло бы в ложную прокрутку.
-                if isReflowScrubbing {
+                // Команду шлём на любое изменение, КРОМЕ эха от onScroll
+                // (скролл вида/озвучки сам двигает фракцию — её не отражаем
+                // обратно). Раньше гейтом был isReflowScrubbing, но он не
+                // покрывал accessibility-регулировку слайдера (VoiceOver):
+                // значение менялось без onEditingChanged, и вид не скроллился.
+                if isReflowScrubbing || abs(value - lastReportedFraction) > 0.0005 {
                     reflowCommandToken += 1
                     reflowCommand = .scrollToFraction(value, token: reflowCommandToken)
                 }
@@ -213,6 +232,40 @@ private struct ReaderScreen: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 6)
+    }
+
+    /// Цвет «бумаги» текущей книги: reflow — из темы чтения, PDF — крем.
+    private var pageBackdrop: Color {
+        model.isReflowable ? Color(settings.readingTheme.pageBackgroundUI)
+                           : Theme.pageBackground
+    }
+
+    // MARK: - Плавающая панель плеера
+
+    /// Навигация (ползунок страниц/прокрутки) + транспорт одной стеклянной картой.
+    private var playerPanel: some View {
+        VStack(spacing: 0) {
+            if model.isReflowable {
+                reflowBar
+            } else if pageCount > 1 {
+                pageBar
+            }
+            PlayerControls(model: model)
+        }
+        .padding(.top, 6)
+        .glass(in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(
+            GeometryReader { geo in
+                Color.clear.preference(key: PanelHeightKey.self, value: geo.size.height)
+            }
+        )
+        .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+        .padding(.horizontal, 12)
+        .padding(.bottom, Theme.floatingBottomPadding)
+        // Панель висит над «бумагой» — стекло и акценты под тему страницы,
+        // как у пузырька и кнопки возврата.
+        .environment(\.colorScheme,
+                     model.isReflowable && settings.readingTheme == .dark ? .dark : .light)
     }
 
     private func requestJump(to page: Int) {
@@ -273,27 +326,36 @@ private struct ReaderScreen: View {
                              },
                              onScroll: { f, ch, vis, _ in
                                  // Пока юзер тащит слайдер — он источник истины, не перебиваем.
-                                 if !isReflowScrubbing { reflowScrollFraction = f }
+                                 if !isReflowScrubbing {
+                                     lastReportedFraction = f
+                                     reflowScrollFraction = f
+                                 }
                                  reflowTopChapter = ch
                                  // Кнопка возврата — ВСЕГДА, когда подсветка не видна
                                  // (раньше пряталась при isFollowing, хотя текст не виден).
                                  withAnimation { showReturnButton = !vis }
                              },
                              command: reflowCommand,
-                             theme: settings.readingTheme)
+                             theme: settings.readingTheme,
+                             bottomClearance: panelHeight + 12)
                 // Фон reflow задаёт сама тема (ReadingTheme.pageBackgroundUI) — кремового
                 // multiply-оверлея здесь нет (он тонировал бы светлую/тёмную темы). PDF
                 // свой оверлей сохраняет (см. pdfContent).
+                // Текст тянется под верхний бар и плавающую панель и размывается
+                // их стеклом — без жёсткой кромки; дочитываемость даёт
+                // bottomClearance-инсет, стартовый отступ сверху — adjustedContentInset.
+                .ignoresSafeArea(.container, edges: [.top, .bottom])
 
             if let index = pendingIndex {
-                playHereBubble(for: index)
-                    .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
-                    .transition(.scale.combined(with: .opacity))
+                bubbleOverlay(for: index)
             }
         }
         .overlay(alignment: .bottomTrailing) {
             returnButton
         }
+        // Плавающие элементы (стекло) — под тему СТРАНИЦЫ, не хрома: при тёмном
+        // фоне чтения и светлом хроме кнопки должны быть тёмным стеклом.
+        .environment(\.colorScheme, settings.readingTheme == .dark ? .dark : .light)
     }
 
     // MARK: - Контент PDF
@@ -332,11 +394,13 @@ private struct ReaderScreen: View {
                         .blendMode(.multiply)
                         .allowsHitTesting(false)
                 )
+                // Бумага PDF тянется под верхний бар и панель плеера: стеклянные
+                // кнопки/панель размывают её, и над панелью нет кромки кадра
+                // (multiply-тонировка раньше заканчивалась выше полосы фона).
+                .ignoresSafeArea(.container, edges: [.top, .bottom])
 
             if let index = pendingIndex {
-                playHereBubble(for: index)
-                    .position(x: tapPoint.x, y: max(tapPoint.y - 44, 28))
-                    .transition(.scale.combined(with: .opacity))
+                bubbleOverlay(for: index)
             }
 
             if let progress = model.ocrProgress {
@@ -347,6 +411,9 @@ private struct ReaderScreen: View {
         .overlay(alignment: .bottomTrailing) {
             returnButton
         }
+        // Бумага PDF всегда кремовая → плавающее стекло поверх неё всегда светлое,
+        // независимо от темы хрома.
+        .environment(\.colorScheme, .light)
     }
 
     // MARK: - Кнопка возврата к чтению
@@ -361,10 +428,8 @@ private struct ReaderScreen: View {
                 Image(systemName: "text.viewfinder")
                     .font(.system(size: 18, weight: .semibold))
                     .frame(width: 44, height: 44)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .overlay(Circle().stroke(Theme.accent.opacity(0.5), lineWidth: 1))
+                    .glass(in: Circle(), interactive: true)
                     .foregroundStyle(Theme.accent)
-                    .opacity(0.85)
             }
             .accessibilityLabel("Вернуться к чтению")
             .padding(.trailing, 16)
@@ -399,6 +464,17 @@ private struct ReaderScreen: View {
 
     // MARK: - Вспомогательные вью
 
+    /// Пузырёк «Читать отсюда» с зажимом позиции в границы вьюпорта:
+    /// тап у кромки экрана раньше уводил половину круга за край.
+    private func bubbleOverlay(for index: Int) -> some View {
+        GeometryReader { geo in
+            playHereBubble(for: index)
+                .position(x: min(max(tapPoint.x, 30), geo.size.width - 30),
+                          y: min(max(tapPoint.y - 44, 28), max(geo.size.height - 30, 28)))
+        }
+        .transition(.scale.combined(with: .opacity))
+    }
+
     private func playHereBubble(for index: Int) -> some View {
         Button {
             model.speech.play(from: index)
@@ -415,9 +491,9 @@ private struct ReaderScreen: View {
             Image(systemName: "play.fill")
                 .font(.subheadline.weight(.bold))
                 .frame(width: 44, height: 44)
-                .background(Theme.accent, in: Circle())
+                .glass(in: Circle(), tint: Theme.accent, interactive: true)
                 .foregroundStyle(Theme.onAccent)
-                .shadow(radius: 4, y: 2)
+                .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Читать отсюда")
@@ -431,7 +507,7 @@ private struct ReaderScreen: View {
                 .foregroundStyle(.secondary)
         }
         .padding(12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .glass(in: RoundedRectangle(cornerRadius: Theme.radiusCard))
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
     }
@@ -444,6 +520,14 @@ private struct ReaderScreen: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+}
+
+/// Высота плавающей панели плеера (для нижнего inset'а reflow-прокрутки).
+private struct PanelHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
 }
 
 // MARK: - Статические хелперы (используются SettingsView и PlayerControls)
@@ -467,37 +551,54 @@ private struct PlayerControls: View {
     }
 
     var body: some View {
-        // Транспорт (пред. / play / след. предложение) по центру, скорость слева.
-        ZStack {
-            HStack(spacing: 24) {
-                Button { speech.skipBackward() } label: {
-                    Image(systemName: "gobackward")
-                        .font(.system(size: 26))
-                        .foregroundStyle(Theme.accent)
-                }
-                Button { model.togglePlayPause() } label: {
-                    Image(systemName: speech.isSpeaking ? "pause.fill" : "play.fill")
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(Theme.onAccent)
-                        .frame(width: 62, height: 62)
-                        .background(Theme.accent, in: Circle())
-                        .shadow(color: Theme.accent.opacity(0.25), radius: 5, y: 2)
-                }
-                .buttonStyle(.plain)
-                Button { speech.skipForward() } label: {
-                    Image(systemName: "goforward")
-                        .font(.system(size: 26))
-                        .foregroundStyle(Theme.accent)
-                }
+        // Контролы делят ширину поровну — на узких экранах ничего не наезжает
+        // (раньше чип скорости лежал в ZStack поверх транспорта и пересекался
+        // с кнопкой перемотки). Иконки «в край» — шаг по предложениям, не ±сек.
+        HStack(spacing: 0) {
+            speedMenu
+                .frame(maxWidth: .infinity)
+            skipButton("backward.end.fill", label: "Предыдущее предложение") {
+                speech.skipBackward()
             }
-            HStack {
-                speedMenu
-                Spacer()
+            .frame(maxWidth: .infinity)
+            playButton
+                .frame(maxWidth: .infinity)
+            skipButton("forward.end.fill", label: "Следующее предложение") {
+                speech.skipForward()
             }
+            .frame(maxWidth: .infinity)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .disabled(speech.sentences.isEmpty)
+    }
+
+    private var playButton: some View {
+        Button { model.togglePlayPause() } label: {
+            Image(systemName: speech.isSpeaking ? "pause.fill" : "play.fill")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Theme.onAccent)
+                .frame(width: 62, height: 62)
+                .glass(in: Circle(), tint: Theme.accent, interactive: true)
+                .shadow(color: Theme.accent.opacity(0.18), radius: 8, y: 3)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(speech.isSpeaking ? "Пауза" : "Играть")
+    }
+
+    /// Мягкая круглая кнопка перемотки: полупрозрачная заливка акцентом + рамка.
+    private func skipButton(_ icon: String, label: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            // Внутри стеклянной панели — мягкая заливка, не стекло-на-стекле.
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+                .frame(width: 48, height: 48)
+                .background(Theme.accent.opacity(0.08), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 
     private var speedMenu: some View {
@@ -514,15 +615,14 @@ private struct PlayerControls: View {
                 }
             }
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "speedometer")
-                Text(ReaderView.speedLabel(speech.speed))
-            }
-            .font(.subheadline.weight(.medium))
-            .foregroundStyle(Theme.accent)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Theme.accent.opacity(0.10), in: Capsule())
+            Text(ReaderView.speedLabel(speech.speed))
+                .font(.subheadline.weight(.semibold).monospacedDigit())
+                .foregroundStyle(Theme.accent)
+                .frame(minWidth: 30)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 13)
+                .background(Theme.accent.opacity(0.08), in: Capsule())
         }
+        .accessibilityLabel("Скорость \(ReaderView.speedLabel(speech.speed))")
     }
 }

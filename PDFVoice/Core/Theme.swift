@@ -60,6 +60,17 @@ enum Theme {
     /// Скругление карточек и плавающих баннеров.
     static let radiusCard: CGFloat = 16
 
+    /// Нижний отступ плавающей карточки в safeAreaInset: на устройствах
+    /// с home-индикатором (~34pt) опускает её в зону индикатора, оставляя
+    /// 12pt до края экрана; без индикатора (SE) — обычные 6pt, иначе
+    /// карточка ушла бы за край.
+    static var floatingBottomPadding: CGFloat {
+        let inset = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)?.safeAreaInsets.bottom ?? 0
+        return inset > 0 ? -(inset - 12) : 6
+    }
 
     // MARK: - Бумага PDF
 
@@ -67,4 +78,33 @@ enum Theme {
     /// `ReadingTheme.pageBackgroundUI` (тема чтения); PDF — всегда эту.
     static let pageBackground = Color(red: 244.0/255, green: 236.0/255, blue: 220.0/255)
     static let pageBackgroundUI = UIColor(red: 244.0/255, green: 236.0/255, blue: 220.0/255, alpha: 1)
+}
+
+// MARK: - Стекло (Liquid Glass)
+
+extension View {
+    /// Стеклянная подложка плавающего элемента/кнопки: Liquid Glass на iOS 26+,
+    /// на старых iOS — фолбэк ultraThinMaterial с тонкой рамкой. Стекло само
+    /// адаптируется к светлой/тёмной теме окружения.
+    /// - `tint` — цветное стекло для акцентных кнопок (фолбэк — сплошная заливка).
+    /// - `interactive` — отклик стекла на нажатие (для кнопок).
+    @ViewBuilder
+    func glass<S: Shape>(in shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(Self.glassVariant(tint: tint, interactive: interactive), in: shape)
+        } else if let tint {
+            self.background(tint, in: shape)
+        } else {
+            self.background(.ultraThinMaterial, in: shape)
+                .overlay(shape.stroke(Theme.hairline, lineWidth: 1))
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private static func glassVariant(tint: Color?, interactive: Bool) -> Glass {
+        var glass: Glass = .regular
+        if let tint { glass = glass.tint(tint) }
+        if interactive { glass = glass.interactive() }
+        return glass
+    }
 }
