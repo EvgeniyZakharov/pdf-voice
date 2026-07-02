@@ -22,6 +22,7 @@ struct LibraryView: View {
                     listView
                 }
             }
+            .background(Theme.background.ignoresSafeArea())
             // Мини-плеер живёт на корневом экране библиотеки; при пуше ReaderView он
             // естественно перекрыт. safeAreaInset резервирует место — список не прячется.
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -114,9 +115,11 @@ struct LibraryView: View {
                     }
                 }
                 .contextMenu { deleteButton(item) }
+                .listRowBackground(Theme.surface)
             }
             .onDelete(perform: deleteItems)
         }
+        .scrollContentBackground(.hidden)
     }
 
     // MARK: - Сетка (как в iBooks)

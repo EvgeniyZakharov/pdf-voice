@@ -51,6 +51,7 @@ struct ThumbnailGridView: View {
                 }
                 .onAppear { proxy.scrollTo(currentPage, anchor: .center) }
             }
+            .background(Theme.background.ignoresSafeArea())
             .navigationTitle("Страницы")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -78,15 +79,15 @@ private struct ThumbnailCell: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                 } else {
-                    Rectangle().fill(Color(.secondarySystemBackground))
+                    Rectangle().fill(Theme.surface)
                 }
             }
             .frame(width: 100, height: 140)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusCover))
             .overlay {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(isCurrent ? Theme.accent : Color(.separator),
-                            lineWidth: isCurrent ? 2.5 : 0.5)
+                RoundedRectangle(cornerRadius: Theme.radiusCover)
+                    .stroke(isCurrent ? Theme.accent : Theme.hairline,
+                            lineWidth: isCurrent ? 2 : 0.5)
             }
 
             Text("\(index + 1)")
@@ -107,7 +108,7 @@ private struct ThumbnailPlaceholder: View {
         VStack(spacing: 6) {
             ZStack {
                 Rectangle()
-                    .fill(Color(.secondarySystemBackground))
+                    .fill(Theme.surface)
                 VStack(spacing: 8) {
                     ProgressView()
                         .scaleEffect(0.9)
@@ -117,10 +118,10 @@ private struct ThumbnailPlaceholder: View {
                 }
             }
             .frame(width: 100, height: 140)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusCover))
             .overlay {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color(.separator), lineWidth: 0.5)
+                RoundedRectangle(cornerRadius: Theme.radiusCover)
+                    .stroke(Theme.hairline, lineWidth: 0.5)
             }
 
             Text("\(index + 1)")

@@ -29,7 +29,10 @@ struct ChapterListView: View {
                     // Явная тап-цель ≥ 44pt по вертикали (accessibility)
                     .frame(minHeight: 44)
                 }
+                .listRowBackground(Theme.surface)
             }
+            .scrollContentBackground(.hidden)
+            .background(Theme.background.ignoresSafeArea())
             .navigationTitle("Содержание")
             .navigationBarTitleDisplayMode(.inline)
         }

@@ -38,13 +38,14 @@ struct OnboardingView: View {
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(steps[page].color, in: RoundedRectangle(cornerRadius: 14))
-                    .foregroundStyle(.white)
+                    .background(steps[page].color, in: Capsule())
+                    .foregroundStyle(Theme.onAccent)
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 40)
             .animation(.easeInOut, value: page)
         }
+        .background(Theme.background.ignoresSafeArea())
         .interactiveDismissDisabled()
     }
 

@@ -48,9 +48,12 @@ struct BookmarksView: View {
                         .onDelete { offsets in
                             offsets.map { model.bookmarks[$0] }.forEach(model.removeBookmark)
                         }
+                        .listRowBackground(Theme.surface)
                     }
+                    .scrollContentBackground(.hidden)
                 }
             }
+            .background(Theme.background.ignoresSafeArea())
             .navigationTitle("Закладки")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

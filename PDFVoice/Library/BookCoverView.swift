@@ -14,7 +14,7 @@ struct BookCoverView: View {
     var fixedSize: CGSize? = nil
     /// Ширина/высота обложки в гибком режиме (книжная страница ≈ 0.7).
     var aspect: CGFloat = 0.69
-    var cornerRadius: CGFloat = 6
+    var cornerRadius: CGFloat = Theme.radiusCover
 
     @State private var image: UIImage?
 
@@ -25,13 +25,18 @@ struct BookCoverView: View {
             if let fixedSize {
                 content.frame(width: fixedSize.width, height: fixedSize.height)
             } else {
-                content.aspectRatio(aspect, contentMode: .fit)
+                // Пропорцию держит Color.clear (нет собственного «идеального» размера):
+                // ширина всегда = ширине ячейки. Если пропорцию задавать самим content,
+                // альбомная миниатюра распирает рамку и наезжает на соседние ячейки.
+                Color.clear
+                    .aspectRatio(aspect, contentMode: .fit)
+                    .overlay(content)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                .strokeBorder(Theme.hairline, lineWidth: 0.5)
         )
         .task(id: fileName) { await load() }
     }
@@ -44,7 +49,7 @@ struct BookCoverView: View {
                     .aspectRatio(contentMode: .fill)
             } else {
                 Rectangle()
-                    .fill(Color(.secondarySystemBackground))
+                    .fill(Theme.surface)
                     .overlay(
                         Image(systemName: "book.closed")
                             .font(.title)

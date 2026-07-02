@@ -23,6 +23,7 @@ struct SettingsView: View {
                             Text(mode.title).tag(mode)
                         }
                     }
+                    .listRowBackground(Theme.surface)
                 }
 
                 Section {
@@ -32,6 +33,7 @@ struct SettingsView: View {
                         }
                     }
                     .pickerStyle(.menu)
+                    .listRowBackground(Theme.surface)
                 } header: {
                     Text("Голос")
                 } footer: {
@@ -47,6 +49,7 @@ struct SettingsView: View {
                         }
                     }
                     .pickerStyle(.menu)
+                    .listRowBackground(Theme.surface)
                 }
 
                 Section {
@@ -63,7 +66,10 @@ struct SettingsView: View {
                 } header: {
                     Text("О приложении")
                 }
+                .listRowBackground(Theme.surface)
             }
+            .scrollContentBackground(.hidden)
+            .background(Theme.background.ignoresSafeArea())
             .navigationTitle("Настройки")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

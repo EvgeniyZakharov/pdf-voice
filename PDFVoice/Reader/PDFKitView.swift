@@ -110,7 +110,7 @@ struct PDFKitView: UIViewRepresentable {
 
         if let range = sentence.range, let selection = page.selection(for: range) {
             // Текстовый слой — нативная подсветка выделением.
-            selection.color = UIColor.systemYellow.withAlphaComponent(0.45)
+            selection.color = Theme.pdfHighlightUI
             view.highlightedSelections = [selection]
             // Авто-прокрутка только при активном следовании.
             if context.coordinator.isFollowing { view.go(to: selection) }
@@ -120,7 +120,7 @@ struct PDFKitView: UIViewRepresentable {
             var union = CGRect.null
             for box in sentence.boxes {
                 let annotation = PDFAnnotation(bounds: box, forType: .highlight, withProperties: nil)
-                annotation.color = UIColor.systemYellow.withAlphaComponent(0.4)
+                annotation.color = Theme.pdfHighlightUI
                 page.addAnnotation(annotation)
                 context.coordinator.ocrAnnotations.append((page, annotation))
                 union = union.union(box)
