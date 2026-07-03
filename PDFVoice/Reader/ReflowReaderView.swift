@@ -40,6 +40,22 @@ struct ReflowReaderView: UIViewRepresentable {
     /// Сам текст-вью растянут под панель (ignoresSafeArea) — текст уходит под стекло
     /// и размывается им, а не обрезается жёсткой кромкой.
     var bottomClearance: CGFloat = 0
+    /// Верх видимой области чтения (глобальные координаты = координаты вьюпорта,
+    /// т.к. текст-вью полноэкранный): низ навбара. Текст течёт под стеклянный бар,
+    /// но центрирование/старт учитывают этот инсет, а тап-жест над баром не ловит.
+    var readingMinY: CGFloat = 0
+    /// Низ видимой области чтения: верх плавающей панели плеера. Тап-жест под
+    /// панелью не ловит (её кнопки получают тап).
+    var readingMaxY: CGFloat = 0
+    /// Центр видимого пузырька «Читать отсюда» (координаты вьюпорта) или nil.
+    /// Тап по этой зоне обрабатывает сам жест текста как подтверждение.
+    var bubbleCenter: CGPoint?
+    /// Подтверждение «Читать отсюда»: тап пришёлся в зону пузырька.
+    var onConfirmPlay: () -> Void = {}
+    /// Центр видимой кнопки «Вернуться к чтению» (координаты вьюпорта) или nil.
+    var returnButtonCenter: CGPoint?
+    /// Тап пришёлся в зону кнопки «Вернуться к чтению».
+    var onReturnTap: () -> Void = {}
 
     private static let fontSize: CGFloat = 19
 
@@ -61,18 +77,19 @@ struct ReflowReaderView: UIViewRepresentable {
 
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
+        tap.delegate = context.coordinator
         tv.addGestureRecognizer(tap)
         context.coordinator.textView = tv
         // Safe area приходит после встраивания в окно — пересчитываем инсет тогда.
         tv.onSafeAreaChange = { [weak coordinator = context.coordinator] in
-            coordinator?.updateBottomInset()
+            coordinator?.updateInsets()
         }
         return tv
     }
 
     func updateUIView(_ tv: UITextView, context: Context) {
         context.coordinator.parent = self
-        context.coordinator.updateBottomInset()
+        context.coordinator.updateInsets()
 
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
@@ -135,7 +152,7 @@ struct ReflowReaderView: UIViewRepresentable {
         context.coordinator.applyHighlight(sentence)
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         var parent: ReflowReaderView
         weak var textView: UITextView?
         var lastText: String
@@ -156,15 +173,24 @@ struct ReflowReaderView: UIViewRepresentable {
             self.lastText = parent.text
         }
 
-        /// Нижний inset прокрутки: чтобы конец книги можно было дочитать НАД
-        /// плавающей панелью. Автоматическая подстройка UIScrollView уже
-        /// добавляет safe area (home-индикатор) — доводим до bottomClearance.
-        func updateBottomInset() {
+        /// Инсеты прокрутки: сверху — под навбар (первая строка на старте видна
+        /// ниже бара, но при прокрутке текст течёт под стекло), снизу — под
+        /// плавающую панель, чтобы конец книги дочитывался над ней.
+        func updateInsets() {
             guard let tv = textView else { return }
-            let extra = max(0, parent.bottomClearance - tv.safeAreaInsets.bottom)
-            if abs(tv.contentInset.bottom - extra) > 0.5 {
-                tv.contentInset.bottom = extra
-            }
+            let top = parent.readingMinY
+            let bottom = max(0, parent.bottomClearance - tv.safeAreaInsets.bottom)
+            if abs(tv.contentInset.top - top) > 0.5 { tv.contentInset.top = top }
+            if abs(tv.contentInset.bottom - bottom) > 0.5 { tv.contentInset.bottom = bottom }
+        }
+
+        /// Ловим тап только в области чтения (между навбаром и панелью). Над баром
+        /// и под панелью НЕ ловим — их стеклянные кнопки получают тап сами
+        /// (иначе play/pause требовал нескольких нажатий).
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard let tv = textView, parent.readingMaxY > parent.readingMinY else { return true }
+            let viewportY = touch.location(in: tv).y - tv.contentOffset.y
+            return viewportY >= parent.readingMinY && viewportY <= parent.readingMaxY
         }
 
         static func makeAttributed(_ text: String, color: UIColor,
@@ -266,10 +292,13 @@ struct ReflowReaderView: UIViewRepresentable {
             }
         }
 
-        /// Центрирует диапазон по вертикали во вьюпорте (для «вернуться к чтению»).
+        /// Центрирует диапазон в ВИДИМОЙ области чтения [readingMinY…readingMaxY]
+        /// (между навбаром и панелью). Без их учёта подсветка уезжала к верхнему
+        /// краю (центр брался по всей высоте bounds).
         func scrollRangeToCenter(_ range: NSRange, animated: Bool) {
             guard let tv = textView, let rect = contentRect(forCharRange: range) else { return }
-            scroll(toContentY: rect.midY - tv.bounds.height / 2, animated: animated)
+            let visibleCenter = (parent.readingMinY + parent.readingMaxY) / 2
+            scroll(toContentY: rect.midY - visibleCenter, animated: animated)
         }
 
         /// Ставит символ (начало главы) к верху вьюпорта (для прыжка по оглавлению).
@@ -292,12 +321,15 @@ struct ReflowReaderView: UIViewRepresentable {
             guard let range = lastRange else { return true }
             let lm = tv.layoutManager
             let inset = tv.textContainerInset
-            // Зона за плавающей панелью (adjustedContentInset.bottom) не считается
-            // видимой: текст там размыт стеклом.
+            // Видимая область чтения [readingMinY…readingMaxY] (между навбаром и
+            // панелью) в координатах контейнера: зоны за стеклянными баром/панелью
+            // не считаются видимыми (текст там размыт стеклом).
+            let top = parent.readingMinY
+            let bottom = parent.readingMaxY > top ? parent.readingMaxY : tv.bounds.height
             let visibleRect = CGRect(x: 0,
-                                     y: tv.contentOffset.y - inset.top,
+                                     y: tv.contentOffset.y + top - inset.top,
                                      width: tv.bounds.width,
-                                     height: tv.bounds.height - tv.adjustedContentInset.bottom)
+                                     height: max(0, bottom - top))
             let visGlyphs = lm.glyphRange(forBoundingRect: visibleRect, in: tv.textContainer)
             let visChars = lm.characterRange(forGlyphRange: visGlyphs, actualGlyphRange: nil)
             return NSIntersectionRange(visChars, range).length > 0
@@ -360,6 +392,18 @@ struct ReflowReaderView: UIViewRepresentable {
             // «Читать отсюда»: без вычитания offset пузырёк уедет за экран при прокрутке.
             let viewPoint = CGPoint(x: point.x - tv.contentOffset.x,
                                     y: point.y - tv.contentOffset.y)
+            // Тап в зоне видимого пузырька = подтверждение «Читать отсюда».
+            if let center = parent.bubbleCenter,
+               hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= 32 {
+                parent.onConfirmPlay()
+                return
+            }
+            // Тап в зоне кнопки «Вернуться к чтению».
+            if let rc = parent.returnButtonCenter,
+               hypot(viewPoint.x - rc.x, viewPoint.y - rc.y) <= 30 {
+                parent.onReturnTap()
+                return
+            }
             // UITextInput учитывает textContainerInset сам — передаём point как есть.
             guard let pos = tv.closestPosition(to: point) else {
                 parent.onTap(nil, viewPoint); return

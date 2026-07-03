@@ -32,6 +32,25 @@ struct PDFKitView: UIViewRepresentable {
     var onFollowChanged: (Bool, Bool) -> Void = { _, _ in }
     /// При смене токена: проскролл к текущей подсветке и возобновление следования.
     var returnToReadingToken: Int = 0
+    /// Границы видимой области чтения (глобальные = координаты вьюшки, PDFView
+    /// полноэкранный). Тап-жест ловит только между ними — над баром и под панелью
+    /// НЕ ловит, чтобы их стеклянные кнопки получали тап (иначе play/pause
+    /// требовал нескольких нажатий).
+    var readingMinY: CGFloat = 0
+    var readingMaxY: CGFloat = 0
+    /// Центр видимого пузырька «Читать отсюда» (в координатах вьюшки) или nil.
+    /// Тап по этой зоне обрабатывает сам PDF-жест как подтверждение (`onConfirmPlay`) —
+    /// SwiftUI-кнопка поверх representable не получает синтетический/сквозной тап
+    /// надёжно, а жест PDFView срабатывает всегда.
+    var bubbleCenter: CGPoint?
+    /// Подтверждение «Читать отсюда»: тап пришёлся в зону пузырька.
+    var onConfirmPlay: () -> Void = {}
+    /// Центр видимой кнопки «Вернуться к чтению» (координаты вьюшки) или nil.
+    /// Как и пузырёк, её тап обрабатывает жест PDFView (SwiftUI-кнопка поверх
+    /// representable надёжно тап не получает).
+    var returnButtonCenter: CGPoint?
+    /// Тап пришёлся в зону кнопки «Вернуться к чтению».
+    var onReturnTap: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -181,13 +200,19 @@ struct PDFKitView: UIViewRepresentable {
         func computeHighlightVisible() -> Bool {
             guard let pdfView, let sentence = parent.highlight else { return true }
             guard let page = parent.document.page(at: sentence.pageIndex) else { return true }
+            // Видимой считаем только область чтения (между стеклянными баром и
+            // панелью) — под ними подсветка размыта и не читается.
+            let reading = parent.readingMaxY > parent.readingMinY
+                ? CGRect(x: 0, y: parent.readingMinY, width: pdfView.bounds.width,
+                         height: parent.readingMaxY - parent.readingMinY)
+                : pdfView.bounds
             if let range = sentence.range, let selection = page.selection(for: range) {
                 let boundsInView = pdfView.convert(selection.bounds(for: page), from: page)
-                return pdfView.bounds.intersects(boundsInView)
+                return reading.intersects(boundsInView)
             } else if !sentence.boxes.isEmpty {
                 for box in sentence.boxes {
                     let boxInView = pdfView.convert(box, from: page)
-                    if pdfView.bounds.intersects(boxInView) { return true }
+                    if reading.intersects(boxInView) { return true }
                 }
                 return false
             }
@@ -241,6 +266,18 @@ struct PDFKitView: UIViewRepresentable {
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard let pdfView else { return }
             let location = gesture.location(in: pdfView)
+            // Тап в зоне видимого пузырька = подтверждение «Читать отсюда».
+            if let center = parent.bubbleCenter,
+               hypot(location.x - center.x, location.y - center.y) <= 32 {
+                parent.onConfirmPlay()
+                return
+            }
+            // Тап в зоне кнопки «Вернуться к чтению».
+            if let rc = parent.returnButtonCenter,
+               hypot(location.x - rc.x, location.y - rc.y) <= 30 {
+                parent.onReturnTap()
+                return
+            }
             guard let page = pdfView.page(for: location, nearest: true) else {
                 parent.onTap(nil, location)
                 return
@@ -265,6 +302,15 @@ struct PDFKitView: UIViewRepresentable {
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
             true
+        }
+
+        /// Ловим тап только в области чтения (между навбаром и панелью). Над баром
+        /// и под панелью НЕ ловим — их стеклянные кнопки получают тап сами.
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldReceive touch: UITouch) -> Bool {
+            guard let pdfView, parent.readingMaxY > parent.readingMinY else { return true }
+            let y = touch.location(in: pdfView).y
+            return y >= parent.readingMinY && y <= parent.readingMaxY
         }
     }
 }

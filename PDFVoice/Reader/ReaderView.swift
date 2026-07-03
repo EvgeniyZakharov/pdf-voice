@@ -57,6 +57,13 @@ private struct ReaderScreen: View {
     /// Измеренная высота плавающей панели плеера — reflow-текст получает такой
     /// нижний inset прокрутки, чтобы конец книги читался над стеклом.
     @State private var panelHeight: CGFloat = 0
+    /// Глобальный прямоугольник области чтения (между навбаром и панелью плеера).
+    /// PDF/текст растянуты на весь экран (контент течёт под стеклянные бар и
+    /// панель), а их тап-жест координатно работает в ГЛОБАЛЬНЫХ координатах —
+    /// совпадающих с этим прямоугольником. Из него берём: верхний инсет (навбар),
+    /// нижнюю границу (верх панели), позиции пузырька и кнопки возврата.
+    @State private var readingFrame: CGRect = .zero
+    private var contentSize: CGSize { readingFrame.size }
     /// Пользователь сейчас тащит reflow-слайдер — гасит обратную связь от onScroll.
     @State private var isReflowScrubbing = false
     /// Последняя доля, пришедшая ИЗ onScroll (эхо собственного скролла вида).
@@ -337,19 +344,26 @@ private struct ReaderScreen: View {
                              },
                              command: reflowCommand,
                              theme: settings.readingTheme,
-                             bottomClearance: panelHeight + 12)
+                             bottomClearance: panelHeight + 12,
+                             readingMinY: readingFrame.minY,
+                             readingMaxY: readingFrame.maxY,
+                             bubbleCenter: bubbleCenter,
+                             onConfirmPlay: { playFromBubble() },
+                             returnButtonCenter: returnButtonCenter,
+                             onReturnTap: { returnToReading() })
                 // Фон reflow задаёт сама тема (ReadingTheme.pageBackgroundUI) — кремового
                 // multiply-оверлея здесь нет (он тонировал бы светлую/тёмную темы). PDF
                 // свой оверлей сохраняет (см. pdfContent).
-                // Текст тянется под верхний бар и плавающую панель и размывается
-                // их стеклом — без жёсткой кромки; дочитываемость даёт
-                // bottomClearance-инсет, стартовый отступ сверху — adjustedContentInset.
+                // Текст течёт под стеклянный верхний бар И под панель плеера. Тап-жест
+                // работает в глобальных координатах и игнорирует зоны бара/панели
+                // (readingMinY…readingMaxY), поэтому их кнопки получают тап.
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
 
             if let index = pendingIndex {
                 bubbleOverlay(for: index)
             }
         }
+        .background(contentSizeReader)
         .overlay(alignment: .bottomTrailing) {
             returnButton
         }
@@ -384,7 +398,13 @@ private struct ReaderScreen: View {
                            // То же правило, что в reflow: показываем, когда подсветка не видна.
                            withAnimation { showReturnButton = !vis }
                        },
-                       returnToReadingToken: pdfReturnToken)
+                       returnToReadingToken: pdfReturnToken,
+                       readingMinY: readingFrame.minY,
+                       readingMaxY: readingFrame.maxY,
+                       bubbleCenter: bubbleCenter,
+                       onConfirmPlay: { playFromBubble() },
+                       returnButtonCenter: returnButtonCenter,
+                       onReturnTap: { returnToReading() })
                 // Тёплая «бумага»: multiply тонирует белые страницы в крем,
                 // чёрный текст остаётся читаемым. compositingGroup ограничивает
                 // смешивание самим PDF.
@@ -394,9 +414,8 @@ private struct ReaderScreen: View {
                         .blendMode(.multiply)
                         .allowsHitTesting(false)
                 )
-                // Бумага PDF тянется под верхний бар и панель плеера: стеклянные
-                // кнопки/панель размывают её, и над панелью нет кромки кадра
-                // (multiply-тонировка раньше заканчивалась выше полосы фона).
+                // Бумага PDF течёт под верхний бар и панель плеера; тап-жест в
+                // глобальных координатах игнорирует их зоны (readingMinY…MaxY).
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
 
             if let index = pendingIndex {
@@ -408,6 +427,7 @@ private struct ReaderScreen: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             }
         }
+        .background(contentSizeReader)
         .overlay(alignment: .bottomTrailing) {
             returnButton
         }
@@ -464,35 +484,73 @@ private struct ReaderScreen: View {
 
     // MARK: - Вспомогательные вью
 
-    /// Пузырёк «Читать отсюда» с зажимом позиции в границы вьюпорта:
-    /// тап у кромки экрана раньше уводил половину круга за край.
+    /// Позиция центра пузырька «Читать отсюда» в ГЛОБАЛЬНЫХ координатах (совпадают
+    /// с координатами тапа из PDF/текста), зажата в границы области чтения. Одна
+    /// точка истины: и для отрисовки пузырька, и для зоны, которую жест
+    /// PDF/текста опознаёт как подтверждение.
+    private var bubbleCenter: CGPoint? {
+        guard pendingIndex != nil, readingFrame != .zero else { return nil }
+        return CGPoint(
+            x: min(max(tapPoint.x, readingFrame.minX + 30), readingFrame.maxX - 30),
+            y: min(max(tapPoint.y - 44, readingFrame.minY + 28), readingFrame.maxY - 30))
+    }
+
+    /// Центр кнопки «Вернуться к чтению» (bottom-trailing области чтения, паддинги
+    /// 16/12, кнопка 44) в ГЛОБАЛЬНЫХ координатах. Её тап тоже опознаёт жест
+    /// PDF/текста — иначе он проваливался в контент и кнопка «не исчезала».
+    private var returnButtonCenter: CGPoint? {
+        guard showReturnButton, readingFrame != .zero else { return nil }
+        return CGPoint(x: readingFrame.maxX - 16 - 22, y: readingFrame.maxY - 12 - 22)
+    }
+
+    /// Пузырёк «Читать отсюда» в полноэкранном оверлее (координаты глобальные,
+    /// совпадают с `bubbleCenter`). Тап по нему обрабатывает жест PDF/текста
+    /// (`onConfirmPlay`), кнопка — визуал + VoiceOver.
     private func bubbleOverlay(for index: Int) -> some View {
+        playHereBubble(for: index)
+            .position(bubbleCenter ?? .zero)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea(.container, edges: [.top, .bottom])
+            .transition(.scale.combined(with: .opacity))
+    }
+
+    /// Фоновый ридер ГЛОБАЛЬНОГО прямоугольника области чтения (между навбаром и
+    /// панелью). Не влияет на хит-тест содержимого.
+    private var contentSizeReader: some View {
         GeometryReader { geo in
-            playHereBubble(for: index)
-                .position(x: min(max(tapPoint.x, 30), geo.size.width - 30),
-                          y: min(max(tapPoint.y - 44, 28), max(geo.size.height - 30, 28)))
+            Color.clear
+                .onAppear { readingFrame = geo.frame(in: .global) }
+                .onChange(of: geo.frame(in: .global)) { readingFrame = $0 }
         }
-        .transition(.scale.combined(with: .opacity))
+    }
+
+    /// Подтверждение «Читать отсюда»: запускает озвучку с выбранного предложения.
+    /// Единый путь для тапа по SwiftUI-кнопке пузырька (VoiceOver) и для тапа,
+    /// перехваченного жестом PDF/текста (`onConfirmPlay`). Guard по pendingIndex
+    /// защищает от двойного срабатывания, если сработали оба.
+    private func playFromBubble() {
+        guard let index = pendingIndex else { return }
+        model.speech.play(from: index)
+        withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+        // После «Читать отсюда» возобновляем следование — вид должен ехать
+        // за новой позицией чтения, а не оставаться там, где пользователь тапнул.
+        if model.isReflowable {
+            reflowCommandToken += 1
+            reflowCommand = .returnToReading(token: reflowCommandToken)
+        } else {
+            pdfReturnToken += 1
+        }
     }
 
     private func playHereBubble(for index: Int) -> some View {
         Button {
-            model.speech.play(from: index)
-            withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
-            // После «Читать отсюда» возобновляем следование — вид должен ехать
-            // за новой позицией чтения, а не оставаться там, где пользователь тапнул.
-            if model.isReflowable {
-                reflowCommandToken += 1
-                reflowCommand = .returnToReading(token: reflowCommandToken)
-            } else {
-                pdfReturnToken += 1
-            }
+            playFromBubble()
         } label: {
             Image(systemName: "play.fill")
                 .font(.subheadline.weight(.bold))
-                .frame(width: 44, height: 44)
-                .glass(in: Circle(), tint: Theme.accent, interactive: true)
-                .foregroundStyle(Theme.onAccent)
+                .frame(width: 48, height: 48)
+                .glass(in: Circle(), interactive: true)
+                .foregroundStyle(Theme.accent)
                 .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
         }
         .buttonStyle(.plain)
