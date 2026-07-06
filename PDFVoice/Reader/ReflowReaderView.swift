@@ -184,6 +184,15 @@ struct ReflowReaderView: UIViewRepresentable {
             if abs(tv.contentInset.bottom - bottom) > 0.5 { tv.contentInset.bottom = bottom }
         }
 
+        /// Одновременное распознавание с pan самого UIScrollView: тап, «ловящий»
+        /// декелерацию (пользователь скроллил и тут же тапнул по кнопке возврата
+        /// или тексту), иначе проигрывает pan'у и молча пропадает — кнопка
+        /// срабатывала через раз.
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            true
+        }
+
         /// Ловим тап только в области чтения (между навбаром и панелью). Над баром
         /// и под панелью НЕ ловим — их стеклянные кнопки получают тап сами
         /// (иначе play/pause требовал нескольких нажатий).
@@ -296,7 +305,7 @@ struct ReflowReaderView: UIViewRepresentable {
         /// (между навбаром и панелью). Без их учёта подсветка уезжала к верхнему
         /// краю (центр брался по всей высоте bounds).
         func scrollRangeToCenter(_ range: NSRange, animated: Bool) {
-            guard let tv = textView, let rect = contentRect(forCharRange: range) else { return }
+            guard let rect = contentRect(forCharRange: range) else { return }
             let visibleCenter = (parent.readingMinY + parent.readingMaxY) / 2
             scroll(toContentY: rect.midY - visibleCenter, animated: animated)
         }
@@ -309,8 +318,13 @@ struct ReflowReaderView: UIViewRepresentable {
             scroll(toContentY: rect.minY - tv.textContainerInset.top, animated: animated)
         }
 
-        /// Видима ли область текущей подсветки во вьюпорте.
+        /// «Видима» ли текущая подсветка: пересекает ли она ЦЕНТРАЛЬНУЮ полосу
+        /// области чтения (~60% высоты, отступы по 20% сверху и снизу).
         /// Возвращает true если подсветки нет — кнопка возврата не нужна.
+        /// Полоса, а не вся область: кнопка возврата должна появляться, когда
+        /// читаемое предложение ушло из центральной части экрана, и прятаться,
+        /// когда оно снова примерно по центру — а не когда его краешек ещё
+        /// цепляется за самую границу вьюпорта.
         ///
         /// Считаем через ВИДИМЫЙ символьный диапазон: раскладываем только видимую
         /// область (дёшево) и проверяем пересечение с диапазоном подсветки. Прежняя
@@ -321,15 +335,15 @@ struct ReflowReaderView: UIViewRepresentable {
             guard let range = lastRange else { return true }
             let lm = tv.layoutManager
             let inset = tv.textContainerInset
-            // Видимая область чтения [readingMinY…readingMaxY] (между навбаром и
-            // панелью) в координатах контейнера: зоны за стеклянными баром/панелью
-            // не считаются видимыми (текст там размыт стеклом).
+            // Область чтения [readingMinY…readingMaxY] (между навбаром и панелью)
+            // в координатах контейнера, суженная до центральной полосы.
             let top = parent.readingMinY
             let bottom = parent.readingMaxY > top ? parent.readingMaxY : tv.bounds.height
+            let band = (bottom - top) * 0.2
             let visibleRect = CGRect(x: 0,
-                                     y: tv.contentOffset.y + top - inset.top,
+                                     y: tv.contentOffset.y + top + band - inset.top,
                                      width: tv.bounds.width,
-                                     height: max(0, bottom - top))
+                                     height: max(0, (bottom - top) - band * 2))
             let visGlyphs = lm.glyphRange(forBoundingRect: visibleRect, in: tv.textContainer)
             let visChars = lm.characterRange(forGlyphRange: visGlyphs, actualGlyphRange: nil)
             return NSIntersectionRange(visChars, range).length > 0

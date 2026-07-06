@@ -80,7 +80,11 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     }
 
     func pause() {
-        synthesizer.pauseSpeaking(at: .word)
+        // .immediate, не .word: у ряда русских голосов (Milena и др.) пауза
+        // «по границе слова» фактически срабатывает лишь на границе utterance —
+        // кнопка не останавливала чтение посреди предложения. continueSpeaking
+        // продолжает с места мгновенной паузы.
+        synthesizer.pauseSpeaking(at: .immediate)
     }
 
     func resume() {

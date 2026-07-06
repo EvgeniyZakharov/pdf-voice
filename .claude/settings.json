@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(idb *)",
+      "Bash(/opt/homebrew/bin/idb *)",
+      "Bash(xcrun simctl *)",
+      "Bash(xcodegen generate *)",
+      "Bash(xcodebuild *)",
+      "Bash(swiftc *)",
+      "Bash(plutil -p *)",
+      "Bash(screencapture *)",
+      "Bash(open -a Simulator)",
+      "Bash(rtk gain *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk ls *)",
+      "Bash(rtk read *)"
+    ]
+  }
+}

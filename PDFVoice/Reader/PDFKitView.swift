@@ -85,6 +85,7 @@ struct PDFKitView: UIViewRepresentable {
 
         if view.document !== document {
             view.document = document
+            view.layoutDocumentView()
             context.coordinator.lastSentenceID = nil
             context.coordinator.lastReadyCount = readyPageCount
         } else if readyPageCount != context.coordinator.lastReadyCount {
@@ -93,6 +94,16 @@ struct PDFKitView: UIViewRepresentable {
             context.coordinator.lastReadyCount = readyPageCount
             view.layoutDocumentView()
         }
+        // layoutDocumentView() выше лишь помечает документ на перекомпоновку —
+        // реальные фреймы страниц PDFKit пересчитывает асинхронно, на следующий
+        // проход рендер-цикла. Если НИЖЕ в ЭТОМ ЖЕ вызове updateUIView мы делаем
+        // go(to:) (восстановление позиции при открытии книги, «Вернуться к
+        // чтению», переход по миниатюре) — без принудительного layoutIfNeeded()
+        // он опирается на ещё не обновлённые фреймы страниц и «уезжает в
+        // пустоту» (типичный симптом: открыли книгу на сохранённой позиции
+        // дальше первой страницы — вид остался на стр. 1). Вызов дешёвый —
+        // no-op, если ничего не помечено грязным.
+        view.layoutIfNeeded()
 
         // Возврат к чтению: кнопка возврата или «Читать отсюда» (приоритет выше pageJump).
         if returnToReadingToken != context.coordinator.lastReturnToken {
@@ -105,6 +116,12 @@ struct PDFKitView: UIViewRepresentable {
                     for box in sentence.boxes { union = union.union(box) }
                     if !union.isNull { view.go(to: union, on: page) }
                 }
+                // «Вернуться к чтению» ставит подсветку по центру области чтения.
+                context.coordinator.alignHighlightToReadingArea(center: true)
+                // Индекс страницы сообщаем НАПРЯМУЮ (не полагаясь на KVO-скролл):
+                // go(to:) может сработать до того, как PDFView пересчитает layout,
+                // и reportVisiblePage() в этот момент вернёт устаревшую страницу.
+                context.coordinator.reportPage(sentence.pageIndex)
             }
             context.coordinator.isFollowing = true
             context.coordinator.reportFollowChanged()
@@ -117,6 +134,12 @@ struct PDFKitView: UIViewRepresentable {
             context.coordinator.lastJumpToken = jump.token
             view.go(to: page)
             context.coordinator.isFollowing = false
+            // Явный репорт, не полагаясь на KVO: тап по миниатюре у родителя
+            // (ReaderView.requestJump) уже двигает currentPage напрямую, но тот
+            // путь может быть проглочен гонкой с закрытием листа миниатюр
+            // (dismiss + мутация состояния в одном действии) — этот вызов
+            // независим от того листа и всегда доставляет индекс.
+            context.coordinator.reportPage(jump.page)
             context.coordinator.reportFollowChanged()
         }
 
@@ -127,12 +150,32 @@ struct PDFKitView: UIViewRepresentable {
         context.coordinator.lastSentenceID = sentence.id
         context.coordinator.clearOCRHighlight()
 
+        // Пока идёт следование, счётчик страниц обязан отражать РЕАЛЬНУЮ
+        // читаемую страницу сразу, а не ждать реактивный KVO-скролл: при
+        // восстановлении позиции (после переоткрытия книги) go(to:) ниже
+        // может выполниться раньше, чем PDFView пересчитает layout, и
+        // reportVisiblePage() в этот момент вернёт страницу 0.
+        if context.coordinator.isFollowing {
+            context.coordinator.reportPage(sentence.pageIndex)
+        }
+
         if let range = sentence.range, let selection = page.selection(for: range) {
             // Текстовый слой — нативная подсветка выделением.
             selection.color = Theme.pdfHighlightUI
             view.highlightedSelections = [selection]
-            // Авто-прокрутка только при активном следовании.
-            if context.coordinator.isFollowing { view.go(to: selection) }
+            // Авто-прокрутка только при активном следовании; после go(to:)
+            // доводим скролл, чтобы подсветка не осталась под стеклянной панелью.
+            if context.coordinator.isFollowing {
+                view.go(to: selection)
+                context.coordinator.alignHighlightToReadingArea(center: false)
+                // При самом первом updateUIView (сразу после makeUIView) SwiftUI
+                // ещё не выдал PDFView реальный размер — view.bounds нулевые, и
+                // go(to:) выше уезжает в никуда. Второго прохода подсветки для
+                // ЭТОГО ЖЕ предложения не будет (lastSentenceID уже проставлен
+                // выше), поэтому без явного повтора вид так и останется на
+                // стр. 1 при открытии книги на сохранённой позиции.
+                if view.bounds.isEmpty { context.coordinator.scheduleFollowScrollRetry() }
+            }
         } else if !sentence.boxes.isEmpty {
             // OCR — подсветка аннотациями по боксам строк.
             view.highlightedSelections = nil
@@ -144,7 +187,13 @@ struct PDFKitView: UIViewRepresentable {
                 context.coordinator.ocrAnnotations.append((page, annotation))
                 union = union.union(box)
             }
-            if !union.isNull, context.coordinator.isFollowing { view.go(to: union, on: page) }
+            if !union.isNull, context.coordinator.isFollowing {
+                view.go(to: union, on: page)
+                context.coordinator.alignHighlightToReadingArea(center: false)
+                // См. комментарий в ветке текстового слоя выше: первый проход
+                // с нулевыми bounds — go(to:) без эффекта, повтора не будет.
+                if view.bounds.isEmpty { context.coordinator.scheduleFollowScrollRetry() }
+            }
         } else {
             view.highlightedSelections = nil
         }
@@ -187,7 +236,13 @@ struct PDFKitView: UIViewRepresentable {
                   let pdfView,
                   let scrollView = Coordinator.firstScrollView(in: pdfView) else { return }
             scrollObservation = scrollView.observe(\.contentOffset, options: [.new]) {
-                [weak self] _, _ in self?.reportVisiblePage()
+                [weak self] _, _ in
+                self?.reportVisiblePage()
+                // Живой пересчёт видимости подсветки при КАЖДОМ тике скролла
+                // (как reflow в scrollViewDidScroll): раньше кнопка возврата
+                // пересчитывалась только в начале следующего жеста — вернул вид
+                // к тексту руками, а кнопка оставалась висеть. Дедуп внутри.
+                self?.reportFollowChanged()
             }
             // Детект ручного взаимодействия (pan/pinch) для паузы следования.
             // Надёжнее, чем переопределять делегат PDFView (внутренний делегат PDFKit).
@@ -195,33 +250,136 @@ struct PDFKitView: UIViewRepresentable {
             scrollView.pinchGestureRecognizer?.addTarget(self, action: #selector(userInteracted(_:)))
         }
 
-        /// Вычисляет, видима ли текущая подсветка в PDFView.
+        /// «Видима» ли текущая подсветка: пересекает ли она ЦЕНТРАЛЬНУЮ полосу
+        /// области чтения (~60% высоты, отступы по 20% сверху и снизу).
+        /// Полоса, а не вся область: кнопка возврата должна появляться, когда
+        /// читаемое предложение ушло из центральной части экрана, и прятаться,
+        /// когда оно снова примерно по центру — а не когда его краешек ещё
+        /// цепляется за самую границу.
         /// Возвращает true если подсветки нет — кнопку возврата показывать не надо.
         func computeHighlightVisible() -> Bool {
             guard let pdfView, let sentence = parent.highlight else { return true }
             guard let page = parent.document.page(at: sentence.pageIndex) else { return true }
-            // Видимой считаем только область чтения (между стеклянными баром и
-            // панелью) — под ними подсветка размыта и не читается.
             let reading = parent.readingMaxY > parent.readingMinY
                 ? CGRect(x: 0, y: parent.readingMinY, width: pdfView.bounds.width,
                          height: parent.readingMaxY - parent.readingMinY)
                 : pdfView.bounds
+            let band = reading.insetBy(dx: 0, dy: reading.height * 0.2)
             if let range = sentence.range, let selection = page.selection(for: range) {
                 let boundsInView = pdfView.convert(selection.bounds(for: page), from: page)
-                return reading.intersects(boundsInView)
+                return band.intersects(boundsInView)
             } else if !sentence.boxes.isEmpty {
                 for box in sentence.boxes {
                     let boxInView = pdfView.convert(box, from: page)
-                    if reading.intersects(boxInView) { return true }
+                    if band.intersects(boxInView) { return true }
                 }
                 return false
             }
             return true
         }
 
+        /// Прямоугольник текущей подсветки в координатах PDFView (или nil).
+        private func highlightRectInView() -> CGRect? {
+            guard let pdfView, let sentence = parent.highlight,
+                  let page = parent.document.page(at: sentence.pageIndex) else { return nil }
+            if let range = sentence.range, let selection = page.selection(for: range) {
+                return pdfView.convert(selection.bounds(for: page), from: page)
+            }
+            guard !sentence.boxes.isEmpty else { return nil }
+            var union = CGRect.null
+            for box in sentence.boxes { union = union.union(box) }
+            return union.isNull ? nil : pdfView.convert(union, from: page)
+        }
+
+        /// Доводит скролл после `go(to:)`: PDFView не знает про стеклянные бар и
+        /// панель (контент течёт под них через ignoresSafeArea) и может оставить
+        /// подсветку «видимой» для себя, но фактически под стеклом. `center: false` —
+        /// минимальный сдвиг внутрь области чтения (follow по предложениям),
+        /// `center: true` — к центру области (возврат к чтению).
+        func alignHighlightToReadingArea(center: Bool) {
+            guard let pdfView, parent.readingMaxY > parent.readingMinY,
+                  let scrollView = Coordinator.firstScrollView(in: pdfView),
+                  let rect = highlightRectInView() else { return }
+            let margin: CGFloat = 16
+            let minY = parent.readingMinY + margin
+            let maxY = parent.readingMaxY - margin
+            var delta: CGFloat = 0
+            if center {
+                delta = rect.midY - (minY + maxY) / 2
+            } else if rect.height >= maxY - minY || rect.minY < minY {
+                // Подсветка выше области чтения (или выше неё целиком) — верх к верху.
+                delta = rect.minY - minY
+            } else if rect.maxY > maxY {
+                delta = rect.maxY - maxY
+            }
+            guard abs(delta) > 0.5 else { return }
+            var offset = scrollView.contentOffset
+            let lo = -scrollView.adjustedContentInset.top
+            let hi = max(lo, scrollView.contentSize.height
+                             + scrollView.adjustedContentInset.bottom
+                             - scrollView.bounds.height)
+            offset.y = min(max(offset.y + delta, lo), hi)
+            scrollView.setContentOffset(offset, animated: false)
+        }
+
+        /// Повторяет follow-скролл к текущей подсветке, когда PDFView реально
+        /// получит размер. При самом первом updateUIView (сразу после makeUIView)
+        /// SwiftUI ещё не выдал вью frame — bounds нулевые, и go(to:) в основном
+        /// проходе не может вычислить осмысленный scroll offset. Повтора «само
+        /// собой» не будет: lastSentenceID уже проставлен для этого предложения,
+        /// а highlight не меняется, пока не начнётся озвучка следующего —
+        /// поэтому опрашиваем bounds на каждом тике до 10 раз (обычно хватает
+        /// одного-двух после первого layout pass) и, как только они появились,
+        /// прокручиваем ещё раз к актуальной подсветке.
+        func scheduleFollowScrollRetry(attempt: Int = 0) {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isFollowing, let pdfView = self.pdfView else { return }
+                guard !pdfView.bounds.isEmpty else {
+                    if attempt < 10 { self.scheduleFollowScrollRetry(attempt: attempt + 1) }
+                    return
+                }
+                pdfView.layoutIfNeeded()
+                self.scrollToCurrentHighlight()
+            }
+        }
+
+        /// Прокручивает к текущей подсветке (highlight из parent) и репортит её
+        /// страницу — вынесено из основного прохода updateUIView, чтобы
+        /// scheduleFollowScrollRetry могло вызвать это же действие повторно, когда
+        /// PDFView наконец получит реальный размер.
+        func scrollToCurrentHighlight() {
+            guard let pdfView, let sentence = parent.highlight,
+                  let page = parent.document.page(at: sentence.pageIndex) else { return }
+            if let range = sentence.range, let selection = page.selection(for: range) {
+                pdfView.go(to: selection)
+            } else if !sentence.boxes.isEmpty {
+                var union = CGRect.null
+                for box in sentence.boxes { union = union.union(box) }
+                if !union.isNull { pdfView.go(to: union, on: page) }
+            }
+            alignHighlightToReadingArea(center: false)
+            reportPage(sentence.pageIndex)
+        }
+
+        /// Последняя отправленная пара (видимость, следование) — дедуп для
+        /// вызовов с каждого тика скролла.
+        private var lastReportedFollow: (vis: Bool, following: Bool)?
+
         func reportFollowChanged() {
             let vis = computeHighlightVisible()
-            parent.onFollowChanged(vis, isFollowing)
+            let following = isFollowing
+            guard lastReportedFollow?.vis != vis
+                || lastReportedFollow?.following != following else { return }
+            lastReportedFollow = (vis, following)
+            // Вычисления синхронные, но КОЛБЭК — за пределами прохода updateUIView:
+            // мутация @State родителя внутри рендера SwiftUI молча выбрасывается
+            // («Modifying state during view update») — из-за этого кнопка возврата
+            // не скрывалась после программного скролла. Тот же паттерн, что в
+            // ReflowReaderView.reportScroll.
+            let callback = parent.onFollowChanged
+            DispatchQueue.main.async {
+                callback(vis, following)
+            }
         }
 
         /// Срабатывает при начале pan или pinch — пользователь вручную скроллит/зумирует.
@@ -232,14 +390,50 @@ struct PDFKitView: UIViewRepresentable {
         }
 
         /// Определяет страницу по центру вьюпорта и сообщает наверх (с дедупом).
+        /// KVO-наблюдатель contentOffset может сработать СИНХРОННО из updateUIView
+        /// (программный go(to:) внутри рендера SwiftUI меняет contentOffset сразу) —
+        /// делегируем в deliverPageChange, а не мутируем @State родителя тут же.
         private func reportVisiblePage() {
             guard let pdfView else { return }
             let center = CGPoint(x: pdfView.bounds.midX, y: pdfView.bounds.midY)
             guard let page = pdfView.page(for: center, nearest: true) else { return }
             let index = parent.document.index(for: page)
-            guard index != NSNotFound, index != lastReportedPage else { return }
-            lastReportedPage = index
-            parent.onPageChange(index)
+            guard index != NSNotFound else { return }
+            deliverPageChange(index)
+        }
+
+        /// Сообщает наверх страницу НАПРЯМУЮ (без чтения layout PDFView) — вызывается
+        /// при программных переходах (восстановление позиции, «Вернуться к чтению»,
+        /// переход по миниатюре), где geometry ещё может быть не пересчитана в
+        /// момент go(to:).
+        func reportPage(_ index: Int) {
+            deliverPageChange(index)
+        }
+
+        /// Общая доставка индекса страницы наверх — за пределами прохода
+        /// updateUIView (тот же паттерн, что в reportFollowChanged): мутация @State
+        /// родителя СИНХРОННО во время рендера SwiftUI молча отбрасывается
+        /// («Modifying state during view update») — из-за этого счётчик страниц не
+        /// обновлялся ни после восстановления позиции, ни после «Вернуться к
+        /// чтению», ни из KVO, сработавшего синхронно от программного go(to:).
+        ///
+        /// lastReportedPage обновляем ТОЛЬКО вместе с фактической доставкой
+        /// колбэка (внутри async-блока), а не сразу в вызывающем коде — иначе
+        /// дедуп рассинхронизируется с реальностью: если бы индекс отмечался
+        /// «отправленным» сразу, а сама доставка потом молча терялась, повторный
+        /// репорт того же индекса больше никогда бы не прошёл guard. Повторная
+        /// проверка внутри async также защищает от гонки МЕЖДУ источниками
+        /// (программный переход и синхронно сработавший KVO-скролл, либо два
+        /// программных перехода подряд) — устаревший запланированный индекс
+        /// отбрасываем, а не затираем им уже доставленный более свежий.
+        private func deliverPageChange(_ index: Int) {
+            guard index != lastReportedPage else { return }
+            let callback = parent.onPageChange
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.lastReportedPage != index else { return }
+                self.lastReportedPage = index
+                callback(index)
+            }
         }
 
         private static func firstScrollView(in view: UIView) -> UIScrollView? {

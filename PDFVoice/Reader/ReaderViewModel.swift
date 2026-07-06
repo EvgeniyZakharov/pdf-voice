@@ -708,7 +708,17 @@ final class ReaderViewModel: ObservableObject {
 
     func togglePlayPause() { speech.togglePlayPause() }
 
+    /// Явно фиксирует прогресс в хранилище. Обычно позиция и так актуальна
+    /// (`speech.onIndexChange` сохраняет её на СТАРТЕ каждого предложения), но
+    /// это событие подтягивается только по мере воспроизведения — перед
+    /// остановкой сессии (✕ в мини-плеере) фиксируем currentIndex напрямую,
+    /// чтобы не зависеть от того, придёт ли ещё одно такое событие.
+    private func persistProgress() {
+        store?.updateProgress(for: item.id, sentenceIndex: speech.currentIndex)
+    }
+
     func endSession() {
+        persistProgress()
         speech.pause()
         sleepTimer.cancel()
         nowPlaying?.teardown()

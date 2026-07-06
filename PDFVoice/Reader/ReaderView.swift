@@ -29,6 +29,13 @@ private struct ReaderScreen: View {
     @State private var tapPoint: CGPoint = .zero
     @State private var currentPage = 0
     @State private var scrubValue: Double = 1
+    /// Идёт ли перетаскивание слайдера страниц. `Slider`'s `onEditingChanged(false)`
+    /// не гарантированно приходит на отменённом/синтетическом жесте (сорванный
+    /// драг, touch-cancel от системного жеста/входящего звонка) — тогда флаг
+    /// зависает в true и гейт `!isScrubbing` в onChange(of: currentPage) молча
+    /// блокирует обновление scrubValue навсегда. Явные действия пользователя
+    /// (тап по миниатюре, «Вернуться к чтению», прямой переход) сбрасывают его
+    /// принудительно — сам драг-UX (гейт в onChange) не трогаем.
     @State private var isScrubbing = false
     @State private var pageJump: PageJump?
     @State private var jumpToken = 0
@@ -102,7 +109,14 @@ private struct ReaderScreen: View {
             if let document = model.document {
                 ThumbnailGridView(document: document,
                                   currentPage: currentPage,
-                                  readyPageCount: model.loadedPageCount) { requestJump(to: $0) }
+                                  readyPageCount: model.loadedPageCount) {
+                    // Явный тап по странице всегда завершает любой скраб: если
+                    // ползунок ранее был протащен и isScrubbing «завис» в true
+                    // (Slider.onEditingChanged(false) не всегда приходит — см.
+                    // requestJump ниже), счётчик страниц молча не обновлялся бы.
+                    isScrubbing = false
+                    requestJump(to: $0)
+                }
             }
         }
         .sheet(isPresented: $showBookmarks) {
@@ -284,6 +298,12 @@ private struct ReaderScreen: View {
         // «отстаёт» до ручного скролла. onChange(of: currentPage) сам учитывает
         // isScrubbing, так что значение слайдера при перетаскивании не перебьётся.
         currentPage = clamped
+        // onChange(of: currentPage) не сработает, если clamped равен уже текущему
+        // значению (повторный тап той же страницы), а гейт `!isScrubbing` там же
+        // не даст обновить scrubValue, если флаг завис в true (см. комментарий
+        // у isScrubbing в pageBar). Явный переход — прямое действие пользователя,
+        // отображаемое значение двигаем сразу, не дожидаясь onChange.
+        if !isScrubbing { scrubValue = Double(clamped + 1) }
     }
 
     // MARK: - Возврат к чтению
@@ -294,6 +314,10 @@ private struct ReaderScreen: View {
             reflowCommandToken += 1
             reflowCommand = .returnToReading(token: reflowCommandToken)
         } else {
+            // Явное действие пользователя — завершает любой зависший скраб
+            // (см. комментарий у requestJump/isScrubbing), иначе счётчик
+            // страниц не подхватит корректно проскроллленную PDFKitView позицию.
+            isScrubbing = false
             pdfReturnToken += 1
         }
     }
@@ -331,16 +355,18 @@ private struct ReaderScreen: View {
                                      withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
                                  }
                              },
-                             onScroll: { f, ch, vis, _ in
+                             onScroll: { f, ch, vis, following in
                                  // Пока юзер тащит слайдер — он источник истины, не перебиваем.
                                  if !isReflowScrubbing {
                                      lastReportedFraction = f
                                      reflowScrollFraction = f
                                  }
                                  reflowTopChapter = ch
-                                 // Кнопка возврата — ВСЕГДА, когда подсветка не видна
-                                 // (раньше пряталась при isFollowing, хотя текст не виден).
-                                 withAnimation { showReturnButton = !vis }
+                                 // Кнопка возврата: пользователь сам увёл вид (не follow)
+                                 // И подсветка вне центральной полосы области чтения.
+                                 // При следовании вид сам держит текст в кадре — без гейта
+                                 // кнопка мигала бы, когда подсветка у кромки экрана.
+                                 withAnimation { showReturnButton = !vis && !following }
                              },
                              command: reflowCommand,
                              theme: settings.readingTheme,
@@ -394,9 +420,10 @@ private struct ReaderScreen: View {
                            currentPage = page
                            model.updateVisiblePage(page)
                        },
-                       onFollowChanged: { vis, _ in
-                           // То же правило, что в reflow: показываем, когда подсветка не видна.
-                           withAnimation { showReturnButton = !vis }
+                       onFollowChanged: { vis, following in
+                           // То же правило, что в reflow: юзер увёл вид И подсветка
+                           // вне центральной полосы → показываем кнопку возврата.
+                           withAnimation { showReturnButton = !vis && !following }
                        },
                        returnToReadingToken: pdfReturnToken,
                        readingMinY: readingFrame.minY,
@@ -438,9 +465,10 @@ private struct ReaderScreen: View {
 
     // MARK: - Кнопка возврата к чтению
 
-    /// Полупрозрачная круглая кнопка, появляющаяся когда:
-    /// - следование за чтением приостановлено (!isFollowing)
-    /// - текущая подсветка не видна во вьюпорте (!highlightVisible)
+    /// Полупрозрачная круглая кнопка, появляющаяся когда ОБА условия верны:
+    /// - следование за чтением приостановлено пользователем (!isFollowing);
+    /// - подсветка вне центральной полосы области чтения (~60% высоты,
+    ///   отступы по 20%) — «примерный диапазон видимости», не строгий центр.
     @ViewBuilder
     private var returnButton: some View {
         if showReturnButton {
@@ -639,6 +667,10 @@ private struct PlayerControls: View {
                 .frame(width: 62, height: 62)
                 .glass(in: Circle(), tint: Theme.accent, interactive: true)
                 .shadow(color: Theme.accent.opacity(0.18), radius: 8, y: 3)
+                // Без contentShape тап ловит только пиксели глифа play/pause
+                // (центр), а не весь круг 62×62 — кнопка «нажималась только по
+                // центру». Явная форма делает кликабельной всю площадь.
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(speech.isSpeaking ? "Пауза" : "Играть")
@@ -654,6 +686,8 @@ private struct PlayerControls: View {
                 .foregroundStyle(Theme.accent)
                 .frame(width: 48, height: 48)
                 .background(Theme.accent.opacity(0.08), in: Circle())
+                // Вся площадь 48×48 кликабельна, не только пиксели глифа.
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)

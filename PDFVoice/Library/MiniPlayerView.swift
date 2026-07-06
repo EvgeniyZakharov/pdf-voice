@@ -44,6 +44,8 @@ struct MiniPlayerView: View {
                     .font(.system(size: 22))
                     .foregroundStyle(Theme.accent)
                     .frame(width: 44, height: 44)
+                    // Кликабельна вся площадь 44×44, а не только пиксели глифа.
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel(speech.isSpeaking ? "Пауза" : "Играть")
 
@@ -52,6 +54,7 @@ struct MiniPlayerView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel("Закрыть плеер")
         }
