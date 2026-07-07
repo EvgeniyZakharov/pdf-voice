@@ -77,6 +77,18 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    /// Смена голоса на лету: применяем настройки и, если книга сейчас читается,
+    /// делаем чистый «пауза → play» — старый голос сразу смолкает, текущее
+    /// предложение перечитывается новым голосом с начала. Смена backend'а
+    /// (система ↔ Silero) сама перезапускает игру через didSet `sileroServerURL`;
+    /// смена голоса/спикера ВНУТРИ одного backend'а авто-перезапуска не даёт —
+    /// его и добавляет этот явный `restartCurrent()`.
+    func changeVoice(_ settings: SettingsStore) {
+        let wasSpeaking = speech.isSpeaking
+        applySettings(settings)
+        if wasSpeaking { speech.restartCurrent() }
+    }
+
     func applySettings(_ settings: SettingsStore) {
         speech.pauseBetweenSentences = settings.pauseBetweenSentences
         speech.sileroAPIKey = settings.sileroAPIKey
@@ -727,34 +739,17 @@ final class ReaderViewModel: ObservableObject {
 
     // MARK: - Закладки
 
+    /// Добавляет закладку на КОНКРЕТНОЕ предложение (тап «пузырёк» → кнопка
+    /// закладки). Возвращает false, если такая закладка уже есть или индекс
+    /// невалиден — вызов не дублирует закладки на одно и то же место.
     @discardableResult
-    func addBookmark() -> Bool {
-        let targetSentence: Sentence?
-        let targetIndex: Int
-
-        if speech.isSpeaking {
-            guard let s = currentSentence else { return false }
-            targetSentence = s
-            targetIndex = speech.currentIndex
-        } else {
-            if let idx = speech.sentences.firstIndex(where: { $0.pageIndex == currentVisiblePage }) {
-                targetSentence = speech.sentences[idx]
-                targetIndex = idx
-            } else if let closest = speech.sentences.enumerated().min(by: {
-                abs($0.element.pageIndex - currentVisiblePage) < abs($1.element.pageIndex - currentVisiblePage)
-            }) {
-                targetSentence = closest.element
-                targetIndex = closest.offset
-            } else {
-                return false
-            }
-        }
-
-        guard let sentence = targetSentence else { return false }
-        let preview = String(sentence.rawText.prefix(80))
-        let bm = Bookmark(sentenceIndex: targetIndex,
+    func addBookmark(atSentence index: Int) -> Bool {
+        guard speech.sentences.indices.contains(index) else { return false }
+        guard !bookmarks.contains(where: { $0.sentenceIndex == index }) else { return false }
+        let sentence = speech.sentences[index]
+        let bm = Bookmark(sentenceIndex: index,
                           pageIndex: sentence.pageIndex,
-                          preview: preview)
+                          preview: String(sentence.rawText.prefix(80)))
         store?.addBookmark(bm, to: item.id)
         bookmarks = store?.items.first(where: { $0.id == item.id })?.bookmarks ?? []
         return true

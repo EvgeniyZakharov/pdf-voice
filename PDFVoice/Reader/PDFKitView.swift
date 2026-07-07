@@ -19,6 +19,9 @@ struct PDFKitView: UIViewRepresentable {
     var readyPageCount: Int
     /// Текущее озвучиваемое предложение (для подсветки и авто-прокрутки).
     var highlight: Sentence?
+    /// Предложение, ВЫБРАННОЕ тапом (кандидат на запуск) — бледная подсветка,
+    /// независимая от активной; nil = ничего не выбрано.
+    var pendingHighlight: Sentence?
     /// Все предложения — для хит-теста тапа.
     var sentences: [Sentence]
     /// Команда перехода на страницу (от скраббера/миниатюр).
@@ -43,8 +46,12 @@ struct PDFKitView: UIViewRepresentable {
     /// SwiftUI-кнопка поверх representable не получает синтетический/сквозной тап
     /// надёжно, а жест PDFView срабатывает всегда.
     var bubbleCenter: CGPoint?
-    /// Подтверждение «Читать отсюда»: тап пришёлся в зону пузырька.
+    /// Подтверждение «Читать отсюда»: тап пришёлся в зону кнопки play пузырька.
     var onConfirmPlay: () -> Void = {}
+    /// Центр кнопки «закладка» в пузырьке (координаты вьюшки) или nil.
+    var bookmarkCenter: CGPoint?
+    /// Тап пришёлся в зону кнопки закладки пузырька.
+    var onBookmarkHere: () -> Void = {}
     /// Центр видимой кнопки «Вернуться к чтению» (координаты вьюшки) или nil.
     /// Как и пузырёк, её тап обрабатывает жест PDFView (SwiftUI-кнопка поверх
     /// representable надёжно тап не получает).
@@ -143,6 +150,14 @@ struct PDFKitView: UIViewRepresentable {
             context.coordinator.reportFollowChanged()
         }
 
+        // Подсветка ВЫБРАННОГО тапом предложения — бледными аннотациями, независимо
+        // от активной подсветки чтения. Меняется на тап (не на смену читаемого),
+        // поэтому свой проход со своим трекингом, ВЫШЕ guard'а reading-подсветки.
+        if context.coordinator.lastPendingID != pendingHighlight?.id {
+            context.coordinator.lastPendingID = pendingHighlight?.id
+            context.coordinator.applyPendingHighlight(pendingHighlight)
+        }
+
         // Подсветку перестраиваем только при смене предложения (не на каждое слово).
         guard let sentence = highlight,
               context.coordinator.lastSentenceID != sentence.id,
@@ -210,6 +225,10 @@ struct PDFKitView: UIViewRepresentable {
         var lastReadyCount: Int = 0
         /// Текущие подсветки-аннотации для OCR-страниц (чтобы снять при смене предложения).
         var ocrAnnotations: [(PDFPage, PDFAnnotation)] = []
+        /// Бледные аннотации подсветки ВЫБРАННОГО тапом предложения (снимаются при смене выбора).
+        var pendingAnnotations: [(PDFPage, PDFAnnotation)] = []
+        /// id последнего выбранного предложения (дедуп прохода pending-подсветки).
+        var lastPendingID: UUID?
         /// Активно ли следование вида за текущим предложением.
         var isFollowing = true
         /// Токен последнего выполненного returnToReading (дедупликация).
@@ -451,6 +470,31 @@ struct PDFKitView: UIViewRepresentable {
             ocrAnnotations.removeAll()
         }
 
+        /// Бледная подсветка выбранного тапом предложения. Аннотациями (а не
+        /// `highlightedSelections`, который занят активной подсветкой чтения) —
+        /// оба слоя живут независимо. Строки берём из выделения текстового слоя,
+        /// иначе — из OCR-боксов.
+        func applyPendingHighlight(_ sentence: Sentence?) {
+            for (page, annotation) in pendingAnnotations {
+                page.removeAnnotation(annotation)
+            }
+            pendingAnnotations.removeAll()
+            guard let sentence,
+                  let page = parent.document.page(at: sentence.pageIndex) else { return }
+            let addBox: (CGRect) -> Void = { box in
+                guard !box.isNull, box.width > 0, box.height > 0 else { return }
+                let ann = PDFAnnotation(bounds: box, forType: .highlight, withProperties: nil)
+                ann.color = Theme.pdfPendingHighlightUI
+                page.addAnnotation(ann)
+                self.pendingAnnotations.append((page, ann))
+            }
+            if let range = sentence.range, let selection = page.selection(for: range) {
+                for line in selection.selectionsByLine() { addBox(line.bounds(for: page)) }
+            } else {
+                for box in sentence.boxes { addBox(box) }
+            }
+        }
+
         @objc func pageChanged(_ note: Notification) {
             // Резервный путь: KVO-скролл обычно опережает эту нотификацию,
             // но при программном go(to:) она может прийти первой.
@@ -460,10 +504,16 @@ struct PDFKitView: UIViewRepresentable {
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard let pdfView else { return }
             let location = gesture.location(in: pdfView)
-            // Тап в зоне видимого пузырька = подтверждение «Читать отсюда».
+            // Тап в зоне кнопки play пузырька = подтверждение «Читать отсюда».
             if let center = parent.bubbleCenter,
-               hypot(location.x - center.x, location.y - center.y) <= 32 {
+               hypot(location.x - center.x, location.y - center.y) <= 28 {
                 parent.onConfirmPlay()
+                return
+            }
+            // Тап в зоне кнопки закладки пузырька.
+            if let center = parent.bookmarkCenter,
+               hypot(location.x - center.x, location.y - center.y) <= 28 {
+                parent.onBookmarkHere()
                 return
             }
             // Тап в зоне кнопки «Вернуться к чтению».

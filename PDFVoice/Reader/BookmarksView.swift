@@ -4,7 +4,6 @@ import UIKit
 struct BookmarksView: View {
     @ObservedObject var model: ReaderViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var bookmarkAdded = false
 
     var body: some View {
         NavigationStack {
@@ -16,7 +15,7 @@ struct BookmarksView: View {
                             .foregroundStyle(.secondary)
                         Text("Закладок нет")
                             .font(.headline)
-                        Text("Нажмите + чтобы добавить закладку.")
+                        Text("Тапните по предложению при чтении и нажмите значок закладки, чтобы отметить место.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -60,22 +59,6 @@ struct BookmarksView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button { dismiss() } label: {
                         Image(systemName: "chevron.down")
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        if model.addBookmark() {
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            withAnimation(.spring(response: 0.2, dampingFraction: 0.5)) {
-                                bookmarkAdded = true
-                            }
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                                withAnimation { bookmarkAdded = false }
-                            }
-                        }
-                    } label: {
-                        Image(systemName: bookmarkAdded ? "checkmark" : "plus")
-                            .animation(.easeInOut(duration: 0.15), value: bookmarkAdded)
                     }
                 }
             }

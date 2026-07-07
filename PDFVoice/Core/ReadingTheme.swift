@@ -46,4 +46,15 @@ enum ReadingTheme: String, CaseIterable, Identifiable {
         case .dark:  return UIColor(red: 150.0/255, green: 120.0/255, blue:  60.0/255, alpha: 0.55)
         }
     }
+
+    /// Подсветка предложения, ВЫБРАННОГО тапом (кандидат на запуск) — тот же тон,
+    /// но бледнее активной `highlightUI`, чтобы отличать «что выбрано» от «что
+    /// читается сейчас».
+    var pendingHighlightUI: UIColor {
+        switch self {
+        case .light: return UIColor(red: 228.0/255, green: 197.0/255, blue: 124.0/255, alpha: 0.18)
+        case .sepia: return UIColor(red: 221.0/255, green: 185.0/255, blue: 117.0/255, alpha: 0.20)
+        case .dark:  return UIColor(red: 150.0/255, green: 120.0/255, blue:  60.0/255, alpha: 0.28)
+        }
+    }
 }

@@ -24,6 +24,9 @@ struct ReflowReaderView: UIViewRepresentable {
     let chapterOffsets: [Int]
     /// Текущее озвучиваемое предложение (подсветка + авто-прокрутка).
     var highlight: Sentence?
+    /// Предложение, ВЫБРАННОЕ тапом (кандидат на запуск) — бледная подсветка,
+    /// независимая от активной; nil = ничего не выбрано.
+    var pendingHighlight: Sentence?
     /// Все предложения — для хит-теста тапа.
     var sentences: [Sentence]
     /// Тап: индекс попавшего предложения (или nil) и точка тапа.
@@ -50,8 +53,12 @@ struct ReflowReaderView: UIViewRepresentable {
     /// Центр видимого пузырька «Читать отсюда» (координаты вьюпорта) или nil.
     /// Тап по этой зоне обрабатывает сам жест текста как подтверждение.
     var bubbleCenter: CGPoint?
-    /// Подтверждение «Читать отсюда»: тап пришёлся в зону пузырька.
+    /// Подтверждение «Читать отсюда»: тап пришёлся в зону кнопки play пузырька.
     var onConfirmPlay: () -> Void = {}
+    /// Центр кнопки «закладка» в пузырьке (координаты вьюпорта) или nil.
+    var bookmarkCenter: CGPoint?
+    /// Тап пришёлся в зону кнопки закладки пузырька.
+    var onBookmarkHere: () -> Void = {}
     /// Центр видимой кнопки «Вернуться к чтению» (координаты вьюпорта) или nil.
     var returnButtonCenter: CGPoint?
     /// Тап пришёлся в зону кнопки «Вернуться к чтению».
@@ -66,7 +73,11 @@ struct ReflowReaderView: UIViewRepresentable {
         // (addAttribute для подсветки) доступен только в TextKit 1.
         let tv = InsetAwareTextView(usingTextLayoutManager: false)
         tv.isEditable = false
-        tv.isSelectable = false          // тап обрабатываем сами (play-here)
+        // isSelectable=true даёт нативное выделение текста по долгому нажатию
+        // (лупа + меню «Копировать») — как в PDF. Одиночный тап у нередактируемого
+        // текст-вью ничего не выделяет, поэтому наш play-here тап-жест (ниже) с ним
+        // не конфликтует: выделение — это long-press, а не tap.
+        tv.isSelectable = true
         tv.backgroundColor = theme.pageBackgroundUI
         tv.alwaysBounceVertical = true
         tv.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 48, right: 20)
@@ -94,8 +105,7 @@ struct ReflowReaderView: UIViewRepresentable {
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
             tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
-            context.coordinator.lastHighlightID = nil
-            context.coordinator.lastRange = nil
+            context.coordinator.resetHighlightTracking()
         }
 
         // Смена темы чтения на лету: фон + перекраска текста. Re-attribute сбрасывает
@@ -104,8 +114,7 @@ struct ReflowReaderView: UIViewRepresentable {
             context.coordinator.lastTheme = theme
             tv.backgroundColor = theme.pageBackgroundUI
             tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
-            context.coordinator.lastHighlightID = nil
-            context.coordinator.lastRange = nil
+            context.coordinator.resetHighlightTracking()
         }
 
         // Команда от родителя (слайдер или кнопка возврата). Применяем при смене токена.
@@ -146,6 +155,13 @@ struct ReflowReaderView: UIViewRepresentable {
             }
         }
 
+        // Бледная подсветка ВЫБРАННОГО тапом предложения — свой трекинг, меняется
+        // на тап (не на смену читаемого), поэтому отдельным проходом ВЫШЕ активной.
+        if context.coordinator.lastPendingID != pendingHighlight?.id {
+            context.coordinator.lastPendingID = pendingHighlight?.id
+            context.coordinator.applyPending(pendingHighlight)
+        }
+
         guard let sentence = highlight,
               context.coordinator.lastHighlightID != sentence.id else { return }
         context.coordinator.lastHighlightID = sentence.id
@@ -158,6 +174,9 @@ struct ReflowReaderView: UIViewRepresentable {
         var lastText: String
         var lastHighlightID: UUID?
         var lastRange: NSRange?
+        /// Трекинг бледной подсветки выбранного тапом предложения.
+        var lastPendingID: UUID?
+        var lastPendingRange: NSRange?
         /// Последняя применённая тема — для перекраски в updateUIView при смене.
         var lastTheme: ReadingTheme = .sepia
         /// Активно ли следование вида за текущим предложением.
@@ -243,6 +262,15 @@ struct ReflowReaderView: UIViewRepresentable {
             return NSRange(location: base, length: len)
         }
 
+        /// Re-attribute сбрасывает ВСЕ фоновые подсветки — обнуляем оба трекинга,
+        /// чтобы updateUIView применил и активную, и pending заново нужным цветом.
+        func resetHighlightTracking() {
+            lastHighlightID = nil
+            lastRange = nil
+            lastPendingID = nil
+            lastPendingRange = nil
+        }
+
         func applyHighlight(_ s: Sentence) {
             guard let tv = textView else { return }
             let storage = tv.textStorage
@@ -261,6 +289,30 @@ struct ReflowReaderView: UIViewRepresentable {
             // Скроллим к подсветке только при активном следовании.
             if let range, isFollowing { tv.scrollRangeToVisible(range) }
             reportScroll(tv)
+        }
+
+        /// Бледная подсветка выбранного тапом предложения (кандидат на запуск).
+        /// Не трогает активную подсветку чтения; если pending совпал бы с активным
+        /// диапазоном — пропускаем (активную не перекрываем более бледным цветом).
+        func applyPending(_ s: Sentence?) {
+            guard let tv = textView else { return }
+            let storage = tv.textStorage
+            storage.beginEditing()
+            if let prev = lastPendingRange {
+                storage.removeAttribute(.backgroundColor, range: prev)
+                // Если pending перекрывал активную подсветку — вернуть её цвет.
+                if let r = lastRange, NSIntersectionRange(prev, r).length > 0 {
+                    storage.addAttribute(.backgroundColor, value: parent.theme.highlightUI, range: r)
+                }
+                lastPendingRange = nil
+            }
+            if let s, let range = globalRange(for: s), range != lastRange {
+                storage.addAttribute(.backgroundColor,
+                                     value: parent.theme.pendingHighlightUI,
+                                     range: range)
+                lastPendingRange = range
+            }
+            storage.endEditing()
         }
 
         // MARK: - Программная прокрутка (возврат к чтению / прыжок к главе)
@@ -406,10 +458,16 @@ struct ReflowReaderView: UIViewRepresentable {
             // «Читать отсюда»: без вычитания offset пузырёк уедет за экран при прокрутке.
             let viewPoint = CGPoint(x: point.x - tv.contentOffset.x,
                                     y: point.y - tv.contentOffset.y)
-            // Тап в зоне видимого пузырька = подтверждение «Читать отсюда».
+            // Тап в зоне кнопки play пузырька = подтверждение «Читать отсюда».
             if let center = parent.bubbleCenter,
-               hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= 32 {
+               hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= 28 {
                 parent.onConfirmPlay()
+                return
+            }
+            // Тап в зоне кнопки закладки пузырька.
+            if let center = parent.bookmarkCenter,
+               hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= 28 {
+                parent.onBookmarkHere()
                 return
             }
             // Тап в зоне кнопки «Вернуться к чтению».

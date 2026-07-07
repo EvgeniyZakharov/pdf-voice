@@ -168,6 +168,15 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         isSpeaking = false
     }
 
+    /// Перечитать текущее предложение с начала активным backend'ом — эффект
+    /// «пауза → play»: `play(from:)` в обоих backend'ах сперва глушит старый звук
+    /// (AVSpeech `stopSpeaking(.immediate)`, Silero `stop()`), затем стартует
+    /// заново. Используется при смене голоса на лету.
+    func restartCurrent() {
+        guard !sentences.isEmpty else { return }
+        play(from: currentIndex)
+    }
+
     func resume() {
         // Категория .playback нужна для фона/экрана блокировки. Раньше её ставил
         // только play(from:), а старт Silero через большую кнопку Play идёт по

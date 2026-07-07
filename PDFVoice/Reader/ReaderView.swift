@@ -27,6 +27,8 @@ private struct ReaderScreen: View {
 
     @State private var pendingIndex: Int?
     @State private var tapPoint: CGPoint = .zero
+    /// Пульс иконки закладки в правом верхнем углу — подтверждение добавления.
+    @State private var bookmarkPulse = false
     @State private var currentPage = 0
     @State private var scrubValue: Double = 1
     /// Идёт ли перетаскивание слайдера страниц. `Slider`'s `onEditingChanged(false)`
@@ -134,7 +136,7 @@ private struct ReaderScreen: View {
         // Сессия (attach/applySettings/load) поднята в PlaybackCoordinator.open — здесь
         // НЕ грузим и НЕ завершаем её: при уходе в библиотеку аудио продолжает играть (R2).
         .onAppear { settings.probeSilero() }
-        .onChange(of: settings.selectedVoice)      { _ in model.applySettings(settings) }
+        .onChange(of: settings.selectedVoice)      { _ in model.changeVoice(settings) }
         // Озвучка перешла на другое предложение — пузырёк «Читать отсюда»
         // больше не актуален, прячем (иначе висел поверх текста).
         .onChange(of: model.currentSentence?.id) { _ in
@@ -149,6 +151,22 @@ private struct ReaderScreen: View {
     @ToolbarContentBuilder
     private var toolbarItems: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            // Выбор голоса прямо в читалке — дублирует пикер из Настроек, но БЕЗ
+            // приветствия: приветствие озвучивается только в SettingsView
+            // (VoicePreviewer). Здесь простое присвоение settings.selectedVoice →
+            // .onChange(of: settings.selectedVoice) в body вызывает
+            // model.applySettings → голос/спикер переключается прямо в чтении книги.
+            Menu {
+                Picker("Голос", selection: $settings.selectedVoice) {
+                    ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable)) { opt in
+                        Text(opt.title).tag(opt.id)
+                    }
+                }
+            } label: {
+                Image(systemName: "person.wave.2")
+            }
+            .accessibilityLabel("Голос")
+
             // Фон чтения — только для reflow (на PDF тема не влияет). Смена на лету:
             // ReflowReaderView.updateUIView перекрашивает фон/текст без переоткрытия книги.
             if model.isReflowable {
@@ -171,6 +189,7 @@ private struct ReaderScreen: View {
             } label: {
                 Image(systemName: hasBookmarkOnPage ? "bookmark.fill" : "bookmark")
                     .foregroundStyle(hasBookmarkOnPage ? Theme.accent : Color.primary)
+                    .scaleEffect(bookmarkPulse ? 1.35 : 1.0)
             }
         }
     }
@@ -346,6 +365,7 @@ private struct ReaderScreen: View {
             ReflowReaderView(text: model.reflowFlatText,
                              chapterOffsets: model.reflowChapterOffsets,
                              highlight: model.currentSentence,
+                             pendingHighlight: pendingSentence,
                              sentences: model.speech.sentences,
                              onTap: { index, point in
                                  if let index {
@@ -373,8 +393,10 @@ private struct ReaderScreen: View {
                              bottomClearance: panelHeight + 12,
                              readingMinY: readingFrame.minY,
                              readingMaxY: readingFrame.maxY,
-                             bubbleCenter: bubbleCenter,
+                             bubbleCenter: playButtonCenter,
                              onConfirmPlay: { playFromBubble() },
+                             bookmarkCenter: bookmarkButtonCenter,
+                             onBookmarkHere: { bookmarkHere() },
                              returnButtonCenter: returnButtonCenter,
                              onReturnTap: { returnToReading() })
                 // Фон reflow задаёт сама тема (ReadingTheme.pageBackgroundUI) — кремового
@@ -406,6 +428,7 @@ private struct ReaderScreen: View {
             PDFKitView(document: model.displayDocument,
                        readyPageCount: model.loadedPageCount,
                        highlight: model.currentSentence,
+                       pendingHighlight: pendingSentence,
                        sentences: model.speech.sentences,
                        pageJump: pageJump,
                        onTap: { index, point in
@@ -428,8 +451,10 @@ private struct ReaderScreen: View {
                        returnToReadingToken: pdfReturnToken,
                        readingMinY: readingFrame.minY,
                        readingMaxY: readingFrame.maxY,
-                       bubbleCenter: bubbleCenter,
+                       bubbleCenter: playButtonCenter,
                        onConfirmPlay: { playFromBubble() },
+                       bookmarkCenter: bookmarkButtonCenter,
+                       onBookmarkHere: { bookmarkHere() },
                        returnButtonCenter: returnButtonCenter,
                        onReturnTap: { returnToReading() })
                 // Тёплая «бумага»: multiply тонирует белые страницы в крем,
@@ -518,9 +543,31 @@ private struct ReaderScreen: View {
     /// PDF/текста опознаёт как подтверждение.
     private var bubbleCenter: CGPoint? {
         guard pendingIndex != nil, readingFrame != .zero else { return nil }
+        // Клемп по X с запасом на половину ширины капсулы (две кнопки) — чтобы
+        // ни play, ни закладка не уезжали за кромку области чтения.
         return CGPoint(
-            x: min(max(tapPoint.x, readingFrame.minX + 30), readingFrame.maxX - 30),
+            x: min(max(tapPoint.x, readingFrame.minX + 58), readingFrame.maxX - 58),
             y: min(max(tapPoint.y - 44, readingFrame.minY + 28), readingFrame.maxY - 30))
+    }
+
+    /// Центр кнопки «play» в капсуле-пузырьке (левая) — для хит-зоны в PDF/тексте.
+    private var playButtonCenter: CGPoint? {
+        bubbleCenter.map { CGPoint(x: $0.x - Self.bubbleButtonOffset, y: $0.y) }
+    }
+
+    /// Центр кнопки «закладка» в капсуле-пузырьке (правая).
+    private var bookmarkButtonCenter: CGPoint? {
+        bubbleCenter.map { CGPoint(x: $0.x + Self.bubbleButtonOffset, y: $0.y) }
+    }
+
+    /// Половина расстояния между центрами двух кнопок капсулы (совпадает с версткой
+    /// `bubbleButtons`: две 44-pt кнопки + разделитель).
+    private static let bubbleButtonOffset: CGFloat = 28
+
+    /// Выбранное тапом предложение (для бледной подсветки-кандидата).
+    private var pendingSentence: Sentence? {
+        guard let i = pendingIndex, model.speech.sentences.indices.contains(i) else { return nil }
+        return model.speech.sentences[i]
     }
 
     /// Центр кнопки «Вернуться к чтению» (bottom-trailing области чтения, паддинги
@@ -535,7 +582,7 @@ private struct ReaderScreen: View {
     /// совпадают с `bubbleCenter`). Тап по нему обрабатывает жест PDF/текста
     /// (`onConfirmPlay`), кнопка — визуал + VoiceOver.
     private func bubbleOverlay(for index: Int) -> some View {
-        playHereBubble(for: index)
+        bubbleButtons(for: index)
             .position(bubbleCenter ?? .zero)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea(.container, edges: [.top, .bottom])
@@ -570,19 +617,53 @@ private struct ReaderScreen: View {
         }
     }
 
-    private func playHereBubble(for index: Int) -> some View {
-        Button {
-            playFromBubble()
-        } label: {
-            Image(systemName: "play.fill")
-                .font(.subheadline.weight(.bold))
-                .frame(width: 48, height: 48)
-                .glass(in: Circle(), interactive: true)
+    /// Пузырёк над выбранным предложением: две сгруппированные кнопки —
+    /// «Читать отсюда» и «Добавить закладку» — единой стеклянной капсулой.
+    /// Реальный тап ловит жест PDF/текста по координатам (`playButtonCenter`/
+    /// `bookmarkButtonCenter`); SwiftUI-кнопки здесь — визуал + VoiceOver.
+    private func bubbleButtons(for index: Int) -> some View {
+        HStack(spacing: 6) {
+            bubbleButton(icon: "play.fill", label: "Читать отсюда", action: playFromBubble)
+            Divider().frame(width: 1, height: 24).overlay(Theme.hairline)
+            bubbleButton(icon: "bookmark.fill", label: "Добавить закладку", action: bookmarkHere)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .glass(in: Capsule(), interactive: false)
+        .shadow(color: .black.opacity(0.15), radius: 8, y: 3)
+    }
+
+    private func bubbleButton(icon: String, label: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .semibold))
+                .frame(width: 44, height: 44)
                 .foregroundStyle(Theme.accent)
-                .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Читать отсюда")
+        .accessibilityLabel(label)
+    }
+
+    /// Кнопка закладки в пузырьке: добавляет закладку на ВЫБРАННОЕ предложение,
+    /// пульсирует иконкой в правом верхнем углу как подтверждение и прячет пузырёк.
+    private func bookmarkHere() {
+        guard let index = pendingIndex else { return }
+        if model.addBookmark(atSentence: index) {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            pulseBookmarkIcon()
+        }
+        withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+    }
+
+    /// Лёгкое увеличение-уменьшение иконки закладки в тулбаре — визуальное
+    /// подтверждение, что закладка действительно добавлена.
+    private func pulseBookmarkIcon() {
+        withAnimation(.spring(response: 0.2, dampingFraction: 0.45)) { bookmarkPulse = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.6)) { bookmarkPulse = false }
+        }
     }
 
     private func ocrProgressBanner(_ progress: Double) -> some View {
