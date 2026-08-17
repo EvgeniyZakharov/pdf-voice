@@ -29,6 +29,16 @@ struct LibraryItem: Codable, Identifiable, Hashable {
     /// Индекс предложения, на котором остановилось чтение (для «продолжить»).
     var currentSentenceIndex: Int
     var bookmarks: [Bookmark]
+    /// id коллекций, в которые входит книга (many-to-many).
+    var collectionIDs: [UUID]
+    /// Книга дочитана до конца (озвучка дошла до последнего предложения) —
+    /// для фильтра «Законченные».
+    var isFinished: Bool
+    /// Язык книги (BCP-47, «ru»/«en») — задаёт языковой профиль и голос озвучки.
+    /// `nil` = ещё не определён: детект отрабатывает один раз при первой загрузке
+    /// книги и записывает результат сюда. Пока nil — поведение прежнее, русское.
+    /// Пользователь может исправить значение вручную (детект иногда ошибается).
+    var language: String?
 
     init(id: UUID = UUID(),
          fileName: String,
@@ -36,7 +46,10 @@ struct LibraryItem: Codable, Identifiable, Hashable {
          addedDate: Date = Date(),
          lastOpened: Date? = nil,
          currentSentenceIndex: Int = 0,
-         bookmarks: [Bookmark] = []) {
+         bookmarks: [Bookmark] = [],
+         collectionIDs: [UUID] = [],
+         isFinished: Bool = false,
+         language: String? = nil) {
         self.id = id
         self.fileName = fileName
         self.title = title
@@ -44,6 +57,32 @@ struct LibraryItem: Codable, Identifiable, Hashable {
         self.lastOpened = lastOpened
         self.currentSentenceIndex = currentSentenceIndex
         self.bookmarks = bookmarks
+        self.collectionIDs = collectionIDs
+        self.isFinished = isFinished
+        self.language = language
+    }
+
+    // Ручной Decodable: `collectionIDs`/`isFinished`/`language` добавлены позже —
+    // у старых записей `library.json` этих ключей нет. Синтезированный init их бы
+    // ТРЕБОВАЛ (дефолты свойств при декодировании не применяются) и ронял загрузку
+    // всей библиотеки. `decodeIfPresent` с фолбэком делает миграцию бесшовной.
+    enum CodingKeys: String, CodingKey {
+        case id, fileName, title, addedDate, lastOpened
+        case currentSentenceIndex, bookmarks, collectionIDs, isFinished, language
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        fileName = try c.decode(String.self, forKey: .fileName)
+        title = try c.decode(String.self, forKey: .title)
+        addedDate = try c.decode(Date.self, forKey: .addedDate)
+        lastOpened = try c.decodeIfPresent(Date.self, forKey: .lastOpened)
+        currentSentenceIndex = try c.decode(Int.self, forKey: .currentSentenceIndex)
+        bookmarks = try c.decodeIfPresent([Bookmark].self, forKey: .bookmarks) ?? []
+        collectionIDs = try c.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
+        isFinished = try c.decodeIfPresent(Bool.self, forKey: .isFinished) ?? false
+        language = try c.decodeIfPresent(String.self, forKey: .language)
     }
 
     /// Абсолютный URL файла в каталоге Documents.
@@ -54,4 +93,9 @@ struct LibraryItem: Codable, Identifiable, Hashable {
     /// Формат книги выводится из расширения `fileName` — единый источник истины,
     /// без миграции `library.json` (старые записи `uuid.pdf` → `.pdf`).
     var format: BookFormat { BookFormat.detect(fileName: fileName) }
+
+    /// Язык для выбора профиля и голоса. ЕДИНСТВЕННОЕ место, где решается, что
+    /// делать с `nil` (детект ещё не отработал): читаем как русскую книгу —
+    /// прежнее поведение приложения.
+    var effectiveLanguage: String { language ?? LanguageProfiles.defaultCode }
 }

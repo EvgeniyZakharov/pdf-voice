@@ -173,18 +173,50 @@ final class SileroBackend: SpeechBackend {
         let url = base.appendingPathComponent("synthesize")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        req.timeoutInterval = 30
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !apiKey.isEmpty {
             req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
         }
         req.httpBody = try JSONEncoder().encode(SileroRequest(text: text, speaker: speaker))
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        // Не-200 (нет сети → URLSession бросит сам; 401/500 → бросаем тут) уводит
-        // в путь отката на системный голос, а не в тихий пропуск предложения.
-        if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-            throw URLError(.badServerResponse)
+
+        // Ретраи с бэкоффом на ТРАНЗИЕНТНЫХ сбоях (таймаут, обрыв соединения,
+        // фон-throttling сети, 5xx). Иначе одна временная ошибка (свернул приложение,
+        // другой звук перехватил сеть) → .failed → откат на системный голос. Фатальные
+        // ошибки (401/403/404 — неверный ключ/адрес) НЕ ретраим — сразу пробрасываем.
+        let maxAttempts = 3
+        var attempt = 0
+        while true {
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                    if (500...599).contains(http.statusCode), attempt < maxAttempts - 1 {
+                        attempt += 1
+                        try await Task.sleep(nanoseconds: UInt64(Double(attempt) * 0.8 * 1_000_000_000))
+                        continue
+                    }
+                    throw URLError(.badServerResponse)
+                }
+                return data
+            } catch let error as URLError where Self.isTransient(error) && attempt < maxAttempts - 1 {
+                attempt += 1
+                try await Task.sleep(nanoseconds: UInt64(Double(attempt) * 0.8 * 1_000_000_000))
+                continue
+            }
         }
-        return data
+    }
+
+    /// Временный ли это сетевой сбой (стоит повторить), в отличие от фатального
+    /// (неверный ключ/адрес — повтор бессмыслен).
+    private static func isTransient(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut, .networkConnectionLost, .notConnectedToInternet,
+             .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .resourceUnavailable, .backgroundSessionWasDisconnected:
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: - Воспроизведение

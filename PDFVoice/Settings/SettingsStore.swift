@@ -35,8 +35,14 @@ final class SettingsStore: ObservableObject {
 
     @Published var pauseBetweenSentences: Double { didSet { ud.set(pauseBetweenSentences, forKey: "pv.pause") } }
 
-    /// Выбранный голос: "sys:<identifier>" (системный) или "silero:<speaker>".
+    /// Голос для РУССКИХ книг: "sys:<identifier>" (системный) или "silero:<speaker>".
+    /// Ключ хранения прежний — миграция не нужна, русский остаётся основным языком.
     @Published var selectedVoice: String  { didSet { ud.set(selectedVoice,   forKey: "pv.selectedVoice") } }
+
+    /// Голос для АНГЛИЙСКИХ книг — всегда системный: сервер Silero держит русскую
+    /// модель. Голос выбирается по языку КНИГИ, а не переключается вручную —
+    /// см. `ReaderViewModel.applySettings`.
+    @Published var selectedVoiceEN: String { didSet { ud.set(selectedVoiceEN, forKey: "pv.selectedVoiceEN") } }
 
     /// Продакшн-сервер Silero. Зашит в приложение — пользователь его не настраивает,
     /// подключение к улучшенным голосам происходит автоматически.
@@ -51,6 +57,10 @@ final class SettingsStore: ObservableObject {
     }
     /// Тема страницы чтения (reflow). Независима от `appearance`. По умолчанию — сепия.
     @Published var readingTheme: ReadingTheme { didSet { ud.set(readingTheme.rawValue, forKey: "pv.readingTheme") } }
+    /// Размер шрифта текста reflow-форматов (pt). Применяется на лету. PDF не трогает.
+    @Published var readingFontSize: Double { didSet { ud.set(readingFontSize, forKey: "pv.readingFontSize") } }
+    /// Границы регулировки размера шрифта reflow.
+    static let fontSizeRange: ClosedRange<Double> = 14...30
     @Published var libraryLayout: LibraryLayout { didSet { ud.set(libraryLayout.rawValue, forKey: "pv.libraryLayout") } }
 
     /// Доступен ли Silero-сервер (не сохраняется — определяется ping'ом /health).
@@ -58,9 +68,17 @@ final class SettingsStore: ObservableObject {
 
     init() {
         pauseBetweenSentences = ud.object(forKey: "pv.pause") as? Double ?? 0.3
-        selectedVoice         = ud.string(forKey: "pv.selectedVoice") ?? VoiceCatalog.defaultSelection()
+        // sanitized: выбор, сохранённый до сокращения списка голосов (kseniya,
+        // aidar, baya, системные кроме Милены), заменяется голосом по умолчанию.
+        selectedVoice         = VoiceCatalog.sanitized(ud.string(forKey: "pv.selectedVoice")
+                                                       ?? VoiceCatalog.defaultSelection(),
+                                                       for: "ru")
+        selectedVoiceEN       = VoiceCatalog.sanitized(ud.string(forKey: "pv.selectedVoiceEN")
+                                                       ?? VoiceCatalog.defaultSelection(for: "en"),
+                                                       for: "en")
         appearance            = AppAppearance(rawValue: ud.string(forKey: "pv.appearance") ?? "") ?? .system
         readingTheme          = ReadingTheme(rawValue: ud.string(forKey: "pv.readingTheme") ?? "") ?? .sepia
+        readingFontSize       = ud.object(forKey: "pv.readingFontSize") as? Double ?? 19
         libraryLayout         = LibraryLayout(rawValue: ud.string(forKey: "pv.libraryLayout") ?? "") ?? .list
 
         // Чистим старые сохранённые адрес/ключ — раньше настраивались вручную,

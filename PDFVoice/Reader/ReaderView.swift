@@ -43,6 +43,8 @@ private struct ReaderScreen: View {
     @State private var jumpToken = 0
     @State private var showThumbnails = false
     @State private var showBookmarks = false
+    /// Показ листа регулировки размера шрифта (reflow).
+    @State private var showFontSize = false
     // Reflow-навигация (не делим состояние с pageBar)
     @State private var showChapters = false
 
@@ -124,6 +126,9 @@ private struct ReaderScreen: View {
         .sheet(isPresented: $showBookmarks) {
             BookmarksView(model: model)
         }
+        .sheet(isPresented: $showFontSize) {
+            FontSizeSheet(fontSize: $settings.readingFontSize)
+        }
         .sheet(isPresented: $showChapters) {
             ChapterListView(model: model) { chapter in
                 // Тап по главе = переход ПОЗИЦИИ ЧТЕНИЯ (как закладка): играет → озвучка
@@ -137,6 +142,7 @@ private struct ReaderScreen: View {
         // НЕ грузим и НЕ завершаем её: при уходе в библиотеку аудио продолжает играть (R2).
         .onAppear { settings.probeSilero() }
         .onChange(of: settings.selectedVoice)      { _ in model.changeVoice(settings) }
+        .onChange(of: settings.selectedVoiceEN)    { _ in model.changeVoice(settings) }
         // Озвучка перешла на другое предложение — пузырёк «Читать отсюда»
         // больше не актуален, прячем (иначе висел поверх текста).
         .onChange(of: model.currentSentence?.id) { _ in
@@ -157,9 +163,21 @@ private struct ReaderScreen: View {
             // .onChange(of: settings.selectedVoice) в body вызывает
             // model.applySettings → голос/спикер переключается прямо в чтении книги.
             Menu {
-                Picker("Голос", selection: $settings.selectedVoice) {
-                    ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable)) { opt in
-                        Text(opt.title).tag(opt.id)
+                // Голоса ТОЛЬКО языка открытой книги: показывать русские голоса
+                // на английской книге бессмысленно — озвучивать её будет
+                // английский (см. ReaderViewModel.applySettings).
+                if VoiceCatalog.isEnglish(model.libraryItem.effectiveLanguage) {
+                    Picker("Голос", selection: $settings.selectedVoiceEN) {
+                        ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable,
+                                                     language: "en")) { opt in
+                            Text(opt.title).tag(opt.id)
+                        }
+                    }
+                } else {
+                    Picker("Голос", selection: $settings.selectedVoice) {
+                        ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable)) { opt in
+                            Text(opt.title).tag(opt.id)
+                        }
                     }
                 }
             } label: {
@@ -167,9 +185,15 @@ private struct ReaderScreen: View {
             }
             .accessibilityLabel("Голос")
 
-            // Фон чтения — только для reflow (на PDF тема не влияет). Смена на лету:
-            // ReflowReaderView.updateUIView перекрашивает фон/текст без переоткрытия книги.
+            // Фон чтения + размер шрифта — только для reflow (на PDF тема/шрифт не
+            // влияют). Смена на лету: ReflowReaderView.updateUIView перекрашивает/
+            // перевёрстывает текст без переоткрытия книги.
             if model.isReflowable {
+                Button { showFontSize = true } label: {
+                    Image(systemName: "textformat.size")
+                }
+                .accessibilityLabel("Размер шрифта")
+
                 Menu {
                     Picker("Фон чтения", selection: $settings.readingTheme) {
                         ForEach(ReadingTheme.allCases) { theme in
@@ -390,6 +414,7 @@ private struct ReaderScreen: View {
                              },
                              command: reflowCommand,
                              theme: settings.readingTheme,
+                             fontSize: CGFloat(settings.readingFontSize),
                              bottomClearance: panelHeight + 12,
                              readingMinY: readingFrame.minY,
                              readingMaxY: readingFrame.maxY,

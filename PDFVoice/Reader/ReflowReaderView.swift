@@ -38,6 +38,8 @@ struct ReflowReaderView: UIViewRepresentable {
     var command: ReflowCommand? = nil
     /// Тема страницы (фон + текст + подсветка). Применяется на лету в updateUIView.
     var theme: ReadingTheme = .sepia
+    /// Размер шрифта основного текста (pt). Меняется на лету из настроек читалки.
+    var fontSize: CGFloat = 19
     /// Сколько места снизу (от края экрана) должно оставаться свободным от текста
     /// при прокрутке в конец: высота плавающей стеклянной панели плеера + зазор.
     /// Сам текст-вью растянут под панель (ignoresSafeArea) — текст уходит под стекло
@@ -64,8 +66,6 @@ struct ReflowReaderView: UIViewRepresentable {
     /// Тап пришёлся в зону кнопки «Вернуться к чтению».
     var onReturnTap: () -> Void = {}
 
-    private static let fontSize: CGFloat = 19
-
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeUIView(context: Context) -> UITextView {
@@ -81,8 +81,9 @@ struct ReflowReaderView: UIViewRepresentable {
         tv.backgroundColor = theme.pageBackgroundUI
         tv.alwaysBounceVertical = true
         tv.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 48, right: 20)
-        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
+        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize, sentences: sentences, chapterOffsets: chapterOffsets)
         context.coordinator.lastTheme = theme
+        context.coordinator.lastFontSize = fontSize
         // Coordinator становится делегатом скролла для детекта ручного взаимодействия.
         tv.delegate = context.coordinator
 
@@ -104,16 +105,18 @@ struct ReflowReaderView: UIViewRepresentable {
 
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
-            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize, sentences: sentences, chapterOffsets: chapterOffsets)
             context.coordinator.resetHighlightTracking()
         }
 
-        // Смена темы чтения на лету: фон + перекраска текста. Re-attribute сбрасывает
-        // подсветку — обнуляем трекинг, чтобы блок ниже применил её заново нужным цветом.
-        if context.coordinator.lastTheme != theme {
+        // Смена темы чтения ИЛИ размера шрифта на лету: перекраска/перевёрстка текста.
+        // Re-attribute сбрасывает подсветку — обнуляем трекинг, чтобы блок ниже
+        // применил её заново нужным цветом.
+        if context.coordinator.lastTheme != theme || context.coordinator.lastFontSize != fontSize {
             context.coordinator.lastTheme = theme
+            context.coordinator.lastFontSize = fontSize
             tv.backgroundColor = theme.pageBackgroundUI
-            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, sentences: sentences, chapterOffsets: chapterOffsets)
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize, sentences: sentences, chapterOffsets: chapterOffsets)
             context.coordinator.resetHighlightTracking()
         }
 
@@ -129,6 +132,10 @@ struct ReflowReaderView: UIViewRepresentable {
                 context.coordinator.lastCommandToken = token
                 switch cmd {
                 case .scrollToFraction(let f, _):
+                    // TextKit 1 у больших книг (EPUB-роман) занижает contentSize.height,
+                    // пока весь текст не разложен — без форса вёрстки maxY≈minY и прокрутка
+                    // к доле схлопывалась в no-op (ползунок «не двигал страницы»).
+                    tv.layoutManager.ensureLayout(for: tv.textContainer)
                     let minY = -tv.adjustedContentInset.top
                     let maxY = max(minY, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
                     tv.setContentOffset(CGPoint(x: 0, y: minY + f * (maxY - minY)), animated: false)
@@ -179,6 +186,8 @@ struct ReflowReaderView: UIViewRepresentable {
         var lastPendingRange: NSRange?
         /// Последняя применённая тема — для перекраски в updateUIView при смене.
         var lastTheme: ReadingTheme = .sepia
+        /// Последний применённый размер шрифта — для перевёрстки при смене.
+        var lastFontSize: CGFloat = 19
         /// Активно ли следование вида за текущим предложением.
         var isFollowing = true
         /// Токен последней применённой команды (дедупликация в updateUIView).
@@ -186,6 +195,9 @@ struct ReflowReaderView: UIViewRepresentable {
         /// Идёт ли программная анимация возврата к чтению — гасит ложный показ кнопки
         /// возврата на время проезда к подсветке.
         var isReturning = false
+        /// Идёт ли анимация автоскролла за подсветкой — чтобы прервать её,
+        /// когда пользователь взялся за экран пальцем.
+        var isAutoScrolling = false
 
         init(_ parent: ReflowReaderView) {
             self.parent = parent
@@ -221,13 +233,13 @@ struct ReflowReaderView: UIViewRepresentable {
             return viewportY >= parent.readingMinY && viewportY <= parent.readingMaxY
         }
 
-        static func makeAttributed(_ text: String, color: UIColor,
+        static func makeAttributed(_ text: String, color: UIColor, fontSize: CGFloat,
                                    sentences: [Sentence], chapterOffsets: [Int]) -> NSAttributedString {
             let para = NSMutableParagraphStyle()
             para.lineSpacing = 5
             para.paragraphSpacing = 10
             let result = NSMutableAttributedString(string: text, attributes: [
-                .font: UIFont.systemFont(ofSize: ReflowReaderView.fontSize),
+                .font: UIFont.systemFont(ofSize: fontSize),
                 .foregroundColor: color,
                 .paragraphStyle: para,
             ])
@@ -238,7 +250,7 @@ struct ReflowReaderView: UIViewRepresentable {
             headingPara.lineSpacing = 3
             headingPara.paragraphSpacing = 8
             headingPara.paragraphSpacingBefore = 18
-            let headingFont = UIFont.systemFont(ofSize: ReflowReaderView.fontSize + 5, weight: .bold)
+            let headingFont = UIFont.systemFont(ofSize: fontSize + 5, weight: .bold)
             let total = (text as NSString).length
             for s in sentences where s.isHeading {
                 guard chapterOffsets.indices.contains(s.pageIndex) else { continue }
@@ -286,8 +298,9 @@ struct ReflowReaderView: UIViewRepresentable {
             }
             lastRange = range
             storage.endEditing()
-            // Скроллим к подсветке только при активном следовании.
-            if let range, isFollowing { tv.scrollRangeToVisible(range) }
+            // Автоскролл: держим читаемое предложение по центру области чтения.
+            // Только при активном следовании (юзер не увёл вид руками).
+            if let range, isFollowing { followHighlight(range) }
             reportScroll(tv)
         }
 
@@ -336,12 +349,16 @@ struct ReflowReaderView: UIViewRepresentable {
         /// на время анимации isReturning гасит кнопку возврата.
         private func scroll(toContentY y: CGFloat, animated: Bool) {
             guard let tv = textView else { return }
+            // Полная вёрстка: иначе на больших книгах contentSize.height занижен и
+            // клампинг схлопывал прыжок к главе/возврат к чтению в no-op.
+            tv.layoutManager.ensureLayout(for: tv.textContainer)
             let minY = -tv.adjustedContentInset.top
             let maxY = max(minY, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
             let clamped = max(minY, min(y, maxY))
             if animated {
                 isReturning = true
-                UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut]) {
+                UIView.animate(withDuration: 0.3, delay: 0,
+                               options: [.curveEaseInOut, .allowUserInteraction]) {
                     tv.contentOffset = CGPoint(x: 0, y: clamped)
                 } completion: { [weak self] _ in
                     guard let self, let tv = self.textView else { return }
@@ -360,6 +377,81 @@ struct ReflowReaderView: UIViewRepresentable {
             guard let rect = contentRect(forCharRange: range) else { return }
             let visibleCenter = (parent.readingMinY + parent.readingMaxY) / 2
             scroll(toContentY: rect.midY - visibleCenter, animated: animated)
+        }
+
+        /// Автоскролл во время озвучки: держит подсвечиваемое предложение по ЦЕНТРУ
+        /// области чтения. Вызывается на каждую смену предложения при следовании,
+        /// поэтому отличается от `scrollRangeToCenter` двумя вещами:
+        ///
+        /// 1. **Дозированная вёрстка.** `scroll(toContentY:)` форсит `ensureLayout`
+        ///    всего текста — на большой книге это заметный фриз, и платить им за
+        ///    КАЖДОЕ предложение нельзя. Раскладываем только до конца предложения
+        ///    плюс запас: иначе TextKit занижает `contentSize.height`, клампинг
+        ///    срезает цель, и подсветка садится ниже центра.
+        /// 2. **Плавность.** Соседнее предложение — короткий проезд с анимацией
+        ///    (кадры сливаются в непрерывную прокрутку); далёкий прыжок (skip,
+        ///    новая глава) — мгновенно, анимировать пол-книги бессмысленно.
+        func followHighlight(_ range: NSRange) {
+            guard let tv = textView else { return }
+            let ensuredEnd = ensureLayout(around: range)
+            guard let rect = contentRect(forCharRange: range) else { return }
+            let top = parent.readingMinY
+            let bottom = parent.readingMaxY > top ? parent.readingMaxY : tv.bounds.height
+            let target: CGFloat
+            if rect.height >= bottom - top {
+                // Предложение выше области чтения — центрировать нечего:
+                // ставим его начало к верху, чтобы читать с первой строки.
+                target = rect.minY - top - 12
+            } else {
+                target = rect.midY - (top + bottom) / 2
+            }
+            // Нижняя граница прокрутки. `contentSize` у TextKit 1 обновляется
+            // ОТЛОЖЕННО (следующим проходом layout), поэтому сразу после
+            // ensureLayout он занижен — клампинг по нему сажал подсветку ниже
+            // центра (проверено: часть предложений вставала у самой панели).
+            // Берём максимум из contentSize и фактического низа разложенного
+            // текста: последний символ ensureLayout-диапазона уже имеет геометрию.
+            var contentBottom = tv.contentSize.height
+            if let tail = contentRect(forCharRange: NSRange(location: ensuredEnd, length: 1)) {
+                contentBottom = max(contentBottom, tail.maxY + tv.textContainerInset.bottom)
+            }
+            let minY = -tv.adjustedContentInset.top
+            let maxY = max(minY, contentBottom + tv.adjustedContentInset.bottom - tv.bounds.height)
+            let clamped = max(minY, min(target, maxY))
+            let delta = abs(clamped - tv.contentOffset.y)
+            guard delta > 0.5 else { return }
+
+            let animate = delta < tv.bounds.height * 2 && !UIAccessibility.isReduceMotionEnabled
+            guard animate else {
+                tv.setContentOffset(CGPoint(x: 0, y: clamped), animated: false)
+                return
+            }
+            isAutoScrolling = true
+            // .allowUserInteraction — иначе на время проезда текст-вью не принимает
+            // касания (тап «Отсюда»/кнопки съедаются анимацией).
+            // .beginFromCurrentState — предложения могут сменяться чаще, чем
+            // заканчивается проезд; новая анимация подхватывает текущую позицию.
+            UIView.animate(withDuration: 0.35, delay: 0,
+                           options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]) {
+                tv.contentOffset = CGPoint(x: 0, y: clamped)
+            } completion: { [weak self] _ in
+                self?.isAutoScrolling = false
+            }
+        }
+
+        /// Раскладывает текст до конца диапазона + запас вперёд (несколько экранов),
+        /// чтобы под подсветкой было куда прокручивать (см. `followHighlight`).
+        /// Возвращает индекс последнего разложенного символа.
+        @discardableResult
+        private func ensureLayout(around range: NSRange) -> Int {
+            guard let tv = textView else { return range.location }
+            let total = tv.textStorage.length
+            guard total > 0, range.location < total else { return max(0, total - 1) }
+            let end = min(total, range.location + range.length + 4000)
+            let lm = tv.layoutManager
+            lm.ensureLayout(forCharacterRange: NSRange(location: range.location,
+                                                       length: end - range.location))
+            return end - 1
         }
 
         /// Ставит символ (начало главы) к верху вьюпорта (для прыжка по оглавлению).
@@ -439,6 +531,14 @@ struct ReflowReaderView: UIViewRepresentable {
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             // Ручной скролл → выходим из режима следования.
             isFollowing = false
+            // Идущий проезд автоскролла обрываем на текущем кадре, иначе он
+            // «тянет» вид против пальца до конца своей анимации.
+            if isAutoScrolling {
+                isAutoScrolling = false
+                let live = scrollView.layer.presentation()?.bounds.origin ?? scrollView.contentOffset
+                scrollView.layer.removeAllAnimations()
+                scrollView.setContentOffset(live, animated: false)
+            }
             if let tv = scrollView as? UITextView { reportScroll(tv) }
         }
 

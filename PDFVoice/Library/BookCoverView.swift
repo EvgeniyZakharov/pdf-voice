@@ -63,12 +63,21 @@ struct BookCoverView: View {
         let key = fileName as NSString
         if let cached = Self.cache.object(forKey: key) { image = cached; return }
         let url = fileURL
+        let format = BookFormat.detect(fileName: fileName)
         // Рендерим в достаточном разрешении для любой ячейки; масштабируется .fill.
         let px = fixedSize.map { CGSize(width: $0.width * 3, height: $0.height * 3) }
             ?? CGSize(width: 240, height: 348)
         let rendered = await Task.detached(priority: .userInitiated) { () -> UIImage? in
-            guard let doc = PDFDocument(url: url), let page = doc.page(at: 0) else { return nil }
-            return page.thumbnail(of: px, for: .cropBox)
+            switch format {
+            case .pdf, .djvu:
+                guard let doc = PDFDocument(url: url), let page = doc.page(at: 0) else { return nil }
+                return page.thumbnail(of: px, for: .cropBox)
+            case .epub, .fb2:
+                // Обложка из контейнера книги; nil (нет обложки) → плейсхолдер.
+                return ReflowCover.image(for: url, format: format)
+            case .txt, .docx:
+                return nil   // текстовые форматы без обложки → плейсхолдер
+            }
         }.value
         if let rendered {
             Self.cache.setObject(rendered, forKey: key)

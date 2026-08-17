@@ -124,7 +124,7 @@ struct PDFKitView: UIViewRepresentable {
                     if !union.isNull { view.go(to: union, on: page) }
                 }
                 // «Вернуться к чтению» ставит подсветку по центру области чтения.
-                context.coordinator.alignHighlightToReadingArea(center: true)
+                context.coordinator.alignHighlightToReadingArea()
                 // Индекс страницы сообщаем НАПРЯМУЮ (не полагаясь на KVO-скролл):
                 // go(to:) может сработать до того, как PDFView пересчитает layout,
                 // и reportVisiblePage() в этот момент вернёт устаревшую страницу.
@@ -178,14 +178,13 @@ struct PDFKitView: UIViewRepresentable {
             // Текстовый слой — нативная подсветка выделением.
             selection.color = Theme.pdfHighlightUI
             view.highlightedSelections = [selection]
-            // Авто-прокрутка только при активном следовании; после go(to:)
-            // доводим скролл, чтобы подсветка не осталась под стеклянной панелью.
+            // Авто-прокрутка только при активном следовании: держим читаемое
+            // предложение по центру области чтения (не под стеклянной панелью).
             if context.coordinator.isFollowing {
-                view.go(to: selection)
-                context.coordinator.alignHighlightToReadingArea(center: false)
+                context.coordinator.followHighlight()
                 // При самом первом updateUIView (сразу после makeUIView) SwiftUI
                 // ещё не выдал PDFView реальный размер — view.bounds нулевые, и
-                // go(to:) выше уезжает в никуда. Второго прохода подсветки для
+                // прокрутка выше уезжает в никуда. Второго прохода подсветки для
                 // ЭТОГО ЖЕ предложения не будет (lastSentenceID уже проставлен
                 // выше), поэтому без явного повтора вид так и останется на
                 // стр. 1 при открытии книги на сохранённой позиции.
@@ -203,10 +202,9 @@ struct PDFKitView: UIViewRepresentable {
                 union = union.union(box)
             }
             if !union.isNull, context.coordinator.isFollowing {
-                view.go(to: union, on: page)
-                context.coordinator.alignHighlightToReadingArea(center: false)
+                context.coordinator.followHighlight()
                 // См. комментарий в ветке текстового слоя выше: первый проход
-                // с нулевыми bounds — go(to:) без эффекта, повтора не будет.
+                // с нулевыми bounds — прокрутка без эффекта, повтора не будет.
                 if view.bounds.isEmpty { context.coordinator.scheduleFollowScrollRetry() }
             }
         } else {
@@ -231,6 +229,9 @@ struct PDFKitView: UIViewRepresentable {
         var lastPendingID: UUID?
         /// Активно ли следование вида за текущим предложением.
         var isFollowing = true
+        /// Идёт ли анимация автоскролла за подсветкой — чтобы оборвать её,
+        /// когда пользователь взялся за экран пальцем.
+        var isAutoScrolling = false
         /// Токен последнего выполненного returnToReading (дедупликация).
         var lastReturnToken: Int = 0
 
@@ -310,35 +311,74 @@ struct PDFKitView: UIViewRepresentable {
             return union.isNull ? nil : pdfView.convert(union, from: page)
         }
 
-        /// Доводит скролл после `go(to:)`: PDFView не знает про стеклянные бар и
-        /// панель (контент течёт под них через ignoresSafeArea) и может оставить
-        /// подсветку «видимой» для себя, но фактически под стеклом. `center: false` —
-        /// минимальный сдвиг внутрь области чтения (follow по предложениям),
-        /// `center: true` — к центру области (возврат к чтению).
-        func alignHighlightToReadingArea(center: Bool) {
-            guard let pdfView, parent.readingMaxY > parent.readingMinY,
-                  let scrollView = Coordinator.firstScrollView(in: pdfView),
-                  let rect = highlightRectInView() else { return }
+        /// Смещение вида, при котором подсветка встаёт по ЦЕНТРУ области чтения.
+        /// Область чтения — между стеклянным баром и панелью плеера: PDFView про
+        /// них не знает (контент течёт под них через ignoresSafeArea) и своим
+        /// центром считает середину всего экрана.
+        private func centerDelta(for rect: CGRect) -> CGFloat {
             let margin: CGFloat = 16
             let minY = parent.readingMinY + margin
             let maxY = parent.readingMaxY - margin
-            var delta: CGFloat = 0
-            if center {
-                delta = rect.midY - (minY + maxY) / 2
-            } else if rect.height >= maxY - minY || rect.minY < minY {
-                // Подсветка выше области чтения (или выше неё целиком) — верх к верху.
-                delta = rect.minY - minY
-            } else if rect.maxY > maxY {
-                delta = rect.maxY - maxY
+            // Предложение выше области чтения — центрировать нечего: верх к верху,
+            // чтобы читать с первой строки.
+            if rect.height >= maxY - minY { return rect.minY - minY }
+            return rect.midY - (minY + maxY) / 2
+        }
+
+        /// Доводит скролл после `go(to:)` до центра области чтения: сам PDFView
+        /// может остановиться так, что подсветка «видима» для него, но фактически
+        /// под стеклом бара или панели.
+        func alignHighlightToReadingArea() {
+            guard parent.readingMaxY > parent.readingMinY,
+                  let rect = highlightRectInView() else { return }
+            scrollBy(centerDelta(for: rect), animated: false)
+        }
+
+        /// Автоскролл за озвучкой: держит читаемое предложение по центру области
+        /// чтения. Короткий проезд (соседнее предложение — в пределах пары
+        /// экранов) идёт плавной анимацией, кадры сливаются в непрерывную
+        /// прокрутку; далёкий прыжок (skip, другая страница) — мгновенным `go(to:)`
+        /// PDFKit: анимировать пролёт через полкниги бессмысленно, да и координаты
+        /// далёкой страницы надёжнее получить уже после перехода.
+        func followHighlight() {
+            guard let pdfView else { return }
+            if parent.readingMaxY > parent.readingMinY, !pdfView.bounds.isEmpty,
+               let rect = highlightRectInView() {
+                let delta = centerDelta(for: rect)
+                if abs(delta) <= pdfView.bounds.height * 2 {
+                    scrollBy(delta, animated: !UIAccessibility.isReduceMotionEnabled)
+                    return
+                }
             }
-            guard abs(delta) > 0.5 else { return }
+            scrollToCurrentHighlight()
+        }
+
+        /// Сдвигает вид на `delta` точек с клампингом по границам контента.
+        private func scrollBy(_ delta: CGFloat, animated: Bool) {
+            guard abs(delta) > 0.5, let pdfView,
+                  let scrollView = Coordinator.firstScrollView(in: pdfView) else { return }
             var offset = scrollView.contentOffset
             let lo = -scrollView.adjustedContentInset.top
             let hi = max(lo, scrollView.contentSize.height
                              + scrollView.adjustedContentInset.bottom
                              - scrollView.bounds.height)
             offset.y = min(max(offset.y + delta, lo), hi)
-            scrollView.setContentOffset(offset, animated: false)
+            guard abs(offset.y - scrollView.contentOffset.y) > 0.5 else { return }
+            guard animated else {
+                scrollView.setContentOffset(offset, animated: false)
+                return
+            }
+            isAutoScrolling = true
+            // .allowUserInteraction — иначе на время проезда вид не принимает
+            // касания (тап «Отсюда» и кнопки съедаются анимацией).
+            // .beginFromCurrentState — короткие предложения сменяются чаще, чем
+            // заканчивается проезд; новая анимация подхватывает текущую позицию.
+            UIView.animate(withDuration: 0.35, delay: 0,
+                           options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]) {
+                scrollView.contentOffset = offset
+            } completion: { [weak self] _ in
+                self?.isAutoScrolling = false
+            }
         }
 
         /// Повторяет follow-скролл к текущей подсветке, когда PDFView реально
@@ -376,7 +416,7 @@ struct PDFKitView: UIViewRepresentable {
                 for box in sentence.boxes { union = union.union(box) }
                 if !union.isNull { pdfView.go(to: union, on: page) }
             }
-            alignHighlightToReadingArea(center: false)
+            alignHighlightToReadingArea()
             reportPage(sentence.pageIndex)
         }
 
@@ -405,6 +445,15 @@ struct PDFKitView: UIViewRepresentable {
         @objc func userInteracted(_ gesture: UIGestureRecognizer) {
             guard gesture.state == .began else { return }
             isFollowing = false
+            // Идущий проезд автоскролла обрываем на текущем кадре, иначе он
+            // «тянет» вид против пальца до конца своей анимации.
+            if isAutoScrolling, let pdfView,
+               let scrollView = Coordinator.firstScrollView(in: pdfView) {
+                isAutoScrolling = false
+                let live = scrollView.layer.presentation()?.bounds.origin ?? scrollView.contentOffset
+                scrollView.layer.removeAllAnimations()
+                scrollView.setContentOffset(live, animated: false)
+            }
             reportFollowChanged()
         }
 

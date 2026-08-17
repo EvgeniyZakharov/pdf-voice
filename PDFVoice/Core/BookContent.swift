@@ -43,12 +43,13 @@ protocol ReflowSource {
 /// Использует ту же токенизацию `LanguageProfile`, что и PDF-путь (паритет),
 /// но БЕЗ PDF-механики колонтитулов/номеров страниц — в reflow их нет.
 enum ReflowExtractor {
-    private static let profile: any LanguageProfile = RussianProfile()
 
     /// Для каждой главы режет текст на предложения. `pageIndex` = индекс главы,
     /// `charOffset` = UTF-16 смещение начала предложения в тексте главы,
     /// `rawText` = ВЕРБАТИМ-срез (для точной подсветки диапазоном в TextKit).
-    static func sentences(from content: BookContent) -> [Sentence] {
+    /// `profile` — языковой профиль книги (по умолчанию русский, как раньше).
+    static func sentences(from content: BookContent,
+                          profile: any LanguageProfile = LanguageProfiles.default) -> [Sentence] {
         var result: [Sentence] = []
         for (chapterIndex, chapter) in content.chapters.enumerated() {
             let ns = chapter.text as NSString

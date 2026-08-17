@@ -7,21 +7,8 @@ struct RussianProfile: LanguageProfile {
 
     let code = "ru"
 
-    // MARK: - Токенизация
-
-    /// Возвращает диапазоны предложений через `NLTokenizer(.sentence)`.
-    /// Поведение идентично прямому вызову `enumerateTokens` в экстракторах.
-    func sentenceRanges(in cleaned: String) -> [Range<String.Index>] {
-        guard !cleaned.isEmpty else { return [] }
-        let tokenizer = NLTokenizer(unit: .sentence)
-        tokenizer.string = cleaned
-        var ranges: [Range<String.Index>] = []
-        tokenizer.enumerateTokens(in: cleaned.startIndex..<cleaned.endIndex) { range, _ in
-            ranges.append(range)
-            return true
-        }
-        return ranges
-    }
+    // Токенизация — общая реализация из расширения `LanguageProfile`
+    // (побайтно та же, что была здесь: `NLTokenizer(.sentence)` с автодетектом).
 
     // MARK: - Детект заголовков
 
@@ -146,8 +133,8 @@ struct RussianProfile: LanguageProfile {
     // MARK: - Раскрытие для озвучки
 
     func expandForSpeech(_ sentence: String) -> String {
-        var result = Self.stripLinks(sentence)
-        result = Self.collapseDots(result)
+        var result = TextPipeline.stripLinks(sentence)
+        result = TextPipeline.collapseDots(result)
         result = Self.expandListMarker(result)
         result = Self.expandUnits(result)
         result = Self.expandNumbers(result)
@@ -155,10 +142,7 @@ struct RussianProfile: LanguageProfile {
         for (abbr, full) in Self.abbreviations {
             result = result.replacingOccurrences(of: abbr, with: full)
         }
-        while result.contains("  ") {
-            result = result.replacingOccurrences(of: "  ", with: " ")
-        }
-        return result.trimmingCharacters(in: .whitespaces)
+        return TextPipeline.squeezeSpaces(result)
     }
 
     // MARK: - Аббревиатуры
@@ -242,46 +226,8 @@ struct RussianProfile: LanguageProfile {
         return re.stringByReplacingMatches(in: text, range: fullRange, withTemplate: "город ")
     }
 
-    // MARK: - Ссылки
-
-    private static let linkDetector = try? NSDataDetector(
-        types: NSTextCheckingResult.CheckingType.link.rawValue)
-
-    private static func stripLinks(_ text: String) -> String {
-        guard let detector = linkDetector else { return text }
-        let full = NSRange(location: 0, length: (text as NSString).length)
-        let matches = detector.matches(in: text, range: full)
-        guard !matches.isEmpty else { return text }
-        let mutable = NSMutableString(string: text)
-        for match in matches.reversed() {
-            mutable.replaceCharacters(in: match.range, with: " ")
-        }
-        return mutable as String
-    }
-
-    // MARK: - Многоточия
-
-    private static func collapseDots(_ text: String) -> String {
-        var out = String.UnicodeScalarView()
-        var dotRun = 0
-        for scalar in text.unicodeScalars {
-            if scalar == "." {
-                dotRun += 1
-                continue
-            }
-            if dotRun > 0 {
-                out.append(dotRun >= 2 ? " " : ".")
-                dotRun = 0
-            }
-            if scalar == "\u{2026}" {
-                out.append(" ")
-            } else {
-                out.append(scalar)
-            }
-        }
-        if dotRun > 0 { out.append(dotRun >= 2 ? " " : ".") }
-        return String(out)
-    }
+    // Ссылки, многоточия и схлопывание пробелов — язык-независимые шаги,
+    // живут в `TextPipeline` (см. `stripLinks`/`collapseDots`/`squeezeSpaces`).
 
     // MARK: - Маркеры списков
 

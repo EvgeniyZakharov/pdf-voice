@@ -11,10 +11,17 @@ final class VoicePreviewer: ObservableObject {
     private var player: AVAudioPlayer?
     private var task: Task<Void, Never>?
 
-    /// Озвучивает «Привет, меня зовут {имя}. С радостью могу почитать для тебя».
+    /// Озвучивает «Привет, меня зовут {имя}. С радостью могу почитать для тебя»,
+    /// а английским голосом — английскую фразу: русская у него звучала бы
+    /// набором нечитаемых звуков (фонетику задаёт голос, а не текст).
     func preview(_ option: VoiceOption, serverURL: String, apiKey: String) {
         stop()
-        let phrase = "Привет, меня зовут \(option.title). С радостью могу почитать для тебя"
+        let isEnglishVoice = option.systemIdentifier.map {
+            AVSpeechSynthesisVoice(identifier: $0)?.language.hasPrefix("en-") ?? false
+        } ?? false
+        let phrase = isEnglishVoice
+            ? "Hello, my name is \(option.title). I will gladly read for you"
+            : "Привет, меня зовут \(option.title). С радостью могу почитать для тебя"
         activateSession()
 
         switch option.kind {

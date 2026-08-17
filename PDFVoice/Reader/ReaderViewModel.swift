@@ -38,8 +38,17 @@ final class ReaderViewModel: ObservableObject {
     let speech = SpeechEngine()
     let sleepTimer = SleepTimer()
 
-    private let item: LibraryItem
+    private var item: LibraryItem
     private weak var store: DocumentStore?
+    /// Языковой профиль книги — один на сессию чтения, из `item.language`.
+    /// Пока детект не отработал (язык `nil`) это русский профиль, то есть
+    /// поведение приложения не меняется.
+    private var profile: any LanguageProfile {
+        LanguageProfiles.profile(for: item.effectiveLanguage)
+    }
+    /// Последние применённые настройки — чтобы перевыбрать голос после детекта
+    /// языка (он отрабатывает уже в процессе загрузки книги).
+    private var lastSettings: SettingsStore?
     private var cancellables = Set<AnyCancellable>()
     private var nowPlaying: NowPlayingController?
     private var totalPageCount: Int = 0
@@ -75,6 +84,10 @@ final class ReaderViewModel: ObservableObject {
             guard let self else { return }
             self.store?.updateProgress(for: self.item.id, sentenceIndex: index)
         }
+        speech.onFinishedAll = { [weak self] in
+            guard let self else { return }
+            self.store?.markFinished(self.item.id)
+        }
     }
 
     /// Смена голоса на лету: применяем настройки и, если книга сейчас читается,
@@ -90,13 +103,23 @@ final class ReaderViewModel: ObservableObject {
     }
 
     func applySettings(_ settings: SettingsStore) {
+        // Запоминаем настройки, чтобы перевыбрать голос, когда язык книги
+        // определится по ходу загрузки (детект идёт уже после первого applySettings).
+        lastSettings = settings
         speech.pauseBetweenSentences = settings.pauseBetweenSentences
         speech.sileroAPIKey = settings.sileroAPIKey
+        // Профиль книги — для late render (числа/аббревиатуры/ударения при
+        // постановке предложения в очередь). Выбор голоса по языку — шаг 5.
+        speech.profile = profile
 
-        let sel = settings.selectedVoice
+        // Голос выбирается по ЯЗЫКУ КНИГИ, а не глобальной настройкой: английскую
+        // книгу русский голос читает с сильным акцентом (фонетику задаёт голос,
+        // а не текст), да и Silero знает только русский.
+        let isEnglishBook = VoiceCatalog.isEnglish(item.effectiveLanguage)
+        let sel = isEnglishBook ? settings.selectedVoiceEN : settings.selectedVoice
         // Голос/спикер выставляем ДО переключения sileroServerURL: его didSet может
         // авто-продолжить озвучку новым backend'ом, и тот должен быть уже настроен.
-        if sel.hasPrefix("silero:"), !settings.sileroServerURL.isEmpty {
+        if sel.hasPrefix("silero:"), !isEnglishBook, !settings.sileroServerURL.isEmpty {
             speech.sileroSpeaker = String(sel.dropFirst("silero:".count))
             speech.sileroServerURL = URL(string: settings.sileroServerURL)
         } else {
@@ -191,6 +214,12 @@ final class ReaderViewModel: ObservableObject {
         }
         pageKinds = kinds
 
+        // Язык — ДО любой ветки извлечения: он выбирает профиль, а профиль
+        // проставляет isHeading, который уходит в кэш предложений.
+        if needsLanguageDetection {
+            resolveLanguage(from: Self.textSample(doc: doc, kinds: kinds))
+        }
+
         let hasText = kinds.contains(.text)
         let hasOCR  = kinds.contains(.ocr)
 
@@ -210,6 +239,61 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Язык книги
+
+    /// Нужен ли детект: язык определяется ОДИН раз за книгу и дальше живёт в
+    /// библиотеке. `nil` бывает у новых книг и у всех, добавленных до появления
+    /// поля. Ручной выбор пользователя (шаг 6) детект тоже отключает — значение
+    /// уже не nil.
+    private var needsLanguageDetection: Bool { item.language == nil }
+
+    /// Записывает определённый язык в модель и в библиотеку. Вызывать ДО
+    /// построения предложений: `isHeading` уезжает в кэш, и первый проход не тем
+    /// профилем испортил бы его надолго.
+    private func resolveLanguage(from sample: String) {
+        guard needsLanguageDetection,
+              let code = LanguageDetector.detect(sample: sample) else { return }
+        applyDetectedLanguage(code)
+    }
+
+    /// Записывает язык и ПЕРЕВЫБИРАЕТ голос: первый `applySettings` отработал до
+    /// детекта, с языком по умолчанию, и английская книга иначе осталась бы на
+    /// русском голосе до следующего открытия.
+    private func applyDetectedLanguage(_ code: String) {
+        item.language = code
+        store?.setLanguage(code, for: item.id)
+        if let settings = lastSettings { applySettings(settings) }
+    }
+
+    /// Образец текста PDF: первые страницы с текстовым слоем.
+    ///
+    /// Берём его ТОЛЬКО если текстовых страниц хотя бы половина документа, то есть
+    /// книга действительно текстовая. Иначе пустая строка — образец возьмётся из
+    /// распознанных страниц (`loadOCR`) или из готовых предложений
+    /// (`finishLoading`).
+    ///
+    /// Проверка не паранойя, а разбор реального провала: у скана русской книги
+    /// (84 страницы) текстовый слой нашёлся ровно на ОДНОЙ — на списке литературы,
+    /// где русские записи из-за битой CMap потеряли буквы, а английские выжили.
+    /// Образец вышел «1093 латинских буквы, ноль кириллицы», и русская книга
+    /// уверенно определилась как английская.
+    nonisolated private static func textSample(doc: PDFDocument, kinds: [PageKind],
+                                               maxPages: Int = 3, maxChars: Int = 4000) -> String {
+        let textPages = kinds.filter { $0 == .text }.count
+        guard doc.pageCount > 0, Double(textPages) / Double(doc.pageCount) >= 0.5 else { return "" }
+
+        var sample = ""
+        var used = 0
+        for pi in 0..<doc.pageCount where used < maxPages {
+            guard kinds.indices.contains(pi), kinds[pi] == .text,
+                  let text = doc.page(at: pi)?.string, !text.isEmpty else { continue }
+            sample += text + " "
+            used += 1
+            if sample.count >= maxChars { break }
+        }
+        return String(sample.prefix(maxChars))
+    }
+
     // MARK: - Reflow-путь (TXT/FB2/EPUB/DOCX)
 
     /// Парсит reflow-книгу целиком off-main (текст быстрый — в отличие от OCR,
@@ -218,20 +302,35 @@ final class ReaderViewModel: ObservableObject {
     private func loadReflow() {
         let format = item.format
         let url = item.fileURL
+        // Профиль поднимаем в локальную переменную: Task.detached выполняется вне
+        // главного актора и не может читать @MainActor-свойство напрямую.
+        let profile = profile
+        let shouldDetect = needsLanguageDetection
 
         Task {
             let parsed: ReflowParse? = await Task.detached(priority: .userInitiated) {
                 guard let source = Self.reflowSource(for: format, url: url) else { return nil }
                 guard let content = try? source.parse(), !content.isEmpty else { return nil }
-                let sentences = ReflowExtractor.sentences(from: content)
                 let flat = content.flatten()
+                // Детект ЗДЕСЬ, между парсингом и нарезкой: текст книги уже есть,
+                // а предложения (с isHeading внутри) ещё не построены. Вынести
+                // на main было бы вторым проходом парсинга.
+                let detected = shouldDetect
+                    ? LanguageDetector.detect(sample: String(flat.text.prefix(4000)))
+                    : nil
+                let effective = detected.map { LanguageProfiles.profile(for: $0) } ?? profile
+                let sentences = ReflowExtractor.sentences(from: content, profile: effective)
                 return ReflowParse(content: content, sentences: sentences,
-                                   text: flat.text, chapterOffsets: flat.chapterOffsets)
+                                   text: flat.text, chapterOffsets: flat.chapterOffsets,
+                                   detectedLanguage: detected)
             }.value
 
             guard let parsed, !parsed.sentences.isEmpty else {
                 loadError = "Не удалось извлечь текст из файла."
                 return
+            }
+            if let detected = parsed.detectedLanguage, needsLanguageDetection {
+                applyDetectedLanguage(detected)
             }
 
             bookContent = parsed.content
@@ -247,6 +346,9 @@ final class ReaderViewModel: ObservableObject {
         let sentences: [Sentence]
         let text: String
         let chapterOffsets: [Int]
+        /// Язык, определённый по тексту книги (nil — детект не запускался либо
+        /// не дал уверенного ответа).
+        let detectedLanguage: String?
     }
 
     nonisolated private static func reflowSource(for format: BookFormat, url: URL) -> ReflowSource? {
@@ -279,7 +381,7 @@ final class ReaderViewModel: ObservableObject {
         }
 
         if pageCount <= 20 {
-            let sentences = PDFTextExtractor.sentences(from: doc)
+            let sentences = PDFTextExtractor.sentences(from: doc, profile: profile)
             document = doc
             loadedPageCount = pageCount
             finishLoading(sentences)
@@ -302,13 +404,16 @@ final class ReaderViewModel: ObservableObject {
         )
         let savedIndex = item.currentSentenceIndex
         let fileName = item.fileName
+        // Локальная копия для Task.detached (вне главного актора).
+        let profile = profile
 
         Task {
             let initial = await Task.detached(priority: .userInitiated) {
                 PDFTextExtractor.extractSentences(
                     pageRange: 0..<initialCount,
                     allLines: initialLines,
-                    boilerplate: quickBoilerplate
+                    boilerplate: quickBoilerplate,
+                    profile: profile
                 )
             }.value
 
@@ -334,6 +439,8 @@ final class ReaderViewModel: ObservableObject {
         backgroundTask?.cancel()
         let fileName = item.fileName
         let savedIndex = item.currentSentenceIndex
+        // Локальная копия для Task.detached (вне главного актора).
+        let profile = profile
 
         backgroundTask = Task {
             // Читаем строки страниц off main thread через GCD.
@@ -377,7 +484,8 @@ final class ReaderViewModel: ObservableObject {
                         pageRange: batchStart..<batchEnd,
                         allLines: remainingLines,
                         boilerplate: boilerplate,
-                        pageOffset: startPage
+                        pageOffset: startPage,
+                        profile: profile
                     )
                 }.value
 
@@ -435,10 +543,35 @@ final class ReaderViewModel: ObservableObject {
         backgroundTask = Task {
             let initialCount = min(startPage + 15, totalPageCount)
 
+            // У скана текстового слоя нет, образец брать неоткуда — распознаём
+            // несколько страниц заранее и определяем язык по ним. Эти страницы
+            // будут распознаны ещё раз в основном проходе: сознательный размен
+            // секунды на то, чтобы весь остальной OCR (и его кэш) строился уже
+            // правильным профилем.
+            //
+            // Именно НЕСКОЛЬКО, а не одна: первая страница книги — обложка, и на
+            // ней букв обычно меньше, чем нужно детектору (на проверенном скане
+            // — 63 буквы против порога в 120). Копим, пока не наберётся образец.
+            if needsLanguageDetection {
+                var sample = ""
+                var probed = 0
+                var pi = startPage
+                while pi < totalPageCount, probed < 3, sample.count < 1500 {
+                    let probe = await OCRTextExtractor.sentences(
+                        from: doc, pageRange: pi..<(pi + 1)
+                    ) { _, _ in }
+                    sample += probe.map(\.rawText).joined(separator: " ") + " "
+                    probed += 1
+                    pi += 1
+                }
+                resolveLanguage(from: sample)
+            }
+
             if startPage < initialCount {
                 let initial = await OCRTextExtractor.sentences(
                     from: doc,
-                    pageRange: startPage..<initialCount
+                    pageRange: startPage..<initialCount,
+                    profile: profile
                 ) { [weak self] done, total in
                     let overall = Double(startPage + done) / Double(totalPageCount)
                     self?.ocrProgress = overall * 0.2
@@ -481,7 +614,8 @@ final class ReaderViewModel: ObservableObject {
                     let captureStart = batchStart
                     let batch = await OCRTextExtractor.sentences(
                         from: doc,
-                        pageRange: batchStart..<batchEnd
+                        pageRange: batchStart..<batchEnd,
+                        profile: profile
                     ) { [weak self] done, _ in
                         let overall = 0.2 + Double(captureStart + done) / Double(totalPageCount) * 0.8
                         self?.ocrProgress = min(overall, 0.99)
@@ -620,6 +754,8 @@ final class ReaderViewModel: ObservableObject {
                                    kinds: [PageKind],
                                    boilerplate: Set<String>?) async -> [Sentence] {
         var result: [Sentence] = []
+        // Локальная копия для Task.detached (вне главного актора).
+        let profile = profile
 
         // Собираем boilerplate по текстовым страницам батча, если не передан снаружи.
         let effectiveBoilerplate: Set<String>
@@ -647,7 +783,8 @@ final class ReaderViewModel: ObservableObject {
                         pageRange: 0..<1,
                         allLines: [lines],
                         boilerplate: effectiveBoilerplate,
-                        pageOffset: pi
+                        pageOffset: pi,
+                        profile: profile
                     )
                 }.value
                 result.append(contentsOf: pageSentences)
@@ -664,7 +801,8 @@ final class ReaderViewModel: ObservableObject {
 
                 let pageSentences = await OCRTextExtractor.sentences(
                     from: doc,
-                    pageRange: pi..<(pi + 1)
+                    pageRange: pi..<(pi + 1),
+                    profile: profile
                 ) { _, _ in }
                 result.append(contentsOf: pageSentences)
             }
@@ -694,6 +832,15 @@ final class ReaderViewModel: ObservableObject {
     }
 
     private func finishLoading(_ sentences: [Sentence]) {
+        // Подстраховка для книг, извлечённых ДО появления детекта: предложения
+        // пришли из кэша, образец брать было неоткуда. Берём его из самих
+        // предложений — язык попадёт в библиотеку и выберет верный голос.
+        // Заголовки в таком кэше останутся определёнными старым профилем: ради
+        // них перестраивать готовый кэш дороже, чем оно того стоит.
+        if needsLanguageDetection, !sentences.isEmpty {
+            let sample = sentences.prefix(80).map(\.rawText).joined(separator: " ")
+            resolveLanguage(from: sample)
+        }
         if isReflowable {
             let n = bookContent?.chapters.count ?? 0
             // Для каждого ch ищем первый индекс предложения где s.pageIndex == ch.

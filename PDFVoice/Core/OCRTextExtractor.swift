@@ -8,11 +8,11 @@ import Vision
 /// Возвращает предложения с боксами строк в координатах страницы — для подсветки.
 enum OCRTextExtractor {
 
-    private static let profile: any LanguageProfile = RussianProfile()
-
     /// Распознаёт документ. `progress(done, total)` вызывается на главном потоке.
+    /// `profile` — языковой профиль книги (по умолчанию русский, как раньше).
     static func sentences(from document: PDFDocument,
                           pageRange: Range<Int>? = nil,
+                          profile: any LanguageProfile = LanguageProfiles.default,
                           progress: @escaping (Int, Int) -> Void) async -> [Sentence] {
         let pageCount = document.pageCount
         guard pageCount > 0 else { return [] }
@@ -38,7 +38,8 @@ enum OCRTextExtractor {
 
             guard let page = document.page(at: pi) else { continue }
             let pageRect = page.bounds(for: .mediaBox)
-            guard let observations = await recognize(page: page, pageRect: pageRect),
+            guard let observations = await recognize(page: page, pageRect: pageRect,
+                                                     languages: recognitionLanguages(for: profile.code)),
                   !observations.isEmpty else { continue }
 
             // Строим параллельные массивы для этой страницы.
@@ -192,7 +193,8 @@ enum OCRTextExtractor {
                     pageIndex: pi,
                     range: nil,
                     boxes: boxes,
-                    isHeading: heading
+                    isHeading: heading,
+                    language: profile.code
                 ))
             }
         }
@@ -200,8 +202,16 @@ enum OCRTextExtractor {
         return PDFTextExtractor.mergeCrossPage(result)
     }
 
+    /// Языки распознавания в порядке приоритета для языка книги. Порядок влияет
+    /// на точность Vision: первый язык считается основным. Второй оставляем
+    /// всегда — в книгах бывают вкрапления, и терять их из-за порядка не нужно.
+    private static func recognitionLanguages(for code: String) -> [String] {
+        code.lowercased().hasPrefix("en") ? ["en-US", "ru-RU"] : ["ru-RU", "en-US"]
+    }
+
     /// Распознавание одной страницы. Vision выполняется на фоновой очереди.
-    private static func recognize(page: PDFPage, pageRect: CGRect) async -> [VNRecognizedTextObservation]? {
+    private static func recognize(page: PDFPage, pageRect: CGRect,
+                                  languages: [String]) async -> [VNRecognizedTextObservation]? {
         let scale: CGFloat = 2
         let size = CGSize(width: pageRect.width * scale, height: pageRect.height * scale)
         guard let cgImage = page.thumbnail(of: size, for: .mediaBox).cgImage else { return nil }
@@ -209,7 +219,7 @@ enum OCRTextExtractor {
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let request = VNRecognizeTextRequest()
-                request.recognitionLanguages = ["ru-RU", "en-US"]
+                request.recognitionLanguages = languages
                 request.recognitionLevel = .accurate
                 request.usesLanguageCorrection = true
                 let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])

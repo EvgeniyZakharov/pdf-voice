@@ -44,12 +44,16 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     }
 
     var onIndexChange: ((Int) -> Void)?
+    /// Озвучка дошла до последнего предложения книги (для отметки «Закончено»).
+    var onFinishedAll: (() -> Void)?
 
     // MARK: - Silero-конфиг (сеттеры переключают active backend)
 
     var sileroServerURL: URL? = nil {
         didSet {
             sileroBackend.serverURL = sileroServerURL
+            // Явная (пере)настройка Silero снимает временный откат на системный голос.
+            systemFallbackActive = false
             let next: SpeechBackend = sileroServerURL != nil ? sileroBackend : avBackend
             // Только при РЕАЛЬНОЙ смене backend'а: глушим уходящий, иначе он
             // продолжит звучать (AVSpeech дочитывает очередь, Silero — свой цикл)
@@ -81,6 +85,12 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     // MARK: - Прерывания
 
     private var interruptionObserver: Any?
+    private var foregroundObserver: Any?
+
+    /// true, если Silero был временно оставлен ради системного голоса из-за сбоя
+    /// (обычно транзиентная сеть в фоне). Конфиг Silero при этом СОХРАНЁН — при
+    /// возврате на передний план `retrySileroAfterFallback` вернёт нейроголос.
+    private var systemFallbackActive = false
 
     override init() {
         active = avBackend
@@ -92,10 +102,21 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
             object: AVAudioSession.sharedInstance(),
             queue: .main
         ) { [weak self] note in self?.handleAudioInterruption(note) }
+        // Возврат приложения на передний план: если в фоне сорвались на системный
+        // голос — пробуем восстановить Silero. Имя нотификации задаём строкой, чтобы
+        // не тянуть UIKit в Core (эти файлы компилируются и в swiftc-харнессах).
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name("UIApplicationDidBecomeActiveNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in self?.retrySileroAfterFallback() }
     }
 
     deinit {
         if let token = interruptionObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+        if let token = foregroundObserver {
             NotificationCenter.default.removeObserver(token)
         }
     }
@@ -109,6 +130,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
                 self.onIndexChange?(i)
             case .finishedAll:
                 self.isSpeaking = false
+                self.onFinishedAll?()
             case .failed(let i):
                 self.fallBackToSystemVoice(from: i)
             }
@@ -116,13 +138,32 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     }
 
     /// Silero-сервер недоступен: беззвучно переключаемся на системный голос и
-    /// продолжаем озвучку с того же предложения. Присвоение `sileroServerURL = nil`
-    /// в своём didSet остановит Silero, сделает active = avBackend и (т.к. isSpeaking
-    /// ещё true) доиграет очередь с `currentIndex` системным движком.
+    /// продолжаем озвучку с того же предложения. Конфиг Silero НЕ сбрасываем
+    /// (`sileroServerURL` остаётся) — ставим флаг `systemFallbackActive`, чтобы при
+    /// возврате приложения на передний план вернуть нейроголос. Раньше здесь стояло
+    /// `sileroServerURL = nil` → откат был НАВСЕГДА: одна транзиентная ошибка сети в
+    /// фоне (свернул приложение / другой звук) меняла голос до конца сессии.
     private func fallBackToSystemVoice(from index: Int) {
         guard active === sileroBackend else { isSpeaking = false; return }
         currentIndex = clamp(index)
-        sileroServerURL = nil
+        systemFallbackActive = true
+        let wasSpeaking = isSpeaking
+        active.stop()
+        active = avBackend
+        if wasSpeaking { play(from: currentIndex) }
+    }
+
+    /// Возврат на передний план после временного отката на системный голос:
+    /// если Silero настроен — переключаемся обратно и продолжаем с текущего
+    /// предложения нейроголосом (первый же запрос повторно проверит сервер;
+    /// снова упадёт — снова мягкий откат, тоже восстановимый).
+    func retrySileroAfterFallback() {
+        guard systemFallbackActive, sileroServerURL != nil, active === avBackend else { return }
+        systemFallbackActive = false
+        let wasSpeaking = isSpeaking
+        active.stop()
+        active = sileroBackend
+        if wasSpeaking { play(from: currentIndex) }
     }
 
     private func handleAudioInterruption(_ notification: Notification) {
@@ -238,7 +279,10 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
     // MARK: - Рендер предложения
 
-    private let profile: any LanguageProfile = RussianProfile()
+    /// Языковой профиль книги: раскрывает предложение при постановке в очередь
+    /// (late render). Выставляется из `ReaderViewModel` ДО загрузки предложений —
+    /// смена профиля на лету очередь не пере-наполняет.
+    var profile: any LanguageProfile = LanguageProfiles.default
 
     private func render(_ s: Sentence) -> SpokenMarkup {
         let m = profile.render(s.rawText)
@@ -271,10 +315,10 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         return Float(min(max(r, minR), maxR))
     }
 
+    /// Системный голос по умолчанию — тот же, что в выборе (Милена):
+    /// один источник истины, чтобы фолбэк не заговорил голосом, которого нет
+    /// в списке. См. `VoiceCatalog.systemVoices`.
     static func bestRussianVoice() -> AVSpeechSynthesisVoice? {
-        let russian = AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language == "ru-RU" }
-            .sorted { $0.quality.rawValue > $1.quality.rawValue }
-        return russian.first ?? AVSpeechSynthesisVoice(language: "ru-RU")
+        VoiceCatalog.systemVoices().first ?? AVSpeechSynthesisVoice(language: "ru-RU")
     }
 }

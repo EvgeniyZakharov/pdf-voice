@@ -113,4 +113,21 @@ extension View {
         if interactive { glass = glass.interactive() }
         return glass
     }
+
+    /// Стеклянная круглая подложка для кнопки СИСТЕМНОГО тулбара на iOS < 26 —
+    /// визуально повторяет автоматический Liquid Glass тулбар iOS 26 (где система
+    /// сама рисует стекло за кнопками шапки). На iOS 26 — no-op, чтобы не было
+    /// двойного стекла поверх системного.
+    @ViewBuilder
+    func toolbarGlassCircle() -> some View {
+        if #available(iOS 26.0, *) {
+            self
+        } else {
+            self
+                .frame(width: 34, height: 34)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().stroke(Theme.hairline, lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
+        }
+    }
 }

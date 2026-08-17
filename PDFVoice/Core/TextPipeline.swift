@@ -224,4 +224,59 @@ enum TextPipeline {
         let cleaned = units.isEmpty ? "" : String(utf16CodeUnits: units, count: units.count)
         return (cleaned, orig)
     }
+
+    // MARK: - Язык-независимая подготовка к озвучке
+
+    // Ниже — общее для всех языков и потому живёт здесь, а не в профиле.
+    // Перенесено из `RussianProfile` без изменения логики (golden совпадает),
+    // чтобы `EnglishProfile` не дублировал те же двадцать строк.
+
+    private static let linkDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue)
+
+    /// Убирает URL/e-mail из предложения — читать их вслух бессмысленно.
+    static func stripLinks(_ text: String) -> String {
+        guard let detector = linkDetector else { return text }
+        let full = NSRange(location: 0, length: (text as NSString).length)
+        let matches = detector.matches(in: text, range: full)
+        guard !matches.isEmpty else { return text }
+        let mutable = NSMutableString(string: text)
+        for match in matches.reversed() {
+            mutable.replaceCharacters(in: match.range, with: " ")
+        }
+        return mutable as String
+    }
+
+    /// Схлопывает многоточия и `…` в пробел (иначе синтезатор читает точки),
+    /// одиночную точку оставляет как есть.
+    static func collapseDots(_ text: String) -> String {
+        var out = String.UnicodeScalarView()
+        var dotRun = 0
+        for scalar in text.unicodeScalars {
+            if scalar == "." {
+                dotRun += 1
+                continue
+            }
+            if dotRun > 0 {
+                out.append(dotRun >= 2 ? " " : ".")
+                dotRun = 0
+            }
+            if scalar == "\u{2026}" {
+                out.append(" ")
+            } else {
+                out.append(scalar)
+            }
+        }
+        if dotRun > 0 { out.append(dotRun >= 2 ? " " : ".") }
+        return String(out)
+    }
+
+    /// Схлопывает двойные пробелы и обрезает края — финальный штрих раскрытия.
+    static func squeezeSpaces(_ text: String) -> String {
+        var result = text
+        while result.contains("  ") {
+            result = result.replacingOccurrences(of: "  ", with: " ")
+        }
+        return result.trimmingCharacters(in: .whitespaces)
+    }
 }

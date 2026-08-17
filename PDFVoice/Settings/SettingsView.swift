@@ -14,6 +14,10 @@ struct SettingsView: View {
         VoiceCatalog.options(sileroReachable: settings.sileroReachable)
     }
 
+    private var englishVoiceOptions: [VoiceOption] {
+        VoiceCatalog.options(sileroReachable: settings.sileroReachable, language: "en")
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -27,8 +31,16 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Picker("Голос", selection: $settings.selectedVoice) {
+                    Picker("Русские книги", selection: $settings.selectedVoice) {
                         ForEach(voiceOptions) { opt in
+                            Text(opt.title).tag(opt.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .listRowBackground(Theme.surface)
+
+                    Picker("Английские книги", selection: $settings.selectedVoiceEN) {
+                        ForEach(englishVoiceOptions) { opt in
                             Text(opt.title).tag(opt.id)
                         }
                     }
@@ -37,9 +49,11 @@ struct SettingsView: View {
                 } header: {
                     Text("Голос")
                 } footer: {
+                    // Голос выбирается по языку книги автоматически — объясняем это
+                    // прямо здесь, иначе два пикера выглядят как «какой из них главный».
                     Text(settings.sileroReachable
-                         ? "Доступны улучшенные голоса (нейросеть)."
-                         : "Улучшенные голоса временно недоступны — используется системный голос.")
+                         ? "Голос выбирается по языку книги. Для русских книг доступны улучшенные голоса (нейросеть)."
+                         : "Голос выбирается по языку книги. Улучшенные голоса временно недоступны — используется системный голос.")
                 }
 
                 Section("Пауза между предложениями") {
@@ -80,6 +94,12 @@ struct SettingsView: View {
             .onAppear { settings.probeSilero() }
             .onChange(of: settings.selectedVoice) { id in
                 if let opt = voiceOptions.first(where: { $0.id == id }) {
+                    previewer.preview(opt, serverURL: settings.sileroServerURL,
+                                      apiKey: settings.sileroAPIKey)
+                }
+            }
+            .onChange(of: settings.selectedVoiceEN) { id in
+                if let opt = englishVoiceOptions.first(where: { $0.id == id }) {
                     previewer.preview(opt, serverURL: settings.sileroServerURL,
                                       apiKey: settings.sileroAPIKey)
                 }

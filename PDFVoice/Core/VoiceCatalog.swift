@@ -15,26 +15,79 @@ struct VoiceOption: Identifiable, Hashable {
 
 enum VoiceCatalog {
 
-    /// Голоса Silero (показываются только при доступном сервере).
+    /// Голоса Silero (показываются только при доступном сервере): женский и
+    /// мужской. Из пяти спикеров сервера в выборе оставлены два — `xenia`
+    /// (бывшая «Ксения 2», теперь просто «Ксения») и `eugene`. Сам сервер
+    /// остальных не потерял, они лишь убраны из UI.
     static let sileroSpeakers: [(id: String, title: String)] = [
-        ("kseniya", "Ксения"),
-        ("xenia",   "Ксения 2"),
-        ("aidar",   "Айдар"),
-        ("baya",    "Байя"),
-        ("eugene",  "Евгений"),
+        ("xenia",  "Ксения"),
+        ("eugene", "Евгений"),
     ]
 
-    /// Системные русские голоса, лучшие (Enhanced/Premium) сверху. Milena — обычно первый.
+    /// Системный голос ровно один — Милена. Остальные русские голоса iOS из
+    /// выбора убраны; Милена же остаётся и офлайн-фолбэком, когда Silero-сервер
+    /// недоступен (см. `SpeechEngine.fallBackToSystemVoice`).
     static func systemVoices() -> [AVSpeechSynthesisVoice] {
-        AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language == "ru-RU" }
+        let russian = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language == "ru-RU" && isRealVoice($0) }
             .sorted { $0.quality.rawValue > $1.quality.rawValue }
+        // Милена бывает в нескольких качествах (compact/enhanced/premium) —
+        // сортировка выше ставит лучшее первым. Если её на устройстве нет вовсе,
+        // берём лучший русский: без системного голоса ломается офлайн-фолбэк.
+        let milena = russian.filter(isMilena)
+        return Array((milena.isEmpty ? russian : milena).prefix(1))
     }
 
-    /// Голос по умолчанию (Milena, если доступна).
-    static func defaultSelection() -> String {
-        if let v = systemVoices().first { return "sys:" + v.identifier }
+    private static func isMilena(_ v: AVSpeechSynthesisVoice) -> Bool {
+        v.identifier.localizedCaseInsensitiveContains("milena")
+            || v.name.localizedCaseInsensitiveContains("milena")
+            || v.name.localizedCaseInsensitiveContains("милена")
+    }
+
+    /// Отсеивает служебные и шуточные голоса iOS. Проверено на устройстве: в
+    /// `speechVoices()` для en-US приходят Albert, Bad News, Bells, Zarvox и ещё
+    /// полтора десятка эффектов — все с тем же качеством `.default`, что и
+    /// нормальная Samantha, так что сортировкой по качеству их не отделить.
+    /// Отличает их ЛЕГАСИ-префикс идентификатора; настоящие голоса живут в
+    /// `com.apple.voice.*` (compact/enhanced/premium) и `com.apple.ttsbundle.*`.
+    private static func isRealVoice(_ v: AVSpeechSynthesisVoice) -> Bool {
+        v.identifier.hasPrefix("com.apple.voice.")
+            || v.identifier.hasPrefix("com.apple.ttsbundle.")
+    }
+
+    /// Английские системные голоса — лучшие по качеству, не больше трёх.
+    /// Нейроголоса тут не участвуют: Silero-сервер держит русскую модель
+    /// (`v3_1_ru`), английский текст ему отдавать нечего.
+    static func englishSystemVoices(limit: Int = 3) -> [AVSpeechSynthesisVoice] {
+        let english = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix("en-") && isRealVoice($0) }
+            .sorted { lhs, rhs in
+                // en-US вперёд (основной вариант), дальше по качеству.
+                if (lhs.language == "en-US") != (rhs.language == "en-US") {
+                    return lhs.language == "en-US"
+                }
+                if lhs.quality.rawValue != rhs.quality.rawValue {
+                    return lhs.quality.rawValue > rhs.quality.rawValue
+                }
+                return lhs.name < rhs.name
+            }
+        // Один и тот же голос бывает в нескольких качествах — оставляем по
+        // одному на имя (сортировка уже поставила лучшее качество первым).
+        var seen = Set<String>()
+        let unique = english.filter { seen.insert($0.name).inserted }
+        return Array(unique.prefix(limit))
+    }
+
+    /// Голос по умолчанию для языка: Милена для русского, лучший системный
+    /// английский — для английского.
+    static func defaultSelection(for language: String = "ru") -> String {
+        let voices = isEnglish(language) ? englishSystemVoices() : systemVoices()
+        if let v = voices.first { return "sys:" + v.identifier }
         return "sys:"
+    }
+
+    static func isEnglish(_ language: String) -> Bool {
+        language.lowercased().hasPrefix("en")
     }
 
     static func qualityLabel(_ v: AVSpeechSynthesisVoice) -> String {
@@ -47,8 +100,10 @@ enum VoiceCatalog {
 
     static func systemOptions() -> [VoiceOption] {
         systemVoices().map { v in
+            // `v.name` приходит от iOS на языке системы («Milena» на английской),
+            // а весь остальной список русский — подписываем явно.
             VoiceOption(id: "sys:" + v.identifier,
-                        title: v.name,
+                        title: isMilena(v) ? "Милена" : v.name,
                         subtitle: qualityLabel(v),
                         kind: .system,
                         systemIdentifier: v.identifier,
@@ -67,8 +122,37 @@ enum VoiceCatalog {
         }
     }
 
-    /// Полный список для выбора.
-    static func options(sileroReachable: Bool) -> [VoiceOption] {
-        systemOptions() + (sileroReachable ? sileroOptions() : [])
+    /// Английские варианты выбора (только системные голоса).
+    static func englishOptions() -> [VoiceOption] {
+        englishSystemVoices().map { v in
+            VoiceOption(id: "sys:" + v.identifier,
+                        title: v.name,
+                        subtitle: qualityLabel(v),
+                        kind: .system,
+                        systemIdentifier: v.identifier,
+                        sileroSpeaker: nil)
+        }
+    }
+
+    /// Список для выбора под язык книги. Русский — Милена + нейроголоса (когда
+    /// сервер доступен), английский — системные английские голоса.
+    static func options(sileroReachable: Bool, language: String = "ru") -> [VoiceOption] {
+        if isEnglish(language) { return englishOptions() }
+        return systemOptions() + (sileroReachable ? sileroOptions() : [])
+    }
+
+    /// Приводит СОХРАНЁННЫЙ выбор к актуальному каталогу ЯЗЫКА. Голос, убранный
+    /// из списка (старые `kseniya`/`aidar`/`baya`, другой системный голос, а для
+    /// английского — вообще любой русский), заменяем на голос по умолчанию:
+    /// иначе Picker показывал бы пустую строку, а озвучка шла голосом, которого
+    /// в выборе нет.
+    ///
+    /// Для русского проверяем по ПОЛНОМУ набору, без гейта доступности сервера:
+    /// выбранный нейроголос остаётся валидным и когда сервер временно не отвечает.
+    static func sanitized(_ selection: String, for language: String = "ru") -> String {
+        let valid = isEnglish(language) ? englishOptions() : systemOptions() + sileroOptions()
+        return valid.contains { $0.id == selection }
+            ? selection
+            : defaultSelection(for: language)
     }
 }

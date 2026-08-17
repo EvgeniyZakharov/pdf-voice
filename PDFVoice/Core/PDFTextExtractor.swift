@@ -41,16 +41,18 @@ struct Sentence: Identifiable {
 /// OCR для сканов появится в M3; здесь — только текстовый слой (PDFKit).
 enum PDFTextExtractor {
 
-    private static let profile: any LanguageProfile = RussianProfile()
-
     /// Разбивает документ на предложения постранично.
     ///
     /// Конвейер: исходный текст страницы → строки → выброс колонтитулов/номеров
     /// (`TextPipeline`) → склейка в чистый текст с картой смещений → токенизация
-    /// предложений (`RussianProfile.sentenceRanges`) → раскрытие аббревиатур для озвучки.
+    /// предложений (`LanguageProfile.sentenceRanges`) → раскрытие аббревиатур для озвучки.
     /// Диапазон каждого предложения маппится обратно в координаты исходной строки,
     /// чтобы `PDFPage.selection(for:)` корректно подсвечивал многострочные фрагменты.
-    static func sentences(from document: PDFDocument) -> [Sentence] {
+    ///
+    /// `profile` — языковой профиль книги; по умолчанию русский, поэтому вызов
+    /// без него ведёт себя как раньше.
+    static func sentences(from document: PDFDocument,
+                          profile: any LanguageProfile = LanguageProfiles.default) -> [Sentence] {
         let pageCount = document.pageCount
         guard pageCount > 0 else { return [] }
 
@@ -91,7 +93,8 @@ enum PDFTextExtractor {
                 let heading = profile.isHeading(rawSpoken)
 
                 let nsRange = NSRange(location: origIndex[lo], length: origIndex[hi] - origIndex[lo] + 1)
-                result.append(Sentence(rawText: rawSpoken, pageIndex: pi, range: nsRange, isHeading: heading))
+                result.append(Sentence(rawText: rawSpoken, pageIndex: pi, range: nsRange,
+                                       isHeading: heading, language: profile.code))
             }
         }
         return mergeCrossPage(result)
@@ -142,7 +145,8 @@ enum PDFTextExtractor {
     static func extractSentences(pageRange: Range<Int>,
                                   allLines: [[TextPipeline.PageLine]],
                                   boilerplate: Set<String>,
-                                  pageOffset: Int = 0) -> [Sentence] {
+                                  pageOffset: Int = 0,
+                                  profile: any LanguageProfile = LanguageProfiles.default) -> [Sentence] {
         var result: [Sentence] = []
 
         for pi in pageRange {
@@ -167,7 +171,8 @@ enum PDFTextExtractor {
                 guard !rawSpoken.isEmpty else { continue }
                 let heading = profile.isHeading(rawSpoken)
                 let nsRange = NSRange(location: origIndex[lo], length: origIndex[hi] - origIndex[lo] + 1)
-                result.append(Sentence(rawText: rawSpoken, pageIndex: pi + pageOffset, range: nsRange, isHeading: heading))
+                result.append(Sentence(rawText: rawSpoken, pageIndex: pi + pageOffset, range: nsRange,
+                                       isHeading: heading, language: profile.code))
             }
         }
         return mergeCrossPage(result)
