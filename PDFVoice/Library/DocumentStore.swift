@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// Лёгкое файловое хранилище библиотеки: список — в JSON, сами PDF — в Documents.
 /// Сознательно без SwiftData/Core Data, чтобы держать минимальную iOS 16.0.
@@ -12,6 +13,19 @@ final class DocumentStore: ObservableObject {
     private let collectionsURL: URL
     private let fileManager = FileManager.default
 
+    /// Прогресс чтения (индекс предложения), накопленный с последнего `flushProgress`,
+    /// но ещё НЕ влитый в `items`. `updateProgress` вызывается на каждое озвученное
+    /// предложение (~каждые 2-5 с) — если бы она сразу мутировала `items`, это
+    /// публиковало бы весь массив (пере-рендер `LibraryView` под читалкой) и писало
+    /// JSON на диск так же часто. Дебаунс копит здесь и вливает разом (`flushProgress`).
+    private var dirtyProgress: [UUID: Int] = [:]
+    private var progressFlushTask: Task<Void, Never>?
+    private static let progressFlushInterval: TimeInterval = 8
+    private var backgroundObserver: NSObjectProtocol?
+    /// Сериализует запись library.json на диск в порядке вызовов `save()` — обычный
+    /// `Task.detached` на каждый вызов мог бы завершиться не в том порядке.
+    private static let writeQueue = DispatchQueue(label: "com.pdfvoice.documentstore.write", qos: .utility)
+
     nonisolated static var documentsDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
@@ -21,6 +35,19 @@ final class DocumentStore: ObservableObject {
         collectionsURL = DocumentStore.documentsDirectory.appendingPathComponent("collections.json")
         load()
         loadCollections()
+        // Уход в фон/убийство процесса не ждёт дебаунс-таймер: без форс-flush тут
+        // последние несколько секунд прогресса чтения терялись бы.
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.flushProgress()
+        }
+    }
+
+    deinit {
+        if let backgroundObserver {
+            NotificationCenter.default.removeObserver(backgroundObserver)
+        }
     }
 
     // MARK: - Импорт
@@ -46,11 +73,48 @@ final class DocumentStore: ObservableObject {
 
     // MARK: - Изменение прогресса
 
+    /// Копит позицию чтения в памяти (см. `dirtyProgress`) — НЕ пишет на диск и не
+    /// публикует `items` сразу. Реальный перенос — по дебаунс-таймеру
+    /// (`scheduleProgressFlush`) либо принудительно (`flushProgress`).
     func updateProgress(for itemID: UUID, sentenceIndex: Int) {
+        guard items.contains(where: { $0.id == itemID }) else { return }
+        dirtyProgress[itemID] = sentenceIndex
+        scheduleProgressFlush()
+    }
+
+    /// Фиксирует момент открытия книги. В отличие от `updateProgress` (частые
+    /// вызовы на каждое предложение) вызывается РОВНО ОДИН раз за сессию чтения
+    /// (`ReaderViewModel.attach`).
+    func markOpened(_ itemID: UUID) {
         guard let idx = items.firstIndex(where: { $0.id == itemID }) else { return }
-        items[idx].currentSentenceIndex = sentenceIndex
         items[idx].lastOpened = Date()
         save()
+    }
+
+    /// Переносит накопленный «грязный» прогресс в `items` и пишет библиотеку на
+    /// диск. Вызывается по дебаунс-таймеру, а также принудительно — на выход из
+    /// сессии чтения (`ReaderViewModel.endSession`) и на уход приложения в фон
+    /// (`willResignActive`).
+    func flushProgress() {
+        progressFlushTask?.cancel()
+        progressFlushTask = nil
+        guard !dirtyProgress.isEmpty else { return }
+        let pending = dirtyProgress
+        dirtyProgress.removeAll()
+        for (itemID, sentenceIndex) in pending {
+            guard let idx = items.firstIndex(where: { $0.id == itemID }) else { continue }
+            items[idx].currentSentenceIndex = sentenceIndex
+        }
+        save()
+    }
+
+    private func scheduleProgressFlush() {
+        guard progressFlushTask == nil else { return }
+        progressFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(DocumentStore.progressFlushInterval * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.flushProgress()
+        }
     }
 
     func addBookmark(_ bookmark: Bookmark, to itemID: UUID) {
@@ -70,6 +134,9 @@ final class DocumentStore: ObservableObject {
         OCRCache.remove(for: item.fileName)
         SentencePageCache.remove(for: item.fileName)
         items.removeAll { $0.id == item.id }
+        // Иначе отложенный flushProgress мог бы вписать прогресс уже удалённой
+        // книги обратно, если позиция успела прийти до удаления.
+        dirtyProgress.removeValue(forKey: item.id)
         save()
     }
 
@@ -164,9 +231,15 @@ final class DocumentStore: ObservableObject {
         }
     }
 
+    /// Кодирование + запись на диск — off-main (`writeQueue`, сериализация FIFO).
+    /// `items` — value type, снимок для фонового потока безопасен.
     private func save() {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+        let snapshot = items
+        let url = indexURL
+        Self.writeQueue.async {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     private func loadCollections() {

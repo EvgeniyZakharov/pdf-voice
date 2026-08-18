@@ -6,11 +6,32 @@ enum PageKind { case text, ocr }
 
 /// Дешёвая классификация: только плотность букв из текстового слоя, без рендера.
 /// Возвращает .text или .ocr.
-/// Вызывать можно на main thread; page.string не рендерит thumbnail.
+/// Вызывать можно на main thread; page.string не рендерит thumbnail. На больших
+/// книгах (сотни страниц) сама классификация всё равно дорога суммарно — это
+/// повод звать её вне main thread (см. `ReaderViewModel.load`), а не повод
+/// оставлять этот проход посимвольным по всей странице.
 func textDensityKind(_ page: PDFPage) -> PageKind {
-    let s = page.string ?? ""
+    textDensityKind(ofText: page.string ?? "")
+}
+
+/// Логика плотности букв, вынесенная в String-версию — без зависимости от
+/// PDFPage, чтобы её можно было проверить в изолированном harness'е.
+///
+/// Считаем по ПРЕФИКСУ текста (до ~400 значимых символов), не по всей странице:
+/// порог 40 non-space символов уже даёт статистически устойчивое решение
+/// text/ocr, а полный посимвольный проход по плотной странице (Character-
+/// итерация + unicode-свойства на каждый символ) на большой книге суммарно
+/// заметно дороже, чем нужно для этого решения. `unicodeScalars` вместо
+/// `Character` — дешевле (без построения grapheme-кластеров).
+func textDensityKind(ofText s: String) -> PageKind {
     var letters = 0, nonSpace = 0
-    for ch in s where !ch.isWhitespace { nonSpace += 1; if ch.isLetter { letters += 1 } }
+    let sampleLimit = 400
+    for scalar in s.unicodeScalars {
+        guard !scalar.properties.isWhitespace else { continue }
+        nonSpace += 1
+        if scalar.properties.isAlphabetic { letters += 1 }
+        if nonSpace >= sampleLimit { break }
+    }
     if nonSpace >= 40 {
         let ratio = Double(letters) / Double(nonSpace)
         if ratio >= 0.35 { return .text }

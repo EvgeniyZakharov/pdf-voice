@@ -15,6 +15,25 @@ struct VoiceOption: Identifiable, Hashable {
 
 enum VoiceCatalog {
 
+    /// Кэш сырого списка голосов ОС. `AVSpeechSynthesisVoice.speechVoices()`
+    /// синхронно опрашивает систему — дорого дёргать на каждый рендер SwiftUI
+    /// body (Menu с этим списком пересобирается на каждую смену предложения и
+    /// каждый кадр скролла reflow, см. аудит П3). Кэшируем НА ПРОЦЕСС, без
+    /// инвалидации по нотификации: `AVSpeechSynthesizer.availableVoicesDidChangeNotification`
+    /// доступна только с iOS 17, а min iOS проекта — 16, `#available`-гардом
+    /// пришлось бы городить два пути ради события, которое практически никогда
+    /// не происходит на лету (голоса ставятся в Настройках iOS, а не пока
+    /// открыто приложение) — если это всё же случится, подхватится при
+    /// следующем запуске процесса.
+    private static var cachedRawVoices: [AVSpeechSynthesisVoice]?
+
+    private static func rawVoices() -> [AVSpeechSynthesisVoice] {
+        if let cachedRawVoices { return cachedRawVoices }
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        cachedRawVoices = voices
+        return voices
+    }
+
     /// Голоса Silero (показываются только при доступном сервере): женский и
     /// мужской. Из пяти спикеров сервера в выборе оставлены два — `xenia`
     /// (бывшая «Ксения 2», теперь просто «Ксения») и `eugene`. Сам сервер
@@ -28,7 +47,7 @@ enum VoiceCatalog {
     /// выбора убраны; Милена же остаётся и офлайн-фолбэком, когда Silero-сервер
     /// недоступен (см. `SpeechEngine.fallBackToSystemVoice`).
     static func systemVoices() -> [AVSpeechSynthesisVoice] {
-        let russian = AVSpeechSynthesisVoice.speechVoices()
+        let russian = rawVoices()
             .filter { $0.language == "ru-RU" && isRealVoice($0) }
             .sorted { $0.quality.rawValue > $1.quality.rawValue }
         // Милена бывает в нескольких качествах (compact/enhanced/premium) —
@@ -59,7 +78,7 @@ enum VoiceCatalog {
     /// Нейроголоса тут не участвуют: Silero-сервер держит русскую модель
     /// (`v3_1_ru`), английский текст ему отдавать нечего.
     static func englishSystemVoices(limit: Int = 3) -> [AVSpeechSynthesisVoice] {
-        let english = AVSpeechSynthesisVoice.speechVoices()
+        let english = rawVoices()
             .filter { $0.language.hasPrefix("en-") && isRealVoice($0) }
             .sorted { lhs, rhs in
                 // en-US вперёд (основной вариант), дальше по качеству.

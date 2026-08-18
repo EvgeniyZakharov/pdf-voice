@@ -131,36 +131,67 @@ private struct ThumbnailPlaceholder: View {
     }
 }
 
-/// Поставщик миниатюр: рендер последовательно на фоновой очереди + кэш.
-/// Это снимает нагрузку с главного потока (грид листается плавно) и не плодит
-/// параллельные рендеры PDFKit. Работает на отдельной копии документа.
+/// Поставщик миниатюр: рендер последовательно на фоновой очереди + кэш с
+/// вытеснением. Это снимает нагрузку с главного потока (грид листается плавно),
+/// не плодит параллельные рендеры PDFKit и не копит миниатюры ВСЕХ пролистанных
+/// страниц бесконечно (700-страничная книга раньше держала все разом). Работает
+/// на отдельной копии документа, открытой лениво.
 @MainActor
 final class ThumbnailProvider: ObservableObject {
-    private let document: PDFDocument?
+    /// URL исходного документа — копия для рендера открывается из него ЛЕНИВО
+    /// (не синхронно в init на главном потоке, как раньше: `PDFDocument(url:)` —
+    /// диск I/O + парсинг, блокирующий вызывающий поток на больших PDF).
+    private let documentURL: URL?
+    /// Запасной вариант, если у документа нет URL (или его не удалось открыть
+    /// повторно) — тот же объект, что показывает читалка.
+    private let fallbackDocument: PDFDocument
     private let size: CGSize
-    private var cache: [Int: UIImage] = [:]
+    /// Лимит в 120 миниатюр с запасом покрывает экран сетки + прокрутку вперёд/
+    /// назад без частых перевытеснений; вытесненные перерендерятся при повторном
+    /// скролле — дёшево, рендер и так последовательный на одной очереди.
+    private let cache: NSCache<NSNumber, UIImage> = {
+        let c = NSCache<NSNumber, UIImage>()
+        c.countLimit = 120
+        return c
+    }()
     private let queue = DispatchQueue(label: "pdfvoice.thumbnails", qos: .utility)
+    /// Открытая копия документа — кладётся сюда при первом запросе миниатюры.
+    /// `nonisolated(unsafe)`: мутируется и читается ТОЛЬКО изнутри `queue`
+    /// (последовательная очередь) — гонок с главным потоком нет, несмотря на то
+    /// что сам класс `@MainActor` (изоляция актора нужна `ObservableObject`/
+    /// SwiftUI-стороне API, не этому внутреннему состоянию, которое SwiftUI не
+    /// видит и никогда не трогает).
+    nonisolated(unsafe) private var openedDocument: PDFDocument?
 
     init(document: PDFDocument, size: CGSize) {
         self.size = size
-        if let url = document.documentURL, let copy = PDFDocument(url: url) {
-            self.document = copy          // отдельная копия — без гонки с PDFView читалки
-        } else {
-            self.document = document      // запасной вариант
-        }
+        self.documentURL = document.documentURL
+        self.fallbackDocument = document
     }
 
     func thumbnail(for index: Int) async -> UIImage? {
-        if let cached = cache[index] { return cached }
-        guard let document else { return nil }
+        let key = NSNumber(value: index)
+        if let cached = cache.object(forKey: key) { return cached }
         let size = self.size
+        let url = documentURL
+        let fallback = fallbackDocument
         let image: UIImage? = await withCheckedContinuation { continuation in
-            queue.async {
-                let img = document.page(at: index)?.thumbnail(of: size, for: .cropBox)
+            queue.async { [self] in
+                let doc: PDFDocument
+                if let opened = openedDocument {
+                    doc = opened
+                } else if let url, let copy = PDFDocument(url: url) {
+                    doc = copy
+                    openedDocument = copy
+                } else {
+                    doc = fallback
+                    openedDocument = fallback
+                }
+                let img = doc.page(at: index)?.thumbnail(of: size, for: .cropBox)
                 continuation.resume(returning: img)
             }
         }
-        if let image { cache[index] = image }
+        if let image { cache.setObject(image, forKey: key) }
         return image
     }
 }

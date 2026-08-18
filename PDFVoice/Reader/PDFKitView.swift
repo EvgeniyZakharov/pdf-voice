@@ -95,6 +95,10 @@ struct PDFKitView: UIViewRepresentable {
             view.layoutDocumentView()
             context.coordinator.lastSentenceID = nil
             context.coordinator.lastReadyCount = readyPageCount
+            // Новый документ — старые кэши (страница-по-identity, прямоугольник
+            // подсветки в координатах старой страницы) больше не валидны.
+            context.coordinator.pageIndexCache.removeAll()
+            context.coordinator.highlightPageRect = nil
         } else if readyPageCount != context.coordinator.lastReadyCount {
             // displayDocument получил новые страницы — сообщаем PDFView перерисовать
             // без сброса позиции прокрутки.
@@ -240,6 +244,24 @@ struct PDFKitView: UIViewRepresentable {
         /// Последняя отправленная наверх страница — чтобы не дёргать @State зря.
         private var lastReportedPage: Int = -1
 
+        // MARK: - Кэши для перф-пути скролла (П6)
+
+        /// Прямоугольник ТЕКУЩЕЙ подсветки в координатах СТРАНИЦЫ — вычисляется
+        /// ОДИН РАЗ при смене предложения (обращение к текстовому слою через
+        /// `page.selection(for:)`, для OCR — объединение боксов, оба дороги) и
+        /// переиспользуется на каждом тике скролла: там нужна лишь конвертация в
+        /// координаты вьюшки (`pdfView.convert` — чистая арифметика). Раньше
+        /// `computeHighlightVisible` звало `page.selection(for:)` на КАЖДЫЙ KVO-тик
+        /// contentOffset.
+        var highlightPageRect: (sentenceID: UUID, page: PDFPage, rect: CGRect)?
+
+        /// Кэш номера страницы по identity объекта `PDFPage`. `PDFDocument.index(for:)`
+        /// сканирует массив страниц линейно; в `displayDocument` страницы КОПИРУЮТСЯ
+        /// один раз при добавлении (`ReaderViewModel.revealPages`) и никогда не
+        /// пересоздаются — кэш по `ObjectIdentifier` безопасен и не протухает при
+        /// росте документа, только пополняется. Сбрасывается при смене документа.
+        var pageIndexCache: [ObjectIdentifier: Int] = [:]
+
         init(_ parent: PDFKitView) { self.parent = parent }
 
         deinit {
@@ -278,37 +300,55 @@ struct PDFKitView: UIViewRepresentable {
         /// цепляется за самую границу.
         /// Возвращает true если подсветки нет — кнопку возврата показывать не надо.
         func computeHighlightVisible() -> Bool {
-            guard let pdfView, let sentence = parent.highlight else { return true }
-            guard let page = parent.document.page(at: sentence.pageIndex) else { return true }
+            guard let pdfView, parent.highlight != nil else { return true }
+            guard let cached = cachedHighlightPageRect() else { return true }
             let reading = parent.readingMaxY > parent.readingMinY
                 ? CGRect(x: 0, y: parent.readingMinY, width: pdfView.bounds.width,
                          height: parent.readingMaxY - parent.readingMinY)
                 : pdfView.bounds
             let band = reading.insetBy(dx: 0, dy: reading.height * 0.2)
-            if let range = sentence.range, let selection = page.selection(for: range) {
-                let boundsInView = pdfView.convert(selection.bounds(for: page), from: page)
-                return band.intersects(boundsInView)
-            } else if !sentence.boxes.isEmpty {
-                for box in sentence.boxes {
-                    let boxInView = pdfView.convert(box, from: page)
-                    if band.intersects(boxInView) { return true }
-                }
-                return false
-            }
-            return true
+            let boundsInView = pdfView.convert(cached.rect, from: cached.page)
+            return band.intersects(boundsInView)
         }
 
         /// Прямоугольник текущей подсветки в координатах PDFView (или nil).
         private func highlightRectInView() -> CGRect? {
-            guard let pdfView, let sentence = parent.highlight,
-                  let page = parent.document.page(at: sentence.pageIndex) else { return nil }
+            guard let pdfView, let cached = cachedHighlightPageRect() else { return nil }
+            return pdfView.convert(cached.rect, from: cached.page)
+        }
+
+        /// Прямоугольник ТЕКУЩЕЙ подсветки (`parent.highlight`) в координатах
+        /// страницы — из кэша, если предложение и страница не изменились, иначе
+        /// пересчитывает (единственное место, трогающее текстовый слой/OCR-боксы
+        /// ради этого прямоугольника) и кладёт в кэш.
+        private func cachedHighlightPageRect() -> (page: PDFPage, rect: CGRect)? {
+            guard let sentence = parent.highlight,
+                  let page = parent.document.page(at: sentence.pageIndex) else {
+                highlightPageRect = nil
+                return nil
+            }
+            if let cached = highlightPageRect, cached.sentenceID == sentence.id, cached.page === page {
+                return (cached.page, cached.rect)
+            }
+            guard let rect = computeHighlightPageRect(sentence, on: page) else {
+                highlightPageRect = nil
+                return nil
+            }
+            highlightPageRect = (sentence.id, page, rect)
+            return (page, rect)
+        }
+
+        /// Обращение к текстовому слою (`page.selection(for:)`) или объединение
+        /// OCR-боксов — дорогая часть, изолированная сюда, чтобы её точно не
+        /// звали чаще одного раза на смену предложения (см. `cachedHighlightPageRect`).
+        private func computeHighlightPageRect(_ sentence: Sentence, on page: PDFPage) -> CGRect? {
             if let range = sentence.range, let selection = page.selection(for: range) {
-                return pdfView.convert(selection.bounds(for: page), from: page)
+                return selection.bounds(for: page)
             }
             guard !sentence.boxes.isEmpty else { return nil }
             var union = CGRect.null
             for box in sentence.boxes { union = union.union(box) }
-            return union.isNull ? nil : pdfView.convert(union, from: page)
+            return union.isNull ? nil : union
         }
 
         /// Смещение вида, при котором подсветка встаёт по ЦЕНТРУ области чтения.
@@ -465,9 +505,18 @@ struct PDFKitView: UIViewRepresentable {
             guard let pdfView else { return }
             let center = CGPoint(x: pdfView.bounds.midX, y: pdfView.bounds.midY)
             guard let page = pdfView.page(for: center, nearest: true) else { return }
-            let index = parent.document.index(for: page)
-            guard index != NSNotFound else { return }
+            guard let index = cachedPageIndex(for: page) else { return }
             deliverPageChange(index)
+        }
+
+        /// Индекс страницы по identity объекта — кэшированный, см. `pageIndexCache`.
+        private func cachedPageIndex(for page: PDFPage) -> Int? {
+            let key = ObjectIdentifier(page)
+            if let cached = pageIndexCache[key] { return cached }
+            let index = parent.document.index(for: page)
+            guard index != NSNotFound else { return nil }
+            pageIndexCache[key] = index
+            return index
         }
 
         /// Сообщает наверх страницу НАПРЯМУЮ (без чтения layout PDFView) — вызывается

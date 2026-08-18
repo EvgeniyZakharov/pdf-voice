@@ -61,8 +61,15 @@ final class ReaderViewModel: ObservableObject {
     /// становится достижимым (`tryApplyPendingRestore`), либо на любое явное
     /// действие пользователя (он сам выбрал новое место).
     private var pendingRestoreIndex: Int?
-    /// Полный исходный документ — источник страниц для displayDocument.
+    /// Полный исходный документ — источник страниц для displayDocument. Трогать
+    /// только с main thread (растёт через revealPages).
     private var sourceDoc: PDFDocument?
+    /// Отдельная копия того же файла — ЕДИНСТВЕННЫЙ источник страниц для всех
+    /// фоновых чтений (классификация, page.string, OCR, blank-check). PDFKit не
+    /// потокобезопасен: `sourceDoc`/`document` растут на main через revealPages
+    /// одновременно с фоновой загрузкой — общий объект гонял бы чтение и мутацию
+    /// с разных потоков.
+    private var extractionDoc: PDFDocument?
 
     // Тип документа, устанавливается при load() однократно.
     private enum DocumentMode { case text, ocr, mixed }
@@ -88,6 +95,9 @@ final class ReaderViewModel: ObservableObject {
     func attach(store: DocumentStore) {
         self.store = store
         bookmarks = store.items.first(where: { $0.id == item.id })?.bookmarks ?? []
+        // Один раз за сессию — в отличие от прогресса (см. persistProgress),
+        // который копится и льётся по дебаунсу на каждое предложение.
+        store.markOpened(item.id)
         speech.onIndexChange = { [weak self] index in
             guard let self else { return }
             // Пока не применилось отложенное восстановление позиции, а событие
@@ -239,40 +249,76 @@ final class ReaderViewModel: ObservableObject {
         totalPageCount = doc.pageCount
         sourceDoc = doc
 
-        // Дешёвая классификация — только плотность букв (page.string), без рендера thumbnail.
-        var kinds: [PageKind] = []
-        kinds.reserveCapacity(doc.pageCount)
-        for pi in 0..<doc.pageCount {
-            if let page = doc.page(at: pi) {
-                kinds.append(textDensityKind(page))
-            } else {
-                kinds.append(.ocr)
+        // Кэш проверяем ДО классификации: у полностью загруженной (ранее уже
+        // прочитанной) книги плотность букв по page.string всей книги
+        // пересчитывать незачем — это и была львиная доля фриза открытия
+        // большой книги (1-8 с даже когда всё уже посчитано).
+        let cached = SentencePageCache.load(for: item.fileName)
+        if let cached, cached.isComplete {
+            let sentences = cached.entries.map { $0.toSentence() }
+            document = doc
+            loadedPageCount = min(cached.loadedPageCount, doc.pageCount)
+            finishLoading(sentences)
+            speech.isFullyLoaded = true
+            return
+        }
+
+        // Кэша нет либо он неполный — классификация (page.string по каждой
+        // странице) обязательна и дорогая, уводим на фон вместе с открытием
+        // ВТОРОЙ копии PDFDocument той же книги: main растит sourceDoc/document
+        // параллельно (revealPages), а PDFKit не потокобезопасен — фоновые
+        // пути должны читать СВОЙ объект (extractionDoc), не тот, что мутируется.
+        let url = item.fileURL
+        let shouldDetect = needsLanguageDetection
+
+        backgroundTask = Task { [weak self] in
+            let result: (extraction: PDFDocument, kinds: [PageKind], sample: String)? =
+                await Task.detached(priority: .userInitiated) {
+                    guard let extraction = PDFDocument(url: url) else { return nil }
+                    var kinds: [PageKind] = []
+                    kinds.reserveCapacity(extraction.pageCount)
+                    for pi in 0..<extraction.pageCount {
+                        if let page = extraction.page(at: pi) {
+                            kinds.append(textDensityKind(page))
+                        } else {
+                            kinds.append(.ocr)
+                        }
+                    }
+                    let sample = shouldDetect ? Self.textSample(doc: extraction, kinds: kinds) : ""
+                    return (extraction, kinds, sample)
+                }.value
+
+            guard !Task.isCancelled, let self else { return }
+            guard let result else {
+                self.loadError = "Не удалось открыть PDF."
+                return
             }
-        }
-        pageKinds = kinds
+            self.extractionDoc = result.extraction
+            self.pageKinds = result.kinds
 
-        // Язык — ДО любой ветки извлечения: он выбирает профиль, а профиль
-        // проставляет isHeading, который уходит в кэш предложений.
-        if needsLanguageDetection {
-            resolveLanguage(from: Self.textSample(doc: doc, kinds: kinds))
-        }
+            // Язык — ДО любой ветки извлечения: он выбирает профиль, а профиль
+            // проставляет isHeading, который уходит в кэш предложений.
+            if shouldDetect, !result.sample.isEmpty {
+                self.resolveLanguage(from: result.sample)
+            }
 
-        let hasText = kinds.contains(.text)
-        let hasOCR  = kinds.contains(.ocr)
+            let hasText = result.kinds.contains(.text)
+            let hasOCR  = result.kinds.contains(.ocr)
 
-        switch (hasText, hasOCR) {
-        case (true, false):
-            // Чисто текстовый — проверенный путь без изменений.
-            documentMode = .text
-            loadText(doc)
-        case (false, _):
-            // Чисто OCR — проверенный путь без изменений.
-            documentMode = .ocr
-            loadOCR(doc)
-        default:
-            // Смешанный: часть страниц с текстовым слоем, часть — сканы.
-            documentMode = .mixed
-            loadMixed(doc)
+            switch (hasText, hasOCR) {
+            case (true, false):
+                // Чисто текстовый — проверенный путь без изменений.
+                self.documentMode = .text
+                self.loadText(doc, extractionDoc: result.extraction, cached: cached)
+            case (false, _):
+                // Чисто OCR — проверенный путь без изменений.
+                self.documentMode = .ocr
+                self.loadOCR(doc, extractionDoc: result.extraction, cached: cached)
+            default:
+                // Смешанный: часть страниц с текстовым слоем, часть — сканы.
+                self.documentMode = .mixed
+                self.loadMixed(doc, extractionDoc: result.extraction, cached: cached)
+            }
         }
     }
 
@@ -339,10 +385,30 @@ final class ReaderViewModel: ObservableObject {
     private func loadReflow() {
         let format = item.format
         let url = item.fileURL
+        let fileName = item.fileName
         // Профиль поднимаем в локальную переменную: Task.detached выполняется вне
         // главного актора и не может читать @MainActor-свойство напрямую.
         let profile = profile
         let shouldDetect = needsLanguageDetection
+
+        // Быстрый путь: язык уже известен (детект не нужен), кэш предложений
+        // полон, и рядом лежит согласованный сайдкар (flatText + главы) —
+        // открытие книги без повторного unzip/парсинга/токенизации всей книги.
+        // Детект языка запускать заново не нужно: он один раз пишется в
+        // `item.language`, а раз shouldDetect==false, значение уже есть.
+        if !shouldDetect,
+           let cached = SentencePageCache.load(for: fileName), cached.isComplete,
+           let sidecar = SentencePageCache.loadReflowSidecar(for: fileName),
+           sidecar.chapterTitles.count == cached.totalPageCount {
+            let sentences = cached.entries.map { $0.toSentence() }
+            bookContent = BookContent(chapters: sidecar.chapterTitles.map { BookChapter(title: $0, text: "") })
+            reflowFlatText = sidecar.flatText
+            reflowChapterOffsets = sidecar.chapterOffsets
+            totalPageCount = cached.totalPageCount
+            finishLoading(sentences)
+            speech.isFullyLoaded = true
+            return
+        }
 
         backgroundTask = Task { [weak self] in
             let parsed: ReflowParse? = await Task.detached(priority: .userInitiated) {
@@ -374,11 +440,26 @@ final class ReaderViewModel: ObservableObject {
             self.bookContent = parsed.content
             self.reflowFlatText = parsed.text
             self.reflowChapterOffsets = parsed.chapterOffsets
-            self.totalPageCount = parsed.content.chapters.count
+            let chapterCount = parsed.content.chapters.count
+            self.totalPageCount = chapterCount
             self.finishLoading(parsed.sentences)
             // Reflow парсится и режется на предложения ЦЕЛИКОМ за один проход —
             // прогрессивной догрузки для него нет, книга сразу полностью загружена.
             self.speech.isFullyLoaded = true
+
+            // Кэшируем результат целиком (loadedPageCount == totalPageCount ==
+            // число глав, isComplete=true), чтобы следующее открытие пошло
+            // быстрым путём выше. Сохранение — off main, не блокирует UI.
+            let sentencesSnapshot = parsed.sentences
+            let flatText = parsed.text
+            let chapterOffsets = parsed.chapterOffsets
+            let chapterTitles = parsed.content.chapters.map(\.title)
+            Task.detached(priority: .background) {
+                SentencePageCache.save(sentences: sentencesSnapshot, loadedPageCount: chapterCount,
+                                       totalPageCount: chapterCount, for: fileName)
+                SentencePageCache.saveReflowSidecar(flatText: flatText, chapterOffsets: chapterOffsets,
+                                                    chapterTitles: chapterTitles, for: fileName)
+            }
         }
     }
 
@@ -404,10 +485,10 @@ final class ReaderViewModel: ObservableObject {
 
     // MARK: - Чисто текстовый путь (без изменений)
 
-    private func loadText(_ doc: PDFDocument) {
+    private func loadText(_ doc: PDFDocument, extractionDoc: PDFDocument, cached: SentenceCacheEntry?) {
         let pageCount = doc.pageCount
 
-        if let cached = SentencePageCache.load(for: item.fileName) {
+        if let cached {
             let sentences = cached.entries.map { $0.toSentence() }
             document = doc
             loadedPageCount = min(cached.loadedPageCount, pageCount)
@@ -415,7 +496,8 @@ final class ReaderViewModel: ObservableObject {
 
             if !cached.isComplete && cached.loadedPageCount < pageCount {
                 isLoadingRemainingPages = true
-                startBackgroundTextLoading(doc: doc, from: cached.loadedPageCount,
+                startBackgroundTextLoading(doc: doc, extractionDoc: extractionDoc,
+                                           from: cached.loadedPageCount,
                                            totalPageCount: pageCount, prior: sentences)
             } else {
                 speech.isFullyLoaded = true
@@ -424,7 +506,7 @@ final class ReaderViewModel: ObservableObject {
         }
 
         if pageCount <= 20 {
-            let sentences = PDFTextExtractor.sentences(from: doc, profile: profile)
+            let sentences = PDFTextExtractor.sentences(from: extractionDoc, profile: profile)
             document = doc
             loadedPageCount = pageCount
             finishLoading(sentences)
@@ -434,14 +516,14 @@ final class ReaderViewModel: ObservableObject {
             return
         }
 
-        loadTextProgressively(doc)
+        loadTextProgressively(doc, extractionDoc: extractionDoc)
     }
 
-    private func loadTextProgressively(_ doc: PDFDocument) {
+    private func loadTextProgressively(_ doc: PDFDocument, extractionDoc: PDFDocument) {
         let pageCount = doc.pageCount
         let initialCount = min(15, pageCount)
         let initialLines: [[TextPipeline.PageLine]] = (0..<initialCount).map {
-            TextPipeline.lines(of: doc.page(at: $0)?.string ?? "")
+            TextPipeline.lines(of: extractionDoc.page(at: $0)?.string ?? "")
         }
         let quickBoilerplate = TextPipeline.detectBoilerplate(
             pages: initialLines, pageCount: initialCount
@@ -472,12 +554,12 @@ final class ReaderViewModel: ObservableObject {
                 return
             }
             self.isLoadingRemainingPages = true
-            self.startBackgroundTextLoading(doc: doc, from: initialCount,
+            self.startBackgroundTextLoading(doc: doc, extractionDoc: extractionDoc, from: initialCount,
                                             totalPageCount: pageCount, prior: initial)
         }
     }
 
-    private func startBackgroundTextLoading(doc: PDFDocument, from startPage: Int,
+    private func startBackgroundTextLoading(doc: PDFDocument, extractionDoc: PDFDocument, from startPage: Int,
                                             totalPageCount: Int, prior: [Sentence]) {
         backgroundTask?.cancel()
         let fileName = item.fileName
@@ -485,13 +567,14 @@ final class ReaderViewModel: ObservableObject {
         let profile = profile
 
         backgroundTask = Task { [weak self] in
-            // Читаем строки страниц off main thread через GCD.
+            // Читаем строки страниц off main thread через GCD — только из extractionDoc,
+            // НЕ из doc/sourceDoc (тот растёт на main через revealPages параллельно).
             let remainingLines: [[TextPipeline.PageLine]] = await withCheckedContinuation { cont in
                 DispatchQueue.global(qos: .background).async {
                     var lines: [[TextPipeline.PageLine]] = []
                     lines.reserveCapacity(totalPageCount - startPage)
                     for pi in startPage..<totalPageCount {
-                        lines.append(TextPipeline.lines(of: doc.page(at: pi)?.string ?? ""))
+                        lines.append(TextPipeline.lines(of: extractionDoc.page(at: pi)?.string ?? ""))
                     }
                     cont.resume(returning: lines)
                 }
@@ -548,12 +631,12 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Чисто OCR путь (без изменений)
+    // MARK: - Чисто OCR путь
 
-    private func loadOCR(_ doc: PDFDocument) {
+    private func loadOCR(_ doc: PDFDocument, extractionDoc: PDFDocument, cached: SentenceCacheEntry?) {
         let pageCount = doc.pageCount
 
-        if let cached = SentencePageCache.load(for: item.fileName) {
+        if let cached {
             let sentences = cached.entries.map { $0.toSentence() }
             document = doc
             loadedPageCount = min(cached.loadedPageCount, pageCount)
@@ -561,7 +644,7 @@ final class ReaderViewModel: ObservableObject {
 
             if !cached.isComplete && cached.loadedPageCount < pageCount {
                 isLoadingRemainingPages = true
-                runOCR(doc: doc, from: cached.loadedPageCount,
+                runOCR(doc: doc, extractionDoc: extractionDoc, from: cached.loadedPageCount,
                        totalPageCount: pageCount, prior: sentences)
             } else {
                 speech.isFullyLoaded = true
@@ -570,10 +653,10 @@ final class ReaderViewModel: ObservableObject {
         }
 
         document = doc
-        runOCR(doc: doc, from: 0, totalPageCount: pageCount, prior: [])
+        runOCR(doc: doc, extractionDoc: extractionDoc, from: 0, totalPageCount: pageCount, prior: [])
     }
 
-    private func runOCR(doc: PDFDocument, from startPage: Int,
+    private func runOCR(doc: PDFDocument, extractionDoc: PDFDocument, from startPage: Int,
                         totalPageCount: Int, prior: [Sentence]) {
         ocrProgress = Double(startPage) / Double(totalPageCount)
         let fileName = item.fileName
@@ -582,6 +665,27 @@ final class ReaderViewModel: ObservableObject {
         backgroundTask = Task { [weak self] in
             guard let self else { return }
             let initialCount = min(startPage + 15, totalPageCount)
+
+            // Дебаунс сохранения кэша: JSON-энкод растущего массива предложений
+            // синхронно на main-акторе внутри цикла — O(n²), 150-200 мс залипания
+            // на каждый батч из 15 страниц к концу большой книги. Сохраняем не
+            // чаще раза в 5 с, кроме форсированных точек (первый батч резюме и
+            // последний батч книги — иначе конец книги мог остаться несохранённым).
+            // Проверка Task.isCancelled ПЕРЕД спавном Task.detached — сама
+            // detached-задача от отмены внешней НЕ зависит (не дочерняя), поэтому
+            // отменённый цикл не должен успеть её запустить.
+            var lastCacheSave = Date.distantPast
+            let cacheSaveInterval: TimeInterval = 5
+            func saveCache(_ sentences: [Sentence], loaded: Int, force: Bool) {
+                guard !Task.isCancelled else { return }
+                let now = Date()
+                guard force || now.timeIntervalSince(lastCacheSave) >= cacheSaveInterval else { return }
+                lastCacheSave = now
+                Task.detached(priority: .background) {
+                    SentencePageCache.save(sentences: sentences, loadedPageCount: loaded,
+                                          totalPageCount: totalPageCount, for: fileName)
+                }
+            }
 
             // У скана текстового слоя нет, образец брать неоткуда — распознаём
             // несколько страниц заранее и определяем язык по ним. Эти страницы
@@ -598,7 +702,7 @@ final class ReaderViewModel: ObservableObject {
                 var pi = startPage
                 while pi < totalPageCount, probed < 3, sample.count < 1500 {
                     let probe = await OCRTextExtractor.sentences(
-                        from: doc, pageRange: pi..<(pi + 1)
+                        from: extractionDoc, pageRange: pi..<(pi + 1)
                     ) { _, _ in }
                     sample += probe.map(\.rawText).joined(separator: " ") + " "
                     probed += 1
@@ -609,7 +713,7 @@ final class ReaderViewModel: ObservableObject {
 
             if startPage < initialCount {
                 let initial = await OCRTextExtractor.sentences(
-                    from: doc,
+                    from: extractionDoc,
                     pageRange: startPage..<initialCount,
                     profile: profile
                 ) { [weak self] done, total in
@@ -627,9 +731,7 @@ final class ReaderViewModel: ObservableObject {
                         tryApplyPendingRestore()
                     }
                     loadedPageCount = initialCount
-                    SentencePageCache.save(sentences: allInitial,
-                                          loadedPageCount: initialCount,
-                                          totalPageCount: totalPageCount, for: fileName)
+                    saveCache(allInitial, loaded: initialCount, force: true)
                 }
 
                 guard initialCount < totalPageCount else {
@@ -656,7 +758,7 @@ final class ReaderViewModel: ObservableObject {
                     let batchEnd = min(batchStart + batchSize, totalPageCount)
                     let captureStart = batchStart
                     let batch = await OCRTextExtractor.sentences(
-                        from: doc,
+                        from: extractionDoc,
                         pageRange: batchStart..<batchEnd,
                         profile: profile
                     ) { [weak self] done, _ in
@@ -671,9 +773,8 @@ final class ReaderViewModel: ObservableObject {
                     speech.appendSentences(batch)   // сначала аудио в плеер...
                     tryApplyPendingRestore()
                     loadedPageCount = batchEnd       // ...потом показываем страницы (в синхроне)
-                    SentencePageCache.save(sentences: allSentences,
-                                          loadedPageCount: batchEnd,
-                                          totalPageCount: totalPageCount, for: fileName)
+                    let isLastBatch = batchEnd >= totalPageCount
+                    saveCache(allSentences, loaded: batchEnd, force: isLastBatch)
                     batchStart = batchEnd
                 }
 
@@ -695,11 +796,11 @@ final class ReaderViewModel: ObservableObject {
     ///
     /// TODO §3.6: Конкурентный OCR-lane (параллельная обработка OCR-страниц с последующей
     /// сборкой в правильном порядке) — бэклог. Сейчас обработка строго последовательна.
-    private func loadMixed(_ doc: PDFDocument) {
+    private func loadMixed(_ doc: PDFDocument, extractionDoc: PDFDocument, cached: SentenceCacheEntry?) {
         let pageCount = doc.pageCount
         let fileName = item.fileName
 
-        if let cached = SentencePageCache.load(for: item.fileName) {
+        if let cached {
             let sentences = cached.entries.map { $0.toSentence() }
             document = doc
             loadedPageCount = min(cached.loadedPageCount, pageCount)
@@ -707,7 +808,8 @@ final class ReaderViewModel: ObservableObject {
 
             if !cached.isComplete && cached.loadedPageCount < pageCount {
                 isLoadingRemainingPages = true
-                startBackgroundMixedLoading(doc: doc, from: cached.loadedPageCount,
+                startBackgroundMixedLoading(doc: doc, extractionDoc: extractionDoc,
+                                            from: cached.loadedPageCount,
                                             totalPageCount: pageCount, prior: sentences)
             } else {
                 speech.isFullyLoaded = true
@@ -720,7 +822,7 @@ final class ReaderViewModel: ObservableObject {
         let kinds = pageKinds
 
         backgroundTask = Task { [weak self] in
-            let initial = await self?.processMixedPages(doc: doc, pageRange: 0..<initialCount,
+            let initial = await self?.processMixedPages(extractionDoc: extractionDoc, pageRange: 0..<initialCount,
                                                         kinds: kinds, boilerplate: nil) ?? []
 
             guard !Task.isCancelled, let self else { return }
@@ -739,12 +841,12 @@ final class ReaderViewModel: ObservableObject {
                 return
             }
             self.isLoadingRemainingPages = true
-            self.startBackgroundMixedLoading(doc: doc, from: initialCount,
+            self.startBackgroundMixedLoading(doc: doc, extractionDoc: extractionDoc, from: initialCount,
                                              totalPageCount: pageCount, prior: initial)
         }
     }
 
-    private func startBackgroundMixedLoading(doc: PDFDocument, from startPage: Int,
+    private func startBackgroundMixedLoading(doc: PDFDocument, extractionDoc: PDFDocument, from startPage: Int,
                                              totalPageCount: Int, prior: [Sentence]) {
         backgroundTask?.cancel()
         let fileName = item.fileName
@@ -762,7 +864,7 @@ final class ReaderViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
 
                 let batchEnd = min(batchStart + batchSize, totalPageCount)
-                let batch = await self?.processMixedPages(doc: doc, pageRange: batchStart..<batchEnd,
+                let batch = await self?.processMixedPages(extractionDoc: extractionDoc, pageRange: batchStart..<batchEnd,
                                                            kinds: kinds, boilerplate: nil) ?? []
 
                 guard !Task.isCancelled, let self else { return }
@@ -793,7 +895,10 @@ final class ReaderViewModel: ObservableObject {
     /// `boilerplate` передаётся nil → вычисляется по текстовым строкам текущего батча.
     /// Точность детекта колонтитулов ниже чем при полном документе — приемлемо для
     /// смешанного режима, где страниц текстового слоя может быть мало.
-    private func processMixedPages(doc: PDFDocument,
+    ///
+    /// `extractionDoc` — ВСЕГДА фоновая копия документа (не main-`document`),
+    /// вызывается только из фоновых Task/Task.detached путей.
+    private func processMixedPages(extractionDoc: PDFDocument,
                                    pageRange: Range<Int>,
                                    kinds: [PageKind],
                                    boilerplate: Set<String>?) async -> [Sentence] {
@@ -808,7 +913,7 @@ final class ReaderViewModel: ObservableObject {
         } else {
             let textLines: [[TextPipeline.PageLine]] = pageRange.map { pi in
                 guard pi < kinds.count, kinds[pi] == .text else { return [] }
-                return TextPipeline.lines(of: doc.page(at: pi)?.string ?? "")
+                return TextPipeline.lines(of: extractionDoc.page(at: pi)?.string ?? "")
             }
             effectiveBoilerplate = await Task.detached(priority: .background) {
                 TextPipeline.detectBoilerplate(pages: textLines, pageCount: textLines.count)
@@ -819,7 +924,7 @@ final class ReaderViewModel: ObservableObject {
             guard pi < kinds.count else { continue }
             switch kinds[pi] {
             case .text:
-                let lines = TextPipeline.lines(of: doc.page(at: pi)?.string ?? "")
+                let lines = TextPipeline.lines(of: extractionDoc.page(at: pi)?.string ?? "")
                 guard !lines.isEmpty else { continue }
                 // Извлекаем предложения одной страницы через общий конвейер.
                 let pageSentences = await Task.detached(priority: .background) {
@@ -837,14 +942,14 @@ final class ReaderViewModel: ObservableObject {
                 // Ленивый blank-чек: рендерим thumbnail только здесь, off-main, прямо перед OCR.
                 // На этапе load() мы намеренно его пропустили, чтобы не рендерить 720 страниц
                 // пачкой на main thread.
-                guard let page = doc.page(at: pi) else { continue }
+                guard let page = extractionDoc.page(at: pi) else { continue }
                 let blank = await Task.detached(priority: .background) {
                     isBlankPage(page)
                 }.value
                 guard !blank else { continue }
 
                 let pageSentences = await OCRTextExtractor.sentences(
-                    from: doc,
+                    from: extractionDoc,
                     pageRange: pi..<(pi + 1),
                     profile: profile
                 ) { _, _ in }
@@ -858,19 +963,19 @@ final class ReaderViewModel: ObservableObject {
     // MARK: - Приоритетная загрузка (исправление бага: ветвление по типу документа)
 
     func requestPriorityLoad(pageIndex: Int) {
-        guard pageIndex >= loadedPageCount, let doc = document else { return }
+        guard pageIndex >= loadedPageCount, let doc = document, let extractionDoc else { return }
         backgroundTask?.cancel()
         isLoadingRemainingPages = true
 
         switch documentMode {
         case .text:
-            startBackgroundTextLoading(doc: doc, from: loadedPageCount,
+            startBackgroundTextLoading(doc: doc, extractionDoc: extractionDoc, from: loadedPageCount,
                                        totalPageCount: totalPageCount, prior: speech.sentences)
         case .ocr:
-            runOCR(doc: doc, from: loadedPageCount,
+            runOCR(doc: doc, extractionDoc: extractionDoc, from: loadedPageCount,
                    totalPageCount: totalPageCount, prior: speech.sentences)
         case .mixed:
-            startBackgroundMixedLoading(doc: doc, from: loadedPageCount,
+            startBackgroundMixedLoading(doc: doc, extractionDoc: extractionDoc, from: loadedPageCount,
                                         totalPageCount: totalPageCount, prior: speech.sentences)
         }
     }
@@ -934,8 +1039,14 @@ final class ReaderViewModel: ObservableObject {
     /// это событие подтягивается только по мере воспроизведения — перед
     /// остановкой сессии (✕ в мини-плеере) фиксируем currentIndex напрямую,
     /// чтобы не зависеть от того, придёт ли ещё одно такое событие.
+    ///
+    /// `updateProgress` копит позицию в памяти (дебаунс — см. `DocumentStore`);
+    /// здесь дополнительно форсируем немедленный `flushProgress`, иначе
+    /// последняя позиция дожидалась бы таймера, а сессия уже закрывается.
     private func persistProgress() {
-        store?.updateProgress(for: item.id, sentenceIndex: speech.currentIndex)
+        guard let store else { return }
+        store.updateProgress(for: item.id, sentenceIndex: speech.currentIndex)
+        store.flushProgress()
     }
 
     /// Полное закрытие сессии чтения (✕ в мини-плеере, открытие другой книги,

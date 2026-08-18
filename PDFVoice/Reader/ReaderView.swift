@@ -43,6 +43,11 @@ private struct ReaderScreen: View {
     @State private var jumpToken = 0
     @State private var showThumbnails = false
     @State private var showBookmarks = false
+    /// Кэш опций голоса для тулбарного пикера (П3): наполняется явно, а не
+    /// вычисляется прямо в body — `VoiceCatalog.options` (даже с кэшем
+    /// `speechVoices()` внутри) не должен пересобираться на КАЖДЫЙ рендер body,
+    /// а body дёргается на каждую смену предложения и каждый кадр скролла reflow.
+    @State private var voiceOptions: [VoiceOption] = []
     /// Показ листа регулировки размера шрифта (reflow).
     @State private var showFontSize = false
     // Reflow-навигация (не делим состояние с pageBar)
@@ -140,9 +145,16 @@ private struct ReaderScreen: View {
         }
         // Сессия (attach/applySettings/load) поднята в PlaybackCoordinator.open — здесь
         // НЕ грузим и НЕ завершаем её: при уходе в библиотеку аудио продолжает играть (R2).
-        .onAppear { settings.probeSilero() }
+        .onAppear {
+            settings.probeSilero()
+            refreshVoiceOptions()
+        }
         .onChange(of: settings.selectedVoice)      { _ in model.changeVoice(settings) }
         .onChange(of: settings.selectedVoiceEN)    { _ in model.changeVoice(settings) }
+        // Опции пикера зависят только от доступности Silero и языка книги —
+        // пересобираем список явно на изменение любого из них, не на body.
+        .onChange(of: settings.sileroReachable)    { _ in refreshVoiceOptions() }
+        .onChange(of: model.libraryItem.effectiveLanguage) { _ in refreshVoiceOptions() }
         // Озвучка перешла на другое предложение — пузырёк «Читать отсюда»
         // больше не актуален, прячем (иначе висел поверх текста).
         .onChange(of: model.currentSentence?.id) { _ in
@@ -168,14 +180,13 @@ private struct ReaderScreen: View {
                 // английский (см. ReaderViewModel.applySettings).
                 if VoiceCatalog.isEnglish(model.libraryItem.effectiveLanguage) {
                     Picker("Голос", selection: $settings.selectedVoiceEN) {
-                        ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable,
-                                                     language: "en")) { opt in
+                        ForEach(voiceOptions) { opt in
                             Text(opt.title).tag(opt.id)
                         }
                     }
                 } else {
                     Picker("Голос", selection: $settings.selectedVoice) {
-                        ForEach(VoiceCatalog.options(sileroReachable: settings.sileroReachable)) { opt in
+                        ForEach(voiceOptions) { opt in
                             Text(opt.title).tag(opt.id)
                         }
                     }
@@ -332,6 +343,14 @@ private struct ReaderScreen: View {
                      model.isReflowable && settings.readingTheme == .dark ? .dark : .light)
     }
 
+    /// Пересобирает `voiceOptions` для тулбарного пикера. Вызывается явно
+    /// (появление экрана, смена доступности Silero, смена языка книги) — НЕ на
+    /// каждый рендер body (см. `voiceOptions`).
+    private func refreshVoiceOptions() {
+        voiceOptions = VoiceCatalog.options(sileroReachable: settings.sileroReachable,
+                                             language: model.libraryItem.effectiveLanguage)
+    }
+
     private func requestJump(to page: Int) {
         let clamped = max(0, min(page, max(pageCount - 1, 0)))
         jumpToken += 1
@@ -401,16 +420,23 @@ private struct ReaderScreen: View {
                              },
                              onScroll: { f, ch, vis, following in
                                  // Пока юзер тащит слайдер — он источник истины, не перебиваем.
+                                 // Гварды по неравенству: @State-присваивание перезапускает body
+                                 // ReaderScreen ДАЖЕ на то же значение — Coordinator.reportScroll
+                                 // уже дедуплицирует репорты, но лишний пере-рендер на границах
+                                 // (следование/видимость меняются, а доля — нет) не нужен.
                                  if !isReflowScrubbing {
-                                     lastReportedFraction = f
-                                     reflowScrollFraction = f
+                                     if abs(lastReportedFraction - f) > 0.0005 { lastReportedFraction = f }
+                                     if abs(reflowScrollFraction - f) > 0.0005 { reflowScrollFraction = f }
                                  }
-                                 reflowTopChapter = ch
+                                 if reflowTopChapter != ch { reflowTopChapter = ch }
                                  // Кнопка возврата: пользователь сам увёл вид (не follow)
                                  // И подсветка вне центральной полосы области чтения.
                                  // При следовании вид сам держит текст в кадре — без гейта
                                  // кнопка мигала бы, когда подсветка у кромки экрана.
-                                 withAnimation { showReturnButton = !vis && !following }
+                                 let shouldShowReturn = !vis && !following
+                                 if showReturnButton != shouldShowReturn {
+                                     withAnimation { showReturnButton = shouldShowReturn }
+                                 }
                              },
                              command: reflowCommand,
                              theme: settings.readingTheme,

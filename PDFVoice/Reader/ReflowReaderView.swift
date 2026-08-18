@@ -199,6 +199,35 @@ struct ReflowReaderView: UIViewRepresentable {
         /// когда пользователь взялся за экран пальцем.
         var isAutoScrolling = false
 
+        /// Последний contentOffset.y, на котором выполнялась логика `reportScroll`
+        /// (П4). Дешёвый гейт ДО дорогих вычислений `computeTopChapter`/
+        /// `computeHighlightVisible`: микросдвиги на излёте инерции/долях пикселя
+        /// не могут заметно поменять ни долю прокрутки, ни главу, ни видимость
+        /// подсветки — считать их незачем. Сравнивается с последним РЕПОРТНУТЫМ
+        /// (не последним кадра) offset — обновляется ТОЛЬКО когда гейт пройден,
+        /// поэтому серия мелких кадров корректно НАКАПЛИВАЕТ сдвиг.
+        private var lastGateOffsetY: CGFloat?
+        /// Принудительно пропускает гейт на СЛЕДУЮЩИЙ вызов `reportScroll` —
+        /// выставляется перед программными переходами/сменой follow-режима, где
+        /// смещение contentOffset к моменту вызова может быть уже нулевым (жест
+        /// только начался, анимация только что осела), а также в конце драга/
+        /// инерции — см. `scrollViewDidEndDragging`/`scrollViewDidEndDecelerating`.
+        private var forceNextReport = false
+        /// Счётчик кадров скролла с последнего ПРОШЕДШЕГО гейт вычисления —
+        /// СТРАХОВКА параллельно с гейтом по смещению (QA нашёл регресс П4: при
+        /// реальном свайпе % / номер главы / кнопка возврата переставали
+        /// обновляться на всём протяжении жеста). Независимо от того, насколько
+        /// надёжен замер смещения по `contentOffset.y` в конкретных условиях
+        /// (скорость жеста, частота колбэков во время инерции), лимит на число
+        /// ПОДРЯД пропущенных кадров гарантирует прогресс: раз в 2 кадра дорогие
+        /// вычисления прогоняются В ЛЮБОМ случае, гейт по смещению остаётся лишь
+        /// быстрым путём для явно избыточных кадров.
+        private var framesSinceLastCompute = 0
+        /// Последний ДОСТАВЛЕННЫЙ наверх снимок — финальный дедуп самого колбэка.
+        /// `fraction` хранится как `CGFloat` (естественный тип выражения ниже) —
+        /// в `Double` конвертируется только на границе колбэка `onScroll`.
+        private var lastReport: (fraction: CGFloat, chapter: Int, visible: Bool, following: Bool)?
+
         init(_ parent: ReflowReaderView) {
             self.parent = parent
             self.lastText = parent.text
@@ -363,6 +392,10 @@ struct ReflowReaderView: UIViewRepresentable {
                 } completion: { [weak self] _ in
                     guard let self, let tv = self.textView else { return }
                     self.isReturning = false
+                    // Финальный кадр анимации может двигаться на доли пикселя —
+                    // но это «оседание» после isReturning=false обязано дойти
+                    // наверх (пересчитанная visible уже не форсирована в true).
+                    self.forceNextReport = true
                     self.reportScroll(tv)
                 }
             } else {
@@ -511,12 +544,41 @@ struct ReflowReaderView: UIViewRepresentable {
         }
 
         func reportScroll(_ tv: UITextView) {
+            let offsetY = tv.contentOffset.y
+            // Стадия 1 (дешёвая): гейт по смещению — быстрый путь, пропускающий
+            // дорогие вычисления, ПОКА накопленный сдвиг с последнего ПРОШЕДШЕГО
+            // (не предыдущего кадра!) гейта мал. Плюс страховка по числу подряд
+            // пропущенных кадров: даже если по каким-то причинам замер смещения
+            // не сработал бы как ожидается, раз в 2 кадра вычисления прогоняются
+            // безусловно — гарантирует прогресс, а не «зависание» на весь жест.
+            let movedEnough = lastGateOffsetY.map { abs(offsetY - $0) >= 1 } ?? true
+            if !forceNextReport && !movedEnough && framesSinceLastCompute < 2 {
+                framesSinceLastCompute += 1
+                return
+            }
+            forceNextReport = false
+            framesSinceLastCompute = 0
+            lastGateOffsetY = offsetY
+
             let minY = -tv.adjustedContentInset.top
             let maxY = max(minY + 1, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
-            let fraction = max(0, min(1, (tv.contentOffset.y - minY) / (maxY - minY)))
+            let fraction = max(0, min(1, (offsetY - minY) / (maxY - minY)))
             let topChapter = computeTopChapter(tv)
             let visible = isReturning ? true : computeHighlightVisible(tv)
             let isFollowing = self.isFollowing
+
+            // Стадия 2: финальный дедуп самого репорта — доля прокрутки меняется
+            // почти на каждый кадр на доли процента, отражать это в @State
+            // родителя (и гонять body ReaderScreen) незачем.
+            if let last = lastReport,
+               abs(fraction - last.fraction) < 0.002,
+               topChapter == last.chapter,
+               visible == last.visible,
+               isFollowing == last.following {
+                return
+            }
+            lastReport = (fraction, topChapter, visible, isFollowing)
+
             // Захват onScroll по значению (struct-замыкание): вычисления сделаны
             // синхронно, но ВЫЗОВ колбэка выносим за проход updateUIView — иначе
             // мутация @State родителя внутри рендера даёт «undefined behavior».
@@ -539,6 +601,27 @@ struct ReflowReaderView: UIViewRepresentable {
                 scrollView.layer.removeAllAnimations()
                 scrollView.setContentOffset(live, animated: false)
             }
+            // Переход в ручной режим важен сообщить сразу — contentOffset в этот
+            // момент мог ещё не сдвинуться ни на пиксель (палец только коснулся),
+            // гейт по смещению в reportScroll его бы проглотил.
+            forceNextReport = true
+            if let tv = scrollView as? UITextView { reportScroll(tv) }
+        }
+
+        /// Отпустили палец БЕЗ инерции (короткий/медленный жест) — конечная позиция
+        /// уже финальна, но последний кадр мог попасть под гейт по смещению
+        /// (QA-регресс П4: остановка ровно на границе гейта не давала финального
+        /// пересчёта visible/chapter). Форсим последний репорт явно.
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+            guard !decelerate else { return }
+            forceNextReport = true
+            if let tv = scrollView as? UITextView { reportScroll(tv) }
+        }
+
+        /// Инерция полностью остановилась — тот же случай, что выше, но для
+        /// жеста С инерцией: последний кадр деселерации мог не пройти гейт.
+        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            forceNextReport = true
             if let tv = scrollView as? UITextView { reportScroll(tv) }
         }
 
