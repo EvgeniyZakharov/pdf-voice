@@ -53,6 +53,14 @@ final class ReaderViewModel: ObservableObject {
     private var nowPlaying: NowPlayingController?
     private var totalPageCount: Int = 0
     private var backgroundTask: Task<Void, Never>?
+    /// Сохранённая позиция (`item.currentSentenceIndex`), которая на момент
+    /// `finishLoading` вышла за пределы первого загруженного батча предложений.
+    /// `SpeechEngine.load` клампит startIndex по тому, что уже загружено — без
+    /// этого поля позиция терялась бы, если пользователь жмёт ▶ до того, как
+    /// фоновая загрузка догонит сохранённый индекс. Сбрасывается либо когда
+    /// становится достижимым (`tryApplyPendingRestore`), либо на любое явное
+    /// действие пользователя (он сам выбрал новое место).
+    private var pendingRestoreIndex: Int?
     /// Полный исходный документ — источник страниц для displayDocument.
     private var sourceDoc: PDFDocument?
 
@@ -82,6 +90,11 @@ final class ReaderViewModel: ObservableObject {
         bookmarks = store.items.first(where: { $0.id == item.id })?.bookmarks ?? []
         speech.onIndexChange = { [weak self] index in
             guard let self else { return }
+            // Пока не применилось отложенное восстановление позиции, а событие
+            // пришло с индексом МЕНЬШЕ него — это озвучка префикса, догоняющего
+            // сохранённую позицию, а не пользователь слушающий книгу сначала.
+            // Не затираем сохранённый прогресс промежуточными индексами.
+            if let pending = self.pendingRestoreIndex, index < pending { return }
             self.store?.updateProgress(for: self.item.id, sentenceIndex: index)
         }
         speech.onFinishedAll = { [weak self] in
@@ -163,6 +176,7 @@ final class ReaderViewModel: ObservableObject {
     func seek(toFraction f: Double) {
         let n = speech.sentences.count
         guard n > 0 else { return }
+        clearPendingRestore()
         let idx = Int((f * Double(n - 1)).rounded())
         speech.seek(to: idx)
     }
@@ -170,7 +184,30 @@ final class ReaderViewModel: ObservableObject {
     /// Перейти к началу главы, сохранив play/pause.
     func seekToChapter(_ chapter: Int) {
         guard chapterFirstSentence.indices.contains(chapter) else { return }
+        clearPendingRestore()
         speech.seek(to: chapterFirstSentence[chapter])
+    }
+
+    // MARK: - Явные действия пользователя (сбрасывают pendingRestoreIndex)
+
+    /// Отменяет отложенное восстановление сохранённой позиции: пользователь сам
+    /// явно выбрал место (тап «Отсюда», skip, закладка, глава) — его выбор важнее.
+    private func clearPendingRestore() { pendingRestoreIndex = nil }
+
+    /// «Читать отсюда» (пузырёк в читалке).
+    func playFrom(_ index: Int) {
+        clearPendingRestore()
+        speech.play(from: index)
+    }
+
+    func skipForward() {
+        clearPendingRestore()
+        speech.skipForward()
+    }
+
+    func skipBackward() {
+        clearPendingRestore()
+        speech.skipBackward()
     }
 
     // MARK: - Растущий документ
@@ -307,7 +344,7 @@ final class ReaderViewModel: ObservableObject {
         let profile = profile
         let shouldDetect = needsLanguageDetection
 
-        Task {
+        backgroundTask = Task { [weak self] in
             let parsed: ReflowParse? = await Task.detached(priority: .userInitiated) {
                 guard let source = Self.reflowSource(for: format, url: url) else { return nil }
                 guard let content = try? source.parse(), !content.isEmpty else { return nil }
@@ -325,19 +362,23 @@ final class ReaderViewModel: ObservableObject {
                                    detectedLanguage: detected)
             }.value
 
+            guard !Task.isCancelled, let self else { return }
             guard let parsed, !parsed.sentences.isEmpty else {
-                loadError = "Не удалось извлечь текст из файла."
+                self.loadError = "Не удалось извлечь текст из файла."
                 return
             }
-            if let detected = parsed.detectedLanguage, needsLanguageDetection {
-                applyDetectedLanguage(detected)
+            if let detected = parsed.detectedLanguage, self.needsLanguageDetection {
+                self.applyDetectedLanguage(detected)
             }
 
-            bookContent = parsed.content
-            reflowFlatText = parsed.text
-            reflowChapterOffsets = parsed.chapterOffsets
-            totalPageCount = parsed.content.chapters.count
-            finishLoading(parsed.sentences)
+            self.bookContent = parsed.content
+            self.reflowFlatText = parsed.text
+            self.reflowChapterOffsets = parsed.chapterOffsets
+            self.totalPageCount = parsed.content.chapters.count
+            self.finishLoading(parsed.sentences)
+            // Reflow парсится и режется на предложения ЦЕЛИКОМ за один проход —
+            // прогрессивной догрузки для него нет, книга сразу полностью загружена.
+            self.speech.isFullyLoaded = true
         }
     }
 
@@ -376,6 +417,8 @@ final class ReaderViewModel: ObservableObject {
                 isLoadingRemainingPages = true
                 startBackgroundTextLoading(doc: doc, from: cached.loadedPageCount,
                                            totalPageCount: pageCount, prior: sentences)
+            } else {
+                speech.isFullyLoaded = true
             }
             return
         }
@@ -385,6 +428,7 @@ final class ReaderViewModel: ObservableObject {
             document = doc
             loadedPageCount = pageCount
             finishLoading(sentences)
+            speech.isFullyLoaded = true
             SentencePageCache.save(sentences: sentences, loadedPageCount: pageCount,
                                    totalPageCount: pageCount, for: item.fileName)
             return
@@ -402,12 +446,11 @@ final class ReaderViewModel: ObservableObject {
         let quickBoilerplate = TextPipeline.detectBoilerplate(
             pages: initialLines, pageCount: initialCount
         )
-        let savedIndex = item.currentSentenceIndex
         let fileName = item.fileName
         // Локальная копия для Task.detached (вне главного актора).
         let profile = profile
 
-        Task {
+        backgroundTask = Task { [weak self] in
             let initial = await Task.detached(priority: .userInitiated) {
                 PDFTextExtractor.extractSentences(
                     pageRange: 0..<initialCount,
@@ -417,20 +460,20 @@ final class ReaderViewModel: ObservableObject {
                 )
             }.value
 
-            document = doc
-            loadedPageCount = initialCount
-            finishLoading(initial)
+            guard !Task.isCancelled, let self else { return }
+            self.document = doc
+            self.loadedPageCount = initialCount
+            self.finishLoading(initial)
             SentencePageCache.save(sentences: initial, loadedPageCount: initialCount,
                                    totalPageCount: pageCount, for: fileName)
 
-            guard initialCount < pageCount else { return }
-            isLoadingRemainingPages = true
-            startBackgroundTextLoading(doc: doc, from: initialCount,
-                                       totalPageCount: pageCount, prior: initial)
-
-            if savedIndex >= initial.count, savedIndex < speech.sentences.count, !speech.isSpeaking {
-                speech.seekSilent(to: savedIndex)
+            guard initialCount < pageCount else {
+                self.speech.isFullyLoaded = true
+                return
             }
+            self.isLoadingRemainingPages = true
+            self.startBackgroundTextLoading(doc: doc, from: initialCount,
+                                            totalPageCount: pageCount, prior: initial)
         }
     }
 
@@ -438,11 +481,10 @@ final class ReaderViewModel: ObservableObject {
                                             totalPageCount: Int, prior: [Sentence]) {
         backgroundTask?.cancel()
         let fileName = item.fileName
-        let savedIndex = item.currentSentenceIndex
         // Локальная копия для Task.detached (вне главного актора).
         let profile = profile
 
-        backgroundTask = Task {
+        backgroundTask = Task { [weak self] in
             // Читаем строки страниц off main thread через GCD.
             let remainingLines: [[TextPipeline.PageLine]] = await withCheckedContinuation { cont in
                 DispatchQueue.global(qos: .background).async {
@@ -467,14 +509,9 @@ final class ReaderViewModel: ObservableObject {
             var batchStart = 0
 
             while batchStart < remainingLines.count {
-                if Task.isCancelled {
-                    let snap = allSentences; let loaded = startPage + batchStart
-                    Task.detached(priority: .background) {
-                        SentencePageCache.save(sentences: snap, loadedPageCount: loaded,
-                                              totalPageCount: totalPageCount, for: fileName)
-                    }
-                    return
-                }
+                // Отменённый таск (закрытие сессии/удаление книги) не должен
+                // пересоздавать кэш удалённой/закрытой книги — просто выходим.
+                guard !Task.isCancelled else { return }
 
                 let batchEnd = min(batchStart + batchSize, remainingLines.count)
 
@@ -489,9 +526,11 @@ final class ReaderViewModel: ObservableObject {
                     )
                 }.value
 
+                guard !Task.isCancelled, let self else { return }
                 allSentences.append(contentsOf: batch)
-                speech.appendSentences(batch)
-                loadedPageCount = startPage + batchEnd
+                self.speech.appendSentences(batch)
+                self.tryApplyPendingRestore()
+                self.loadedPageCount = startPage + batchEnd
 
                 // Сохранение off main thread — не блокируем UI.
                 let snap = allSentences; let loaded = startPage + batchEnd
@@ -503,11 +542,9 @@ final class ReaderViewModel: ObservableObject {
                 batchStart = batchEnd
             }
 
-            // Восстанавливаем позицию если она была за пределами начального батча.
-            if savedIndex >= prior.count, savedIndex < speech.sentences.count, !speech.isSpeaking {
-                speech.seekSilent(to: savedIndex)
-            }
-            isLoadingRemainingPages = false
+            guard !Task.isCancelled, let self else { return }
+            self.speech.isFullyLoaded = true
+            self.isLoadingRemainingPages = false
         }
     }
 
@@ -526,6 +563,8 @@ final class ReaderViewModel: ObservableObject {
                 isLoadingRemainingPages = true
                 runOCR(doc: doc, from: cached.loadedPageCount,
                        totalPageCount: pageCount, prior: sentences)
+            } else {
+                speech.isFullyLoaded = true
             }
             return
         }
@@ -540,7 +579,8 @@ final class ReaderViewModel: ObservableObject {
         let fileName = item.fileName
 
         backgroundTask?.cancel()
-        backgroundTask = Task {
+        backgroundTask = Task { [weak self] in
+            guard let self else { return }
             let initialCount = min(startPage + 15, totalPageCount)
 
             // У скана текстового слоя нет, образец брать неоткуда — распознаём
@@ -577,12 +617,14 @@ final class ReaderViewModel: ObservableObject {
                     self?.ocrProgress = overall * 0.2
                 }
 
+                guard !Task.isCancelled else { return }
                 let allInitial = prior + initial
                 if !prior.isEmpty || !initial.isEmpty {
                     if prior.isEmpty {
                         finishLoading(allInitial)
                     } else {
                         speech.appendSentences(initial)
+                        tryApplyPendingRestore()
                     }
                     loadedPageCount = initialCount
                     SentencePageCache.save(sentences: allInitial,
@@ -593,6 +635,7 @@ final class ReaderViewModel: ObservableObject {
                 guard initialCount < totalPageCount else {
                     ocrProgress = nil
                     isLoadingRemainingPages = false
+                    speech.isFullyLoaded = true
                     if allInitial.isEmpty {
                         loadError = "Не удалось распознать текст на страницах."
                     }
@@ -609,7 +652,7 @@ final class ReaderViewModel: ObservableObject {
                 var batchStart = initialCount
                 let batchSize = 15
                 while batchStart < totalPageCount {
-                    if Task.isCancelled { return }
+                    guard !Task.isCancelled else { return }
                     let batchEnd = min(batchStart + batchSize, totalPageCount)
                     let captureStart = batchStart
                     let batch = await OCRTextExtractor.sentences(
@@ -620,9 +663,13 @@ final class ReaderViewModel: ObservableObject {
                         let overall = 0.2 + Double(captureStart + done) / Double(totalPageCount) * 0.8
                         self?.ocrProgress = min(overall, 0.99)
                     }
-                    if Task.isCancelled { return }
+                    // Отменённый таск (закрытие сессии/удаление книги) не должен
+                    // пересоздавать кэш удалённой/закрытой книги — проверяем ПЕРЕД
+                    // append/save.
+                    guard !Task.isCancelled else { return }
                     allSentences.append(contentsOf: batch)
                     speech.appendSentences(batch)   // сначала аудио в плеер...
+                    tryApplyPendingRestore()
                     loadedPageCount = batchEnd       // ...потом показываем страницы (в синхроне)
                     SentencePageCache.save(sentences: allSentences,
                                           loadedPageCount: batchEnd,
@@ -632,6 +679,7 @@ final class ReaderViewModel: ObservableObject {
 
                 ocrProgress = nil
                 isLoadingRemainingPages = false
+                speech.isFullyLoaded = true
                 if allSentences.isEmpty {
                     loadError = "Не удалось распознать текст на страницах."
                 }
@@ -661,6 +709,8 @@ final class ReaderViewModel: ObservableObject {
                 isLoadingRemainingPages = true
                 startBackgroundMixedLoading(doc: doc, from: cached.loadedPageCount,
                                             totalPageCount: pageCount, prior: sentences)
+            } else {
+                speech.isFullyLoaded = true
             }
             return
         }
@@ -669,29 +719,28 @@ final class ReaderViewModel: ObservableObject {
         let initialCount = min(15, pageCount)
         let kinds = pageKinds
 
-        Task {
-            let initial = await processMixedPages(doc: doc, pageRange: 0..<initialCount,
-                                                  kinds: kinds, boilerplate: nil)
+        backgroundTask = Task { [weak self] in
+            let initial = await self?.processMixedPages(doc: doc, pageRange: 0..<initialCount,
+                                                        kinds: kinds, boilerplate: nil) ?? []
 
-            document = doc
-            loadedPageCount = initialCount
+            guard !Task.isCancelled, let self else { return }
+            self.document = doc
+            self.loadedPageCount = initialCount
             if initial.isEmpty && initialCount == pageCount {
-                loadError = "Не удалось распознать текст на страницах."
+                self.loadError = "Не удалось распознать текст на страницах."
                 return
             }
-            finishLoading(initial)
+            self.finishLoading(initial)
             SentencePageCache.save(sentences: initial, loadedPageCount: initialCount,
                                    totalPageCount: pageCount, for: fileName)
 
-            guard initialCount < pageCount else { return }
-            isLoadingRemainingPages = true
-            startBackgroundMixedLoading(doc: doc, from: initialCount,
-                                        totalPageCount: pageCount, prior: initial)
-
-            let savedIndex = item.currentSentenceIndex
-            if savedIndex >= initial.count, savedIndex < speech.sentences.count, !speech.isSpeaking {
-                speech.seekSilent(to: savedIndex)
+            guard initialCount < pageCount else {
+                self.speech.isFullyLoaded = true
+                return
             }
+            self.isLoadingRemainingPages = true
+            self.startBackgroundMixedLoading(doc: doc, from: initialCount,
+                                             totalPageCount: pageCount, prior: initial)
         }
     }
 
@@ -699,32 +748,28 @@ final class ReaderViewModel: ObservableObject {
                                              totalPageCount: Int, prior: [Sentence]) {
         backgroundTask?.cancel()
         let fileName = item.fileName
-        let savedIndex = item.currentSentenceIndex
         let kinds = pageKinds
 
-        backgroundTask = Task {
+        backgroundTask = Task { [weak self] in
             var allSentences = prior
             // OCR медленный — батчи меньше чем для текстового пути.
             let batchSize = 10
             var batchStart = startPage
 
             while batchStart < totalPageCount {
-                if Task.isCancelled {
-                    let snap = allSentences
-                    Task.detached(priority: .background) {
-                        SentencePageCache.save(sentences: snap, loadedPageCount: batchStart,
-                                              totalPageCount: totalPageCount, for: fileName)
-                    }
-                    return
-                }
+                // Отменённый таск (закрытие сессии/удаление книги) не должен
+                // пересоздавать кэш удалённой/закрытой книги — выходим без сохранения.
+                guard !Task.isCancelled else { return }
 
                 let batchEnd = min(batchStart + batchSize, totalPageCount)
-                let batch = await processMixedPages(doc: doc, pageRange: batchStart..<batchEnd,
-                                                    kinds: kinds, boilerplate: nil)
+                let batch = await self?.processMixedPages(doc: doc, pageRange: batchStart..<batchEnd,
+                                                           kinds: kinds, boilerplate: nil) ?? []
 
+                guard !Task.isCancelled, let self else { return }
                 allSentences.append(contentsOf: batch)
-                speech.appendSentences(batch)
-                loadedPageCount = batchEnd
+                self.speech.appendSentences(batch)
+                self.tryApplyPendingRestore()
+                self.loadedPageCount = batchEnd
 
                 let snap = allSentences
                 Task.detached(priority: .background) {
@@ -735,10 +780,9 @@ final class ReaderViewModel: ObservableObject {
                 batchStart = batchEnd
             }
 
-            if savedIndex >= prior.count, savedIndex < speech.sentences.count, !speech.isSpeaking {
-                speech.seekSilent(to: savedIndex)
-            }
-            isLoadingRemainingPages = false
+            guard !Task.isCancelled, let self else { return }
+            self.speech.isFullyLoaded = true
+            self.isLoadingRemainingPages = false
         }
     }
 
@@ -861,8 +905,26 @@ final class ReaderViewModel: ObservableObject {
             }
             chapterFirstSentence = mapping
         }
+        // Сохранённая позиция может быть дальше, чем этот (первый) батч
+        // предложений — SpeechEngine.load клампит startIndex по нему.
+        // Запоминаем цель, чтобы восстановить её, когда фоновая загрузка
+        // догонит (см. tryApplyPendingRestore).
+        pendingRestoreIndex = item.currentSentenceIndex >= sentences.count
+            ? item.currentSentenceIndex : nil
         speech.load(sentences: sentences, startIndex: item.currentSentenceIndex)
         nowPlaying = NowPlayingController(speech: speech, title: item.title)
+    }
+
+    /// Пытается применить отложенное восстановление позиции после того, как в
+    /// очередь добавился очередной батч предложений. Если пользователь уже сам
+    /// нажал play/выбрал место — не перетираем его текущую позицию, просто
+    /// снимаем отметку (он и так слушает там, где сам решил).
+    private func tryApplyPendingRestore() {
+        guard let target = pendingRestoreIndex, target < speech.sentences.count else { return }
+        if !speech.isSpeaking {
+            speech.seekSilent(to: target)
+        }
+        pendingRestoreIndex = nil
     }
 
     func togglePlayPause() { speech.togglePlayPause() }
@@ -876,9 +938,15 @@ final class ReaderViewModel: ObservableObject {
         store?.updateProgress(for: item.id, sentenceIndex: speech.currentIndex)
     }
 
+    /// Полное закрытие сессии чтения (✕ в мини-плеере, открытие другой книги,
+    /// удаление книги) — НЕ вызывается на простом уходе с экрана читалки, где
+    /// чтение продолжается в фоне через мини-плеер (см. `PlaybackCoordinator`,
+    /// который вызывает этот метод только при реальной смене/остановке сессии).
     func endSession() {
+        backgroundTask?.cancel()
+        backgroundTask = nil
         persistProgress()
-        speech.pause()
+        speech.shutdown()
         sleepTimer.cancel()
         nowPlaying?.teardown()
         nowPlaying = nil
@@ -908,6 +976,7 @@ final class ReaderViewModel: ObservableObject {
     }
 
     func navigate(to bm: Bookmark) {
+        clearPendingRestore()
         speech.play(from: bm.sentenceIndex)
     }
 }

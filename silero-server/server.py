@@ -81,10 +81,18 @@ def _synthesize(text: str, speaker: str) -> bytes:
             audio = model.apply_tts(text=text, speaker=speaker, sample_rate=SAMPLE_RATE)
         pcm = (audio.numpy() * 32767).astype(np.int16)
         return _wav_bytes(pcm)
+    except HTTPException:
+        # Уже осмысленная HTTP-ошибка (если появится выше) — не глушить.
+        raise
+    except MemoryError:
+        # Нехватка памяти — не маскировать тишиной, пусть процесс/оркестратор увидит сбой.
+        raise
     except Exception as exc:
-        # Любой сбой синтеза не должен ронять воспроизведение на клиенте.
-        print(f"Синтез не удался для {text!r}: {exc}")
-        return _silence()
+        # Реальный сбой синтеза: клиент должен узнать об этом (не-200), чтобы
+        # корректно откатиться на системный голос, а не подсвечивать текст под тишину.
+        # KeyboardInterrupt/SystemExit не Exception — сюда не попадают и пробрасываются сами.
+        print(f"Синтез не удался (len={len(text)}, speaker={speaker}): {exc}")
+        raise HTTPException(status_code=503, detail="tts synthesis failed")
 
 
 @app.post("/synthesize")

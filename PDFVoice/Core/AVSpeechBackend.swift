@@ -97,6 +97,10 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         }
         indexForUtterance.removeAll()
         windowEnd = -1
+        // Обнуляем замыкание рендера: оно захватывает SpeechEngine (пусть и слабо),
+        // но держать ссылку на устаревший рендер после stop() смысла нет — и это
+        // единственное место, где backend отпускает предыдущую очередь целиком.
+        currentRender = nil
     }
 
     func setSpeed(_ speed: Double) {

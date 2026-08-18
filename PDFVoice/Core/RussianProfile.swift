@@ -299,7 +299,9 @@ struct RussianProfile: LanguageProfile {
     static func integerToWords(_ digits: String) -> String {
         guard !digits.isEmpty else { return "" }
         if digits.count > 9 || Int(digits) == nil {
-            return digits.compactMap { $0.wholeNumberValue }.map { nDigit[$0] }.joined(separator: " ")
+            return digits.compactMap { $0.wholeNumberValue }
+                .compactMap { v in (0...9).contains(v) ? nDigit[v] : nil }
+                .joined(separator: " ")
         }
         let value = Int(digits)!
         if value == 0 { return "ноль" }
@@ -318,7 +320,9 @@ struct RussianProfile: LanguageProfile {
 
     private static func numberWords(_ digits: String) -> String {
         digits.count > 9
-            ? digits.compactMap { $0.wholeNumberValue }.map { nDigit[$0] }.joined(separator: " ")
+            ? digits.compactMap { $0.wholeNumberValue }
+                .compactMap { v in (0...9).contains(v) ? nDigit[v] : nil }
+                .joined(separator: " ")
             : integerToWords(digits)
     }
 
@@ -439,16 +443,16 @@ struct RussianProfile: LanguageProfile {
         var out = ""
         var i = 0
         while i < chars.count {
-            guard chars[i].isNumber else { out.append(chars[i]); i += 1; continue }
+            guard chars[i].isASCII && chars[i].isNumber else { out.append(chars[i]); i += 1; continue }
 
             var parts: [String] = []
             var seps: [Character] = []
             var cur = ""
             var j = i
             while j < chars.count {
-                if chars[j].isNumber {
+                if chars[j].isASCII && chars[j].isNumber {
                     cur.append(chars[j]); j += 1
-                } else if (chars[j] == "." || chars[j] == ",") && j + 1 < chars.count && chars[j + 1].isNumber {
+                } else if (chars[j] == "." || chars[j] == ",") && j + 1 < chars.count && chars[j + 1].isASCII && chars[j + 1].isNumber {
                     parts.append(cur); cur = ""; seps.append(chars[j]); j += 1
                 } else { break }
             }

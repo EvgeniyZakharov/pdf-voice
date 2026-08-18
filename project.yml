@@ -4,6 +4,9 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+configFiles:
+  Debug: Secrets.xcconfig
+  Release: Secrets.xcconfig
 settings:
   base:
     MARKETING_VERSION: "0.1.0"
@@ -37,6 +40,9 @@ targets:
           - audio
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Ключ Silero подставляется из Secrets.xcconfig (SILERO_API_KEY,
+        # не в git) — см. Secrets.xcconfig.example.
+        SileroAPIKey: $(SILERO_API_KEY)
         # Разрешаем незашифрованный HTTP только к локальной сети (Silero на
         # http://localhost:8000). ATS по умолчанию блокирует cleartext HTTP —
         # без этого исключения запрос к Silero не уходит. Произвольный HTTP в

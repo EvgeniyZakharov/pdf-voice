@@ -47,7 +47,10 @@ final class SettingsStore: ObservableObject {
     /// Продакшн-сервер Silero. Зашит в приложение — пользователь его не настраивает,
     /// подключение к улучшенным голосам происходит автоматически.
     let sileroServerURL = "https://tts.pdf-voice.com"
-    let sileroAPIKey    = "n8tJPX6qpWSpLH7GRNWwCCcb0JQoQCZX"
+    /// Из Info.plist (`SileroAPIKey`, подставляется из Secrets.xcconfig при сборке —
+    /// см. Secrets.xcconfig.example). Пустая строка при отсутствии ключа ведёт к
+    /// штатному офлайн-фолбэку на системный голос, а не к крашу.
+    let sileroAPIKey = Bundle.main.object(forInfoDictionaryKey: "SileroAPIKey") as? String ?? ""
 
     @Published var appearance: AppAppearance {
         didSet {

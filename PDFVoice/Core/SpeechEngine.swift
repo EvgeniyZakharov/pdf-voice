@@ -47,6 +47,17 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     /// Озвучка дошла до последнего предложения книги (для отметки «Закончено»).
     var onFinishedAll: (() -> Void)?
 
+    /// true, когда в `sentences` загружена ВСЯ книга (не только префикс прогрессивной
+    /// загрузки). Выставляется `ReaderViewModel` в момент, когда фоновая загрузка
+    /// завершена. Пока false, `finishedAll` от backend'а — это не «дочитано», а
+    /// «упёрлись в конец ещё не догруженного префикса» (см. `isStarved`).
+    var isFullyLoaded: Bool = false
+
+    /// Backend дочитал весь загруженный ПРЕФИКС предложений, пока книга ещё
+    /// грузится фоном («голодание»). `appendSentences` перезапускает воспроизведение
+    /// с этого места, когда придут новые предложения.
+    private var isStarved = false
+
     // MARK: - Silero-конфиг (сеттеры переключают active backend)
 
     var sileroServerURL: URL? = nil {
@@ -129,8 +140,15 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
                 self.currentIndex = i
                 self.onIndexChange?(i)
             case .finishedAll:
-                self.isSpeaking = false
-                self.onFinishedAll?()
+                if self.isFullyLoaded {
+                    self.isSpeaking = false
+                    self.onFinishedAll?()
+                } else {
+                    // Книга ещё грузится фоном — backend упёрся в конец загруженного
+                    // префикса, это не конец книги. Не гасим isSpeaking (намерение
+                    // играть сохраняется), ждём appendSentences.
+                    self.isStarved = true
+                }
             case .failed(let i):
                 self.fallBackToSystemVoice(from: i)
             }
@@ -187,12 +205,21 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         stop()
         self.sentences = sentences
         currentIndex = clamp(startIndex)
+        isFullyLoaded = false
+        isStarved = false
     }
 
     func appendSentences(_ newSentences: [Sentence]) {
         guard !newSentences.isEmpty else { return }
         sentences.append(contentsOf: newSentences)
-        active.append(sentences: newSentences, render: render(_:))
+        active.append(sentences: newSentences, render: renderClosure)
+        if isStarved {
+            // currentIndex — последнее ПОЛНОСТЬЮ прозвучавшее предложение (didStart
+            // на него уже пришёл, backend доиграл его и упёрся в конец префикса).
+            // Продолжаем со следующего, чтобы не повторить и не пропустить.
+            isStarved = false
+            play(from: currentIndex + 1)
+        }
     }
 
     func play(from index: Int) {
@@ -201,7 +228,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         activateAudioSession()
         isSpeaking = true
         active.play(sentences: sentences, from: currentIndex,
-                    speed: speed, render: render(_:))
+                    speed: speed, render: renderClosure)
     }
 
     func pause() {
@@ -219,6 +246,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     }
 
     func resume() {
+        guard !sentences.isEmpty else { return }
         // Категория .playback нужна для фона/экрана блокировки. Раньше её ставил
         // только play(from:), а старт Silero через большую кнопку Play идёт по
         // resume() → звук оставался в дефолтной soloAmbient и глох при сворачивании.
@@ -230,7 +258,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
                 sileroBackend.resume()
             } else {
                 active.play(sentences: sentences, from: currentIndex,
-                            speed: speed, render: render(_:))
+                            speed: speed, render: renderClosure)
             }
         } else {
             // AVSpeech: если синтезатор на паузе — продолжаем; иначе — play с начала.
@@ -252,9 +280,31 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         isSpeaking = false
     }
 
+    /// Полное завершение сессии (не просто пауза): останавливает звук и
+    /// деактивирует аудиосессию, чтобы приложение отпустило её (иначе «зомби»-сессия
+    /// продолжает реагировать на прерывания/Now Playing после закрытия читалки).
+    /// Вызывать только на явном закрытии сессии (✕ в мини-плеере, открытие другой
+    /// книги) — НЕ на простом уходе с экрана читалки, где чтение должно продолжаться
+    /// в фоне через мини-плеер.
+    func shutdown() {
+        stop()
+        if let token = interruptionObserver {
+            NotificationCenter.default.removeObserver(token)
+            interruptionObserver = nil
+        }
+        if let token = foregroundObserver {
+            NotificationCenter.default.removeObserver(token)
+            foregroundObserver = nil
+        }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
     // MARK: - Навигация
 
-    func skipForward()  { play(from: currentIndex + 1) }
+    func skipForward()  {
+        guard currentIndex + 1 < sentences.count else { return }
+        play(from: currentIndex + 1)
+    }
     func skipBackward() { play(from: currentIndex - 1) }
 
     /// Перейти к предложению, сохранив текущее play/pause.
@@ -287,8 +337,16 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     private func render(_ s: Sentence) -> SpokenMarkup {
         let m = profile.render(s.rawText)
         return m.text.trimmingCharacters(in: .whitespaces).isEmpty
-            ? SpokenMarkup(text: " ", stresses: [])
+            ? SpokenMarkup(text: "", stresses: [])
             : m
+    }
+
+    /// Замыкание с ленивым захватом self, передаваемое backend'ам как `render`.
+    /// Backend'ы хранят его (`currentRender`) на всё время жизни очереди — сильный
+    /// захват `render(_:)`-референса держал бы SpeechEngine живым, пока backend не
+    /// обнулит `currentRender` (что раньше не происходило в `stop()`), т.е. навсегда.
+    private var renderClosure: (Sentence) -> SpokenMarkup {
+        { [weak self] s in self?.render(s) ?? SpokenMarkup(text: "", stresses: []) }
     }
 
     // MARK: - Вспомогательные

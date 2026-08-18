@@ -75,6 +75,9 @@ final class SileroBackend: SpeechBackend {
         audioPlayer?.stop()
         audioPlayer = nil
         isPausedMidClip = false
+        // См. AVSpeechBackend.stop(): отпускаем замыкание рендера, чтобы не
+        // держать (пусть и слабую) ссылку на устаревшую очередь дольше нужного.
+        currentRender = nil
     }
 
     func setSpeed(_ speed: Double) {
@@ -110,15 +113,32 @@ final class SileroBackend: SpeechBackend {
         return String(decoding: utf16, as: UTF16.self)
     }
 
+    /// Результат подготовки клипа: либо аудио, либо «рендер пуст — сетевого
+    /// запроса не было» (например, предложение-ссылка вырезана `stripLinks`).
+    private enum AudioFetchResult {
+        case data(Data)
+        case empty
+    }
+
     private func runQueue(from startIndex: Int) async {
-        func prefetch(_ index: Int) -> Task<Data, Error>? {
+        // Пустая очередь: не слать finishedAll — координатору нечего было играть,
+        // это не «дочитали книгу».
+        guard !currentSentences.isEmpty else { return }
+
+        func prefetch(_ index: Int) -> Task<AudioFetchResult, Error>? {
             guard currentSentences.indices.contains(index),
                   let render = currentRender else { return nil }
             let markup = render(currentSentences[index])
+            let trimmed = markup.text.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else {
+                // Явная аннотация типа: без неё компилятор выводит Task<_, Never>
+                // (замыкание не throws), а объявленный тип функции — Task<_, Error>.
+                return Task<AudioFetchResult, Error> { .empty }
+            }
             let text = SileroBackend.applyStresses(markup)
             return Task.detached { [weak self] in
                 guard let self else { throw CancellationError() }
-                return try await self.fetchAudio(text)
+                return .data(try await self.fetchAudio(text))
             }
         }
 
@@ -131,30 +151,50 @@ final class SileroBackend: SpeechBackend {
             }
             self.queueIndex = i
             onEvent?(.didStart(i))
-            let data: Data
+            let result: AudioFetchResult
             do {
-                data = try await current.value
+                result = try await current.value
             } catch is CancellationError {
                 return
+            } catch SileroFetchError.contentRejected(let code) {
+                // 4xx (кроме 429) — контентная ошибка (например, сервер не принял
+                // пустой/невалидный текст после раскрытия предложения), а не сбой
+                // сервиса. НЕ повод откатываться на системный голос — пропускаем
+                // это предложение и продолжаем очередь тем же backend'ом.
+                #if DEBUG
+                print("Silero: sentence \(i) rejected by server (\(code)), skipping")
+                #endif
+                i += 1
+                pending = prefetch(i)
+                continue
             } catch {
-                // Сервер недоступен/ответил ошибкой → координатор откатится на
-                // системный голос с этого предложения. На отмене (stop/переключение
-                // backend'а) — молчим, иначе откат сработал бы ложно.
+                // Сеть/5xx → координатор откатится на системный голос с этого
+                // предложения. На отмене (stop/переключение backend'а) — молчим,
+                // иначе откат сработал бы ложно.
                 if !Task.isCancelled { onEvent?(.failed(i)) }
                 return
             }
             guard !Task.isCancelled else { return }
             pending = prefetch(i + 1)
-            do {
+
+            switch result {
+            case .empty:
+                // Рендер дал пустой текст — без сетевого запроса, просто
+                // выдерживаем паузу между предложениями и идём дальше.
                 let extra = currentSentences[i].isHeading ? headingPause : 0
-                try await playAndWait(data, extraPause: extra)
-            } catch is CancellationError {
-                pending?.cancel()
-                return
-            } catch {
-                // Данные не сложились в аудио — пропускаем предложение, не глушим очередь.
-                i += 1
-                continue
+                let pauseAfter = max(0, pauseBetweenSentences) + max(0, extra)
+                do { try await Task.sleep(nanoseconds: UInt64(pauseAfter * 1_000_000_000)) }
+                catch { return }
+            case .data(let data):
+                do {
+                    let extra = currentSentences[i].isHeading ? headingPause : 0
+                    try await playAndWait(data, extraPause: extra)
+                } catch is CancellationError {
+                    pending?.cancel()
+                    return
+                } catch {
+                    // Данные не сложились в аудио — пропускаем предложение, не глушим очередь.
+                }
             }
             i += 1
         }
@@ -166,6 +206,13 @@ final class SileroBackend: SpeechBackend {
     private struct SileroRequest: Encodable {
         let text: String
         let speaker: String
+    }
+
+    /// Контентная ошибка сервера (4xx, кроме 429) — сервер отверг конкретный
+    /// текст, а не недоступен. Не повод для отката на системный голос
+    /// (см. `runQueue`), в отличие от сетевых ошибок/5xx.
+    private enum SileroFetchError: Error {
+        case contentRejected(Int)
     }
 
     private func fetchAudio(_ text: String) async throws -> Data {
@@ -181,19 +228,25 @@ final class SileroBackend: SpeechBackend {
         req.httpBody = try JSONEncoder().encode(SileroRequest(text: text, speaker: speaker))
 
         // Ретраи с бэкоффом на ТРАНЗИЕНТНЫХ сбоях (таймаут, обрыв соединения,
-        // фон-throttling сети, 5xx). Иначе одна временная ошибка (свернул приложение,
-        // другой звук перехватил сеть) → .failed → откат на системный голос. Фатальные
-        // ошибки (401/403/404 — неверный ключ/адрес) НЕ ретраим — сразу пробрасываем.
+        // фон-throttling сети, 5xx, 429 — rate limit). Иначе одна временная ошибка
+        // (свернул приложение, другой звук перехватил сеть) → .failed → откат на
+        // системный голос. Фатальные ошибки (401/403/404 — неверный ключ/адрес,
+        // либо контент, который сервер не принял) НЕ ретраим — сразу пробрасываем,
+        // 4xx (кроме 429) — как контентную ошибку, не сетевую.
         let maxAttempts = 3
         var attempt = 0
         while true {
             do {
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                    if (500...599).contains(http.statusCode), attempt < maxAttempts - 1 {
+                    let retryableStatus = (500...599).contains(http.statusCode) || http.statusCode == 429
+                    if retryableStatus, attempt < maxAttempts - 1 {
                         attempt += 1
                         try await Task.sleep(nanoseconds: UInt64(Double(attempt) * 0.8 * 1_000_000_000))
                         continue
+                    }
+                    if (400...499).contains(http.statusCode), http.statusCode != 429 {
+                        throw SileroFetchError.contentRejected(http.statusCode)
                     }
                     throw URLError(.badServerResponse)
                 }

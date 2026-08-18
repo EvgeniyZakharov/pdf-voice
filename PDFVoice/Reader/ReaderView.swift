@@ -630,7 +630,7 @@ private struct ReaderScreen: View {
     /// защищает от двойного срабатывания, если сработали оба.
     private func playFromBubble() {
         guard let index = pendingIndex else { return }
-        model.speech.play(from: index)
+        model.playFrom(index)
         withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
         // После «Читать отсюда» возобновляем следование — вид должен ехать
         // за новой позицией чтения, а не оставаться там, где пользователь тапнул.
@@ -750,13 +750,13 @@ private struct PlayerControls: View {
             speedMenu
                 .frame(maxWidth: .infinity)
             skipButton("backward.end.fill", label: "Предыдущее предложение") {
-                speech.skipBackward()
+                model.skipBackward()
             }
             .frame(maxWidth: .infinity)
             playButton
                 .frame(maxWidth: .infinity)
             skipButton("forward.end.fill", label: "Следующее предложение") {
-                speech.skipForward()
+                model.skipForward()
             }
             .frame(maxWidth: .infinity)
         }

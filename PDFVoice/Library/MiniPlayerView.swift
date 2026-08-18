@@ -47,6 +47,7 @@ struct MiniPlayerView: View {
                     // Кликабельна вся площадь 44×44, а не только пиксели глифа.
                     .contentShape(Rectangle())
             }
+            .disabled(speech.sentences.isEmpty)
             .accessibilityLabel(speech.isSpeaking ? "Пауза" : "Играть")
 
             Button(action: onClose) {
