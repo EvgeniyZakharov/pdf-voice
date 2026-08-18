@@ -30,10 +30,17 @@ enum AppAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 final class SettingsStore: ObservableObject {
     private let ud = UserDefaults.standard
 
     @Published var pauseBetweenSentences: Double { didSet { ud.set(pauseBetweenSentences, forKey: "pv.pause") } }
+
+    /// Скорость озвучки (множитель, 1.0 = обычная речь). Глобальная (не по-книжная):
+    /// пишется обратно сюда из `SpeechEngine.onSpeedChange`, когда пользователь меняет
+    /// темп в плеере читалки (см. `ReaderViewModel`), и применяется к каждой новой
+    /// открытой сессии в `applySettings`.
+    @Published var playbackSpeed: Double { didSet { ud.set(playbackSpeed, forKey: "pv.playbackSpeed") } }
 
     /// Голос для РУССКИХ книг: "sys:<identifier>" (системный) или "silero:<speaker>".
     /// Ключ хранения прежний — миграция не нужна, русский остаётся основным языком.
@@ -71,6 +78,7 @@ final class SettingsStore: ObservableObject {
 
     init() {
         pauseBetweenSentences = ud.object(forKey: "pv.pause") as? Double ?? 0.3
+        playbackSpeed         = ud.object(forKey: "pv.playbackSpeed") as? Double ?? 1.0
         // sanitized: выбор, сохранённый до сокращения списка голосов (kseniya,
         // aidar, baya, системные кроме Милены), заменяется голосом по умолчанию.
         selectedVoice         = VoiceCatalog.sanitized(ud.string(forKey: "pv.selectedVoice")

@@ -3,9 +3,23 @@ import SwiftUI
 /// Компактный лист регулировки размера шрифта reflow-текста (кнопка «Aa» в
 /// правом верхнем углу читалки). Меняет `SettingsStore.readingFontSize` — текст
 /// перевёрстывается на лету. PDF этот контрол не показывает.
+///
+/// Пересборка `ReflowReaderView.attributedText` на смену шрифта — недешёвая
+/// операция на большой книге (полный `ensureLayout`), поэтому биндинг наружу
+/// (`fontSize`) коммитится НЕ на каждый тик слайдера, а на отпускание пальца
+/// (`onEditingChanged(false)`) — как в `pageBar`/`reflowBar`. Кнопки ± коммитят
+/// сразу: это единичные дискретные события, а не поток кадров драга.
 struct FontSizeSheet: View {
     @Binding var fontSize: Double
+    /// Живое значение для превью текста внутри листа — двигается на каждый тик
+    /// слайдера, независимо от коммита наружу.
+    @State private var liveValue: Double
     @Environment(\.dismiss) private var dismiss
+
+    init(fontSize: Binding<Double>) {
+        self._fontSize = fontSize
+        self._liveValue = State(initialValue: fontSize.wrappedValue)
+    }
 
     private var range: ClosedRange<Double> { SettingsStore.fontSizeRange }
 
@@ -13,24 +27,28 @@ struct FontSizeSheet: View {
         VStack(spacing: 20) {
             // Живой образец текущего размера.
             Text("Пример текста")
-                .font(.system(size: fontSize))
+                .font(.system(size: liveValue))
                 .frame(maxWidth: .infinity, minHeight: 60)
                 .padding(.horizontal)
 
             HStack(spacing: 16) {
                 stepButton("textformat.size.smaller", label: "Мельче") {
-                    fontSize = max(range.lowerBound, (fontSize - 1).rounded())
+                    liveValue = max(range.lowerBound, (liveValue - 1).rounded())
+                    fontSize = liveValue
                 }
-                Text("\(Int(fontSize)) pt")
+                Text("\(Int(liveValue)) pt")
                     .font(.headline.monospacedDigit())
                     .frame(minWidth: 64)
                 stepButton("textformat.size.larger", label: "Крупнее") {
-                    fontSize = min(range.upperBound, (fontSize + 1).rounded())
+                    liveValue = min(range.upperBound, (liveValue + 1).rounded())
+                    fontSize = liveValue
                 }
             }
 
-            Slider(value: $fontSize, in: range, step: 1)
-                .padding(.horizontal)
+            Slider(value: $liveValue, in: range, step: 1) { editing in
+                if !editing { fontSize = liveValue }
+            }
+            .padding(.horizontal)
         }
         .padding(24)
         .presentationDetents([.height(240)])

@@ -98,10 +98,16 @@ enum OCRTextExtractor {
             let pageRect = page.bounds(for: .mediaBox)
 
             let lines = entries.map { $0.line }
+            let dropped = TextPipeline.droppedIndices(lines: lines, boilerplate: boilerplate)
 
             // Диапазоны UTF-16 каждой строки в синтетической строке страницы
             // (нужны для сопоставления с origIndex после cleanPage).
             // lineInfos[i]: полуоткрытый интервал [start, end), кандидат Vision и полный бокс.
+            // Строки из `dropped` (колонтитул/мусор/номер страницы) сюда не попадают —
+            // иначе их UTF-16-диапазон мог пересечься с диапазоном соседнего предложения
+            // (после cleanPage мусорная строка просто выпадает из текста, но её исходный
+            // интервал остаётся «висеть» рядом с оставшимися строками) и в подсветку
+            // предложения подмешивался бы бокс строки, которая вообще не звучит.
             struct LineInfo {
                 let start: Int
                 let end: Int
@@ -110,7 +116,7 @@ enum OCRTextExtractor {
             }
             var lineInfos: [LineInfo] = []
             lineInfos.reserveCapacity(entries.count)
-            for entry in entries {
+            for (i, entry) in entries.enumerated() where !dropped.contains(i) {
                 lineInfos.append(LineInfo(
                     start: entry.line.startUTF16,
                     end: entry.line.startUTF16 + entry.utf16Len,
@@ -119,31 +125,16 @@ enum OCRTextExtractor {
                 ))
             }
 
-            let dropped = TextPipeline.droppedIndices(lines: lines, boilerplate: boilerplate)
             let (cleaned, origIndex) = TextPipeline.cleanPage(lines, dropped: dropped)
             guard !cleaned.isEmpty else { continue }
 
-            let cleanedUnits = Array(cleaned.utf16)
-
-            for range in profile.sentenceRanges(in: cleaned) {
-                let ns = NSRange(range, in: cleaned)
-                guard ns.length > 0 else { continue }
-
-                // Обрезаем пробелы по краям (в координатах чистого текста).
-                var lo = ns.location
-                var hi = ns.location + ns.length - 1
-                while lo <= hi, cleanedUnits[lo] == 0x20 { lo += 1 }
-                while hi >= lo, cleanedUnits[hi] == 0x20 { hi -= 1 }
-                guard lo <= hi else { continue }
-
-                let rawText = String(utf16CodeUnits: Array(cleanedUnits[lo...hi]), count: hi - lo + 1)
-                guard !rawText.isEmpty else { continue }
-
-                let heading = profile.isHeading(rawText)
+            for tok in PDFTextExtractor.tokenize(cleaned: cleaned, origIndex: origIndex, profile: profile) {
+                let rawText = tok.rawText
+                let heading = tok.isHeading
 
                 // Исходный UTF-16-диапазон предложения через origIndex.
-                let oLo = origIndex[lo]
-                let oHi = origIndex[hi]   // последний символ включительно
+                let oLo = tok.oLo
+                let oHi = tok.oHi   // последний символ включительно
 
                 // Собираем под-строчные боксы для каждой строки, пересекающейся с [oLo, oHi].
                 var boxes: [CGRect] = []

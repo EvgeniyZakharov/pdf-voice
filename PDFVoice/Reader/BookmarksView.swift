@@ -35,7 +35,7 @@ struct BookmarksView: View {
                                         .lineLimit(2)
                                         .foregroundStyle(.primary)
                                     HStack {
-                                        Text("Страница \(bm.pageIndex + 1)")
+                                        Text(locationLabel(for: bm))
                                         Spacer()
                                         Text(bm.createdAt.formatted(date: .abbreviated, time: .shortened))
                                     }
@@ -63,5 +63,15 @@ struct BookmarksView: View {
                 }
             }
         }
+    }
+
+    /// В reflow `bm.pageIndex` — индекс ГЛАВЫ (см. `Sentence.pageIndex` для
+    /// reflow-пути), не номер страницы: подпись «Страница N» там вводила в
+    /// заблуждение. Название главы берём из `chapterTitles` (уже содержит
+    /// фолбэк «Глава N» для безымянных глав).
+    private func locationLabel(for bm: Bookmark) -> String {
+        guard model.isReflowable else { return "Страница \(bm.pageIndex + 1)" }
+        let titles = model.chapterTitles
+        return titles.indices.contains(bm.pageIndex) ? titles[bm.pageIndex] : "Глава \(bm.pageIndex + 1)"
     }
 }

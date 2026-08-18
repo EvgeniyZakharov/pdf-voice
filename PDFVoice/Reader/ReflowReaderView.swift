@@ -81,7 +81,9 @@ struct ReflowReaderView: UIViewRepresentable {
         tv.backgroundColor = theme.pageBackgroundUI
         tv.alwaysBounceVertical = true
         tv.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 48, right: 20)
-        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize, sentences: sentences, chapterOffsets: chapterOffsets)
+        context.coordinator.rebuildIndex()
+        tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize,
+                                                        headingRanges: context.coordinator.headingRanges)
         context.coordinator.lastTheme = theme
         context.coordinator.lastFontSize = fontSize
         // Coordinator становится делегатом скролла для детекта ручного взаимодействия.
@@ -105,19 +107,27 @@ struct ReflowReaderView: UIViewRepresentable {
 
         if context.coordinator.lastText != text {
             context.coordinator.lastText = text
-            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize, sentences: sentences, chapterOffsets: chapterOffsets)
+            context.coordinator.rebuildIndex()
+            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize,
+                                                            headingRanges: context.coordinator.headingRanges)
             context.coordinator.resetHighlightTracking()
         }
 
-        // Смена темы чтения ИЛИ размера шрифта на лету: перекраска/перевёрстка текста.
-        // Re-attribute сбрасывает подсветку — обнуляем трекинг, чтобы блок ниже
-        // применил её заново нужным цветом.
-        if context.coordinator.lastTheme != theme || context.coordinator.lastFontSize != fontSize {
+        // Смена ТЕМЫ страницы: точечная перекраска текста/подсветки БЕЗ пересборки
+        // attributedText — полная пересборка на большой книге теряла бы позицию
+        // прокрутки (TextKit 1 занижает contentSize до релэйаута).
+        if context.coordinator.lastTheme != theme {
             context.coordinator.lastTheme = theme
+            context.coordinator.recolor(theme: theme)
+        }
+
+        // Смена РАЗМЕРА ШРИФТА: пересборка неизбежна (глифы другой ширины), но
+        // позиция прокрутки восстанавливается по символьному индексу верха
+        // вьюпорта, независимо от isFollowing — иначе смена шрифта на паузе
+        // роняла бы вид в начало книги.
+        if context.coordinator.lastFontSize != fontSize {
             context.coordinator.lastFontSize = fontSize
-            tv.backgroundColor = theme.pageBackgroundUI
-            tv.attributedText = Coordinator.makeAttributed(text, color: theme.pageTextUI, fontSize: fontSize, sentences: sentences, chapterOffsets: chapterOffsets)
-            context.coordinator.resetHighlightTracking()
+            context.coordinator.rebuildForFontChange(fontSize: fontSize)
         }
 
         // Команда от родителя (слайдер или кнопка возврата). Применяем при смене токена.
@@ -151,11 +161,21 @@ struct ReflowReaderView: UIViewRepresentable {
                     }
                 case .scrollToChapter(let ch, _):
                     // Переход позиции чтения: вид следует за новой подсветкой,
-                    // play/pause сохраняется методом seekToChapter.
+                    // play/pause сохраняется методом seekToChapter. seekToChapter
+                    // выше (ReaderView) меняет speech.currentIndex В ТОЙ ЖЕ
+                    // транзакции — highlight ниже в этом же проходе updateUIView
+                    // почти всегда УЖЕ новый, и applyHighlight сама доведёт вид
+                    // через followHighlight (isFollowing=true). Скроллим здесь
+                    // САМИ только если предложение НЕ сменилось (например,
+                    // повторный выбор уже текущей главы) — иначе applyHighlight
+                    // не переприменится (её guard по lastHighlightID), и без
+                    // этой ветки вид остался бы там, где его оставил пользователь.
                     context.coordinator.isFollowing = true
-                    let offsets = chapterOffsets
-                    if offsets.indices.contains(ch) {
-                        context.coordinator.scrollCharToTop(offsets[ch], animated: false)
+                    if highlight?.id == context.coordinator.lastHighlightID {
+                        let offsets = chapterOffsets
+                        if offsets.indices.contains(ch) {
+                            context.coordinator.scrollCharToTop(offsets[ch], animated: false)
+                        }
                     }
                     context.coordinator.reportScroll(tv)
                 }
@@ -188,6 +208,15 @@ struct ReflowReaderView: UIViewRepresentable {
         var lastTheme: ReadingTheme = .sepia
         /// Последний применённый размер шрифта — для перевёрстки при смене.
         var lastFontSize: CGFloat = 19
+        /// Диапазоны заголовков (`isHeading`) — предрассчитаны ОДИН раз в
+        /// `rebuildIndex()` (при смене текста книги), а не циклом по всем
+        /// предложениям на каждую пересборку `attributedText` (смена шрифта).
+        var headingRanges: [NSRange] = []
+        /// Диапазоны ВСЕХ предложений + их индекс в `parent.sentences`,
+        /// отсортированные по положению в тексте (порядок извлечения уже такой) —
+        /// для бинарного поиска ближайшего предложения на тап (`closestSentenceIndex`).
+        /// Пересчитывается вместе с `headingRanges` в `rebuildIndex()`.
+        private var indexedRanges: [(range: NSRange, sentenceIndex: Int)] = []
         /// Активно ли следование вида за текущим предложением.
         var isFollowing = true
         /// Токен последней применённой команды (дедупликация в updateUIView).
@@ -262,8 +291,12 @@ struct ReflowReaderView: UIViewRepresentable {
             return viewportY >= parent.readingMinY && viewportY <= parent.readingMaxY
         }
 
+        /// `headingRanges` — предрассчитанные диапазоны заголовков (`rebuildIndex`),
+        /// а не сырые `sentences`/`chapterOffsets`: цикл по ВСЕМ предложениям
+        /// раньше повторялся на КАЖДУЮ пересборку (в т.ч. на каждый тик слайдера
+        /// шрифта), хотя набор заголовков меняется только вместе с текстом книги.
         static func makeAttributed(_ text: String, color: UIColor, fontSize: CGFloat,
-                                   sentences: [Sentence], chapterOffsets: [Int]) -> NSAttributedString {
+                                   headingRanges: [NSRange]) -> NSAttributedString {
             let para = NSMutableParagraphStyle()
             para.lineSpacing = 5
             para.paragraphSpacing = 10
@@ -280,13 +313,7 @@ struct ReflowReaderView: UIViewRepresentable {
             headingPara.paragraphSpacing = 8
             headingPara.paragraphSpacingBefore = 18
             let headingFont = UIFont.systemFont(ofSize: fontSize + 5, weight: .bold)
-            let total = (text as NSString).length
-            for s in sentences where s.isHeading {
-                guard chapterOffsets.indices.contains(s.pageIndex) else { continue }
-                let base = chapterOffsets[s.pageIndex] + (s.charOffset ?? 0)
-                let len = (s.rawText as NSString).length
-                guard base >= 0, len > 0, base + len <= total else { continue }
-                let range = NSRange(location: base, length: len)
+            for range in headingRanges {
                 result.addAttribute(.font, value: headingFont, range: range)
                 result.addAttribute(.paragraphStyle, value: headingPara, range: range)
             }
@@ -301,6 +328,121 @@ struct ReflowReaderView: UIViewRepresentable {
             let total = (parent.text as NSString).length
             guard base >= 0, len > 0, base + len <= total else { return nil }
             return NSRange(location: base, length: len)
+        }
+
+        /// Пересчитывает `headingRanges`/`indexedRanges` из `parent.sentences` —
+        /// вызывать ТОЛЬКО при смене текста книги (полная пересборка вьюшки).
+        /// Порядок `parent.sentences` уже совпадает с порядком текста (экстракторы
+        /// строят предложения последовательно), поэтому `indexedRanges` не
+        /// нуждается в отдельной сортировке под бинарный поиск.
+        func rebuildIndex() {
+            var ranges: [(range: NSRange, sentenceIndex: Int)] = []
+            ranges.reserveCapacity(parent.sentences.count)
+            var headings: [NSRange] = []
+            for (i, s) in parent.sentences.enumerated() {
+                guard let range = globalRange(for: s) else { continue }
+                ranges.append((range, i))
+                if s.isHeading { headings.append(range) }
+            }
+            indexedRanges = ranges
+            headingRanges = headings
+        }
+
+        /// Ближайшее к `charIndex` предложение (бинарный поиск по отсортированным
+        /// непересекающимся диапазонам `indexedRanges`): точное попадание либо
+        /// один из двух соседей на границе (предыдущий/следующий) — минимум
+        /// дистанции до множества непересекающихся интервалов всегда достигается
+        /// на одном из них. Сохраняет прежнюю семантику линейного перебора
+        /// («ближайшее предложение на зазорах \n\n между абзацами/главами»).
+        func closestSentenceIndex(for charIndex: Int) -> Int? {
+            guard !indexedRanges.isEmpty else { return nil }
+            var lo = 0, hi = indexedRanges.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if indexedRanges[mid].range.location <= charIndex {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            func distance(to range: NSRange) -> Int {
+                if NSLocationInRange(charIndex, range) { return 0 }
+                if charIndex < range.location { return range.location - charIndex }
+                return charIndex - (range.location + range.length - 1)
+            }
+            var best: (index: Int, distance: Int)?
+            if lo > 0 {
+                let entry = indexedRanges[lo - 1]
+                best = (entry.sentenceIndex, distance(to: entry.range))
+            }
+            if lo < indexedRanges.count {
+                let entry = indexedRanges[lo]
+                let d = distance(to: entry.range)
+                if best == nil || d < best!.distance { best = (entry.sentenceIndex, d) }
+            }
+            return best?.index
+        }
+
+        /// Символьный индекс у самого верха вьюпорта (первый видимый символ) —
+        /// «якорь» для восстановления позиции прокрутки после пересборки текста
+        /// на новый размер шрифта (см. `rebuildForFontChange`).
+        private func topCharacterIndex(_ tv: UITextView) -> Int {
+            let point = CGPoint(x: tv.textContainerInset.left + 1,
+                                y: tv.contentOffset.y + tv.adjustedContentInset.top + 1)
+            guard let pos = tv.closestPosition(to: point) else { return 0 }
+            return tv.offset(from: tv.beginningOfDocument, to: pos)
+        }
+
+        /// Точечная перекраска текста + активной/бледной подсветки при смене темы
+        /// страницы — БЕЗ пересборки `attributedText` (та сбросила бы позицию
+        /// прокрутки на большой книге).
+        func recolor(theme: ReadingTheme) {
+            guard let tv = textView else { return }
+            tv.backgroundColor = theme.pageBackgroundUI
+            let storage = tv.textStorage
+            storage.beginEditing()
+            storage.addAttribute(.foregroundColor, value: theme.pageTextUI,
+                                 range: NSRange(location: 0, length: storage.length))
+            reapplyHighlightColors(storage: storage, theme: theme)
+            storage.endEditing()
+        }
+
+        /// Перекрашивает фон активной/бледной подсветки (диапазоны те же — только
+        /// цвет темы). Общий хелпер для `recolor` и `rebuildForFontChange`.
+        private func reapplyHighlightColors(storage: NSTextStorage, theme: ReadingTheme) {
+            if let range = lastRange {
+                storage.addAttribute(.backgroundColor, value: theme.highlightUI, range: range)
+            }
+            if let range = lastPendingRange {
+                storage.addAttribute(.backgroundColor, value: theme.pendingHighlightUI, range: range)
+            }
+        }
+
+        /// Пересобирает `attributedText` на новый размер шрифта — сама пересборка
+        /// неизбежна (другая ширина глифов меняет вёрстку), но позиция прокрутки
+        /// восстанавливается по СИМВОЛЬНОМУ индексу верха вьюпорта (не по
+        /// `contentOffset` — тот меняется вместе с высотой строк), мгновенно и
+        /// НЕЗАВИСИМО от `isFollowing`: на паузе следования нет, но терять место
+        /// пользователя всё равно нельзя.
+        func rebuildForFontChange(fontSize: CGFloat) {
+            guard let tv = textView else { return }
+            let anchor = topCharacterIndex(tv)
+            tv.attributedText = Coordinator.makeAttributed(parent.text, color: parent.theme.pageTextUI,
+                                                            fontSize: fontSize, headingRanges: headingRanges)
+            let storage = tv.textStorage
+            storage.beginEditing()
+            reapplyHighlightColors(storage: storage, theme: parent.theme)
+            storage.endEditing()
+
+            tv.layoutManager.ensureLayout(for: tv.textContainer)
+            if let rect = contentRect(forCharRange: NSRange(location: anchor, length: 1)) {
+                let minY = -tv.adjustedContentInset.top
+                let maxY = max(minY, tv.contentSize.height + tv.adjustedContentInset.bottom - tv.bounds.height)
+                let y = max(minY, min(rect.minY - tv.textContainerInset.top, maxY))
+                tv.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+            }
+            forceNextReport = true
+            reportScroll(tv)
         }
 
         /// Re-attribute сбрасывает ВСЕ фоновые подсветки — обнуляем оба трекинга,
@@ -641,22 +783,15 @@ struct ReflowReaderView: UIViewRepresentable {
             // «Читать отсюда»: без вычитания offset пузырёк уедет за экран при прокрутке.
             let viewPoint = CGPoint(x: point.x - tv.contentOffset.x,
                                     y: point.y - tv.contentOffset.y)
-            // Тап в зоне кнопки play пузырька = подтверждение «Читать отсюда».
-            if let center = parent.bubbleCenter,
-               hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= 28 {
-                parent.onConfirmPlay()
-                return
-            }
-            // Тап в зоне кнопки закладки пузырька.
-            if let center = parent.bookmarkCenter,
-               hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= 28 {
-                parent.onBookmarkHere()
-                return
-            }
-            // Тап в зоне кнопки «Вернуться к чтению».
-            if let rc = parent.returnButtonCenter,
-               hypot(viewPoint.x - rc.x, viewPoint.y - rc.y) <= 30 {
-                parent.onReturnTap()
+            if let action = FloatingControlsHitTest.action(at: viewPoint,
+                                                            bubbleCenter: parent.bubbleCenter,
+                                                            bookmarkCenter: parent.bookmarkCenter,
+                                                            returnButtonCenter: parent.returnButtonCenter) {
+                switch action {
+                case .confirmPlay: parent.onConfirmPlay()
+                case .bookmark: parent.onBookmarkHere()
+                case .returnToReading: parent.onReturnTap()
+                }
                 return
             }
             // UITextInput учитывает textContainerInset сам — передаём point как есть.
@@ -668,27 +803,10 @@ struct ReflowReaderView: UIViewRepresentable {
             // Привязка к БЛИЖАЙШЕМУ предложению, а не строгое попадание: между абзацами
             // и главами есть разделители/переносы (flatten склеивает через «\n\n»), и тап
             // часто попадает в такой зазор. Строгая проверка NSLocationInRange там давала
-            // промах → пузырёк не показывался. Выбираем предложение с минимальной
-            // дистанцией от charIndex до его диапазона (0 = точное попадание).
-            var bestIndex: Int?
-            var bestDistance = Int.max
-            for (i, sentence) in parent.sentences.enumerated() {
-                guard let range = globalRange(for: sentence) else { continue }
-                let distance: Int
-                if NSLocationInRange(charIndex, range) {
-                    distance = 0
-                } else if charIndex < range.location {
-                    distance = range.location - charIndex
-                } else {
-                    distance = charIndex - (range.location + range.length - 1)
-                }
-                if distance < bestDistance {
-                    bestDistance = distance
-                    bestIndex = i
-                    if distance == 0 { break }
-                }
-            }
-            parent.onTap(bestIndex, viewPoint)
+            // промах → пузырёк не показывался. `closestSentenceIndex` — бинарный поиск по
+            // предрассчитанному индексу (`rebuildIndex`), а не линейный перебор всех
+            // предложений на каждый тап.
+            parent.onTap(closestSentenceIndex(for: charIndex), viewPoint)
         }
     }
 }

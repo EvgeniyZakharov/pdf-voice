@@ -19,25 +19,17 @@ struct RussianProfile: LanguageProfile {
         "^\\d+(\\.\\d+)+\\s+\\S",
     ].compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
 
-    private static let specialSections: Set<String> = [
+    private static let specialSectionsStatic: Set<String> = [
         "пролог", "эпилог", "предисловие", "введение", "заключение",
         "послесловие", "оглавление", "содержание", "аннотация", "благодарности",
         "prologue", "epilogue", "foreword", "afterword", "preface",
         "introduction", "conclusion", "contents",
     ]
 
-    func isHeading(_ raw: String) -> Bool {
-        let t = raw.trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty else { return false }
-        guard t.split(separator: " ").count <= 12 else { return false }
-        if let last = t.last, ".!?…".contains(last) { return false }
-        let lower = t.lowercased()
-        let firstWord = lower.split(whereSeparator: { $0 == " " || $0 == ":" })
-            .first.map(String.init) ?? lower
-        if Self.specialSections.contains(firstWord) { return true }
-        let range = NSRange(t.startIndex..<t.endIndex, in: t)
-        return Self.headingPatterns.contains { $0.firstMatch(in: t, range: range) != nil }
-    }
+    // Вердикт `isHeading` считает общая реализация в `extension LanguageProfile`
+    // (см. LanguageProfile.swift) — здесь только языковые таблицы.
+    var headingPatterns: [NSRegularExpression] { Self.headingPatterns }
+    var specialSections: Set<String> { Self.specialSectionsStatic }
 
     // MARK: - Словарь ударений
 
@@ -229,6 +221,11 @@ struct RussianProfile: LanguageProfile {
     }()
 
     private static func expandUnits(_ text: String) -> String {
+        // Ранний выход: без цифр ни один unitRegex не совпадёт, а построение
+        // NSMutableString на каждый из пяти паттернов на КАЖДОМ предложении книги
+        // (в т.ч. на предложениях без единиц измерения — подавляющем большинстве)
+        // не нужно.
+        guard text.contains(where: \.isNumber) else { return text }
         var result = text as NSString
         // Process each unit pattern independently; iterate regexes in defined order.
         for (re, forms) in unitRegexes {

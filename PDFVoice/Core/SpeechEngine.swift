@@ -7,7 +7,7 @@ import Foundation
 /// Все @Published свойства и методы сохранены без изменений —
 /// ReaderView, ReaderViewModel, NowPlayingController, SettingsView не требуют правок.
 @MainActor
-final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
+final class SpeechEngine: NSObject, ObservableObject {
 
     // MARK: - Публичное состояние для UI
 
@@ -25,11 +25,17 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
     @Published var voice: AVSpeechSynthesisVoice? = SpeechEngine.bestRussianVoice() {
         didSet {
+            // AVSpeechSynthesisVoice(identifier:) создаёт новый объект на каждый вызов —
+            // сравнение по `!==` никогда не считало голоса равными, даже когда
+            // identifier не менялся (лишний re-enqueue на каждый applySettings).
+            guard voice?.identifier != oldValue?.identifier else { return }
             // Всегда синхронизируем avBackend.voice, даже если Silero активен —
             // чтобы fallback на системный голос сразу взял актуальный голос.
-            // avBackend.setVoice пере-наполняет очередь только если синтезатор играет/на паузе.
-            guard voice !== oldValue else { return }
-            avBackend.setVoice(voice)
+            // avBackend.setVoice пере-наполняет очередь (= перезапускает звук) только
+            // если синтезатор играет/на паузе — в этом случае помечаем, что рестарт
+            // уже случился здесь, чтобы вызывающий код (ReaderViewModel.changeVoice)
+            // не рестартовал повторно через restartCurrent().
+            if avBackend.setVoice(voice) { didRestartSincePrepare = true }
         }
     }
 
@@ -48,12 +54,28 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
             guard speed != oldValue else { return }
             avBackend.setSpeed(speed)
             sileroBackend.setSpeed(speed)
+            onSpeedChange?(speed)
+        }
+    }
+
+    /// Дополнительная пауза после заголовков (глав/разделов) — единая настройка,
+    /// прокидываемая в ОБА backend'а (по образцу `pauseBetweenSentences`). Раньше
+    /// AVSpeechBackend и SileroBackend хранили одно и то же значение 0.7 порознь,
+    /// без единого источника истины.
+    var headingPause: Double = 0.7 {
+        didSet {
+            avBackend.headingPause = headingPause
+            sileroBackend.headingPause = headingPause
         }
     }
 
     var onIndexChange: ((Int) -> Void)?
     /// Озвучка дошла до последнего предложения книги (для отметки «Закончено»).
     var onFinishedAll: (() -> Void)?
+    /// Скорость озвучки изменилась (пользователь выбрал темп в плеере читалки).
+    /// `ReaderViewModel` подключает это к `SettingsStore.playbackSpeed`, чтобы
+    /// выбор темпа пережил закрытие книги (скорость глобальная, не по-книжная).
+    var onSpeedChange: ((Double) -> Void)?
 
     /// true, когда в `sentences` загружена ВСЯ книга (не только префикс прогрессивной
     /// загрузки). Выставляется `ReaderViewModel` в момент, когда фоновая загрузка
@@ -74,16 +96,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
             // Явная (пере)настройка Silero снимает временный откат на системный голос.
             systemFallbackActive = false
             let next: SpeechBackend = sileroServerURL != nil ? sileroBackend : avBackend
-            // Только при РЕАЛЬНОЙ смене backend'а: глушим уходящий, иначе он
-            // продолжит звучать (AVSpeech дочитывает очередь, Silero — свой цикл)
-            // и при следующем play/skip наложится второй голос.
-            guard next !== active else { return }
-            let wasSpeaking = isSpeaking
-            active.stop()
-            active = next
-            // Продолжаем с текущего предложения новым движком (как при смене
-            // голоса/скорости внутри одного backend'а), а не обрываем озвучку.
-            if wasSpeaking { play(from: currentIndex) }
+            switchBackend(to: next)
         }
     }
 
@@ -119,11 +132,26 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     /// возврате на передний план `retrySileroAfterFallback` вернёт нейроголос.
     private var systemFallbackActive = false
 
+    /// true, если с последнего `prepareForSettingsChange()` уже произошёл
+    /// audible-рестарт (смена backend'а через `switchBackend`, либо AVSpeech
+    /// пере-наполнил очередь новым голосом). `ReaderViewModel.changeVoice`
+    /// проверяет флаг перед `restartCurrent()`, чтобы не рестартовать дважды —
+    /// applySettings может сам по себе уже перезапустить чтение через один из
+    /// didSet'ов (voice/sileroServerURL).
+    private(set) var didRestartSincePrepare = false
+
+    /// Сбрасывает флаг перед применением новых настроек (см. `didRestartSincePrepare`).
+    func prepareForSettingsChange() { didRestartSincePrepare = false }
+
     override init() {
         active = avBackend
         super.init()
         wireBackend(avBackend)
         wireBackend(sileroBackend)
+        // didSet не срабатывает на значение из property-инициализатора — синхронизируем
+        // дефолт headingPause с backend'ами явно один раз.
+        avBackend.headingPause = headingPause
+        sileroBackend.headingPause = headingPause
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: AVAudioSession.sharedInstance(),
@@ -193,10 +221,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         guard active === sileroBackend else { isSpeaking = false; return }
         currentIndex = clamp(index)
         systemFallbackActive = true
-        let wasSpeaking = isSpeaking
-        active.stop()
-        active = avBackend
-        if wasSpeaking { play(from: currentIndex) }
+        switchBackend(to: avBackend)
     }
 
     /// Возврат на передний план после временного отката на системный голос:
@@ -206,9 +231,19 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     func retrySileroAfterFallback() {
         guard systemFallbackActive, sileroServerURL != nil, active === avBackend else { return }
         systemFallbackActive = false
+        switchBackend(to: sileroBackend)
+    }
+
+    /// Единая точка переключения активного backend'а: глушит уходящий (иначе он
+    /// продолжит звучать — AVSpeech дочитывает очередь, Silero — свой цикл — и
+    /// наложится второй голос при следующем play/skip) и продолжает с текущего
+    /// предложения новым движком, если играли. Идемпотентна: если `next` уже
+    /// активен — no-op, звук не дёргается.
+    private func switchBackend(to next: SpeechBackend) {
+        guard next !== active else { return }
         let wasSpeaking = isSpeaking
         active.stop()
-        active = sileroBackend
+        active = next
         if wasSpeaking { play(from: currentIndex) }
     }
 
@@ -243,7 +278,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         if isSpeaking { pause() }
     }
 
-    // MARK: - TTSProvider
+    // MARK: - Управление очередью
 
     func load(sentences: [Sentence], startIndex: Int = 0) {
         stop()
@@ -271,6 +306,7 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         currentIndex = clamp(index)
         activateAudioSession()
         isSpeaking = true
+        didRestartSincePrepare = true
         active.play(sentences: sentences, from: currentIndex,
                     speed: speed, render: renderClosure)
     }

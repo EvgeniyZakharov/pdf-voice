@@ -115,8 +115,28 @@ enum TextPipeline {
     static func isJunkLine(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return false }
+        guard couldBeJunk(t) else { return false }
         let range = NSRange(t.startIndex..<t.endIndex, in: t)
         return junkPatterns.contains { $0.firstMatch(in: t, range: range) != nil }
+    }
+
+    /// Дешёвый предфильтр перед прогоном десяти регулярок на КАЖДОЙ строке книги:
+    /// большинство строк — обычная проза, которая гарантированно ни одну не матчит.
+    /// Проверяет НЕОБХОДИМЫЕ (но не достаточные) условия каждого паттерна — первый
+    /// символ для тех, что заякорены на `^`, и вхождение характерной подстроки для
+    /// «©…\d{4}»/«rights»/«защищены». Ложноотрицательных быть не может: если один
+    /// из паттернов способен совпасть, соответствующее условие здесь истинно.
+    private static func couldBeJunk(_ t: String) -> Bool {
+        guard let first = t.first else { return false }
+        if first.isNumber { return true }                  // ^\d{4}-.., ^\d+ of/из ..
+        if first == "©" { return true }                    // ^©
+        let firstLower = Character(first.lowercased())
+        if firstLower == "p" { return true }                // ^page ...
+        if firstLower == "с" { return true }                // ^стр/^страница (кириллица)
+        if t.contains("©") { return true }                  // ©…\d{4} не в начале строки
+        if t.localizedCaseInsensitiveContains("rights") { return true }
+        if t.localizedCaseInsensitiveContains("защищены") { return true }
+        return false
     }
 
     /// Ищет повторяющиеся строки в зоне верх/низ страниц (колонтитулы).

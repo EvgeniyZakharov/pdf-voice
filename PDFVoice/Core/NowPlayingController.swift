@@ -16,28 +16,43 @@ final class NowPlayingController {
         self.speech = speech
         self.title = title
         setupRemoteCommands()
+        setStaticInfo()
         observeState()
-        updateNowPlaying()
+        updateProgress()
     }
 
     // MARK: - Now Playing
 
+    /// Название/автор книги не меняются в рамках одной сессии чтения — ставим
+    /// их РОВНО ОДИН раз здесь (контроллер и так пересоздаётся на каждую новую
+    /// книгу в `finishLoading`), а не на каждую смену предложения.
+    private func setStaticInfo() {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyTitle] = title
+        info[MPMediaItemPropertyArtist] = "PDF Voice"
+        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
     private func observeState() {
-        // Обновляем при смене предложения и play/pause (не на каждое слово).
+        // Обновляем при смене предложения, play/pause и смене скорости — не на
+        // каждое слово (за счёт связки с currentIndex, а не таймером слов).
         speech.$currentIndex
-            .combineLatest(speech.$isSpeaking)
+            .combineLatest(speech.$isSpeaking, speech.$speed)
             .sink { [weak self] _ in
-                Task { @MainActor in self?.updateNowPlaying() }
+                Task { @MainActor in self?.updateProgress() }
             }
             .store(in: &cancellables)
     }
 
-    private func updateNowPlaying() {
-        var info: [String: Any] = [:]
-        info[MPMediaItemPropertyTitle] = title
-        info[MPMediaItemPropertyArtist] = "PDF Voice"
-        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
-        info[MPNowPlayingInfoPropertyPlaybackRate] = speech.isSpeaking ? 1.0 : 0.0
+    /// Прогресс-бар на экране блокировки — «длительность» и «позиция» в единицах
+    /// НОМЕРА ПРЕДЛОЖЕНИЯ (у нас нет посекундной длительности TTS-аудио заранее).
+    /// Не трогает title/artist/mediaType — они выставлены один раз в `setStaticInfo`.
+    private func updateProgress() {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyPlaybackDuration] = Double(max(speech.sentences.count, 1))
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(speech.currentIndex)
+        info[MPNowPlayingInfoPropertyPlaybackRate] = speech.isSpeaking ? speech.speed : 0.0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 

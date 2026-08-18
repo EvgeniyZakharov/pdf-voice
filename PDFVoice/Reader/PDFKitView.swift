@@ -602,22 +602,15 @@ struct PDFKitView: UIViewRepresentable {
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard let pdfView else { return }
             let location = gesture.location(in: pdfView)
-            // Тап в зоне кнопки play пузырька = подтверждение «Читать отсюда».
-            if let center = parent.bubbleCenter,
-               hypot(location.x - center.x, location.y - center.y) <= 28 {
-                parent.onConfirmPlay()
-                return
-            }
-            // Тап в зоне кнопки закладки пузырька.
-            if let center = parent.bookmarkCenter,
-               hypot(location.x - center.x, location.y - center.y) <= 28 {
-                parent.onBookmarkHere()
-                return
-            }
-            // Тап в зоне кнопки «Вернуться к чтению».
-            if let rc = parent.returnButtonCenter,
-               hypot(location.x - rc.x, location.y - rc.y) <= 30 {
-                parent.onReturnTap()
+            if let action = FloatingControlsHitTest.action(at: location,
+                                                            bubbleCenter: parent.bubbleCenter,
+                                                            bookmarkCenter: parent.bookmarkCenter,
+                                                            returnButtonCenter: parent.returnButtonCenter) {
+                switch action {
+                case .confirmPlay: parent.onConfirmPlay()
+                case .bookmark: parent.onBookmarkHere()
+                case .returnToReading: parent.onReturnTap()
+                }
                 return
             }
             guard let page = pdfView.page(for: location, nearest: true) else {

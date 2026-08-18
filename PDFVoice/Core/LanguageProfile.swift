@@ -27,9 +27,36 @@ protocol LanguageProfile: Sendable {
     /// ударных гласных для слов из словаря ударений.
     /// AVSpeech-backend использует только `text`; Silero-backend вставляет «+» по `stresses`.
     func render(_ raw: String) -> SpokenMarkup
+
+    /// Скомпилированные regex-шаблоны заголовков («Глава 5», «Chapter 5», markdown
+    /// `#`/`##`/`###`, нумерация «1.2 Название») — специфичны для языка, поэтому
+    /// профиль их предоставляет, а вердикт считает общая реализация ниже.
+    var headingPatterns: [NSRegularExpression] { get }
+
+    /// Служебные разделы («Пролог»/«Prologue», «Оглавление»/«Contents»…),
+    /// которые распознаются как заголовок целиком по первому слову строки.
+    var specialSections: Set<String> { get }
 }
 
 extension LanguageProfile {
+
+    /// Похоже ли предложение на заголовок главы/раздела. Общая для всех языков
+    /// реализация (различаются только таблицы `headingPatterns`/`specialSections`,
+    /// которые профиль подставляет своими): короткая строка (≤12 слов) без
+    /// завершающей пунктуации, начинающаяся со служебного слова или совпадающая
+    /// с одним из языковых regex-шаблонов.
+    func isHeading(_ raw: String) -> Bool {
+        let t = raw.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return false }
+        guard t.split(separator: " ").count <= 12 else { return false }
+        if let last = t.last, ".!?…".contains(last) { return false }
+        let lower = t.lowercased()
+        let firstWord = lower.split(whereSeparator: { $0 == " " || $0 == ":" })
+            .first.map(String.init) ?? lower
+        if specialSections.contains(firstWord) { return true }
+        let range = NSRange(t.startIndex..<t.endIndex, in: t)
+        return headingPatterns.contains { $0.firstMatch(in: t, range: range) != nil }
+    }
 
     /// Разбиение на предложения общее для всех профилей: `NLTokenizer(.sentence)`
     /// сам определяет язык строки. Проверено эмпирически — явный

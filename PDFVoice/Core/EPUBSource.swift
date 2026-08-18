@@ -82,7 +82,12 @@ private final class OPFDelegate: NSObject, XMLParserDelegate {
         case "item":
             if let id = attr["id"], let href = attr["href"] { manifest[id] = href }
         case "itemref":
-            if let idref = attr["idref"] { spine.append(idref) }
+            // linear="no" — вспомогательный документ (например, обложка-заглушка
+            // или сноски), не часть основного потока чтения; EPUB-спецификация
+            // не требует его в линейной навигации.
+            if let idref = attr["idref"], attr["linear"]?.lowercased() != "no" {
+                spine.append(idref)
+            }
         default: break
         }
     }
@@ -154,10 +159,16 @@ enum HTMLText {
     static func decodeEntities(_ s: String) -> String {
         guard s.contains("&") else { return s }
         var r = s
-        let named = ["&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'",
-                     "&nbsp;": "\u{00A0}", "&mdash;": "—", "&ndash;": "–", "&hellip;": "…",
-                     "&laquo;": "«", "&raquo;": "»", "&rsquo;": "’", "&lsquo;": "‘",
-                     "&ldquo;": "“", "&rdquo;": "”"]
+        // Массив пар, НЕ Dictionary: итерация по Dictionary недетерминирована, а
+        // «&amp;» должен разворачиваться ПОСЛЕДНИМ — иначе «&amp;lt;» (закодированный
+        // литерал «&lt;») мог сначала стать «&lt;», а затем той же итерацией — «<»,
+        // хотя корректный результат — оставить видимый текст «&lt;».
+        let named: [(String, String)] = [
+            ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"),
+            ("&nbsp;", "\u{00A0}"), ("&mdash;", "—"), ("&ndash;", "–"), ("&hellip;", "…"),
+            ("&laquo;", "«"), ("&raquo;", "»"), ("&rsquo;", "’"), ("&lsquo;", "‘"),
+            ("&ldquo;", "“"), ("&rdquo;", "”"), ("&amp;", "&"),
+        ]
         for (k, v) in named { r = r.replacingOccurrences(of: k, with: v) }
         // Числовые: &#1234; и &#x1F600;
         if let re = try? NSRegularExpression(pattern: "&#(x?[0-9a-fA-F]+);") {

@@ -26,6 +26,9 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
 
     /// Пауза после каждого предложения (сек). Coordinator выставляет перед вызовом play/append.
     var pauseBetweenSentences: Double = 0.3
+    /// Дополнительная пауза после заголовка главы/раздела. Coordinator (`SpeechEngine`)
+    /// прокидывает одно и то же значение в оба backend'а — единый источник истины.
+    var headingPause: Double = 0.7
 
     // Состояние, необходимое для пере-наполнения очереди при смене speed/voice.
     private var currentSentences: [Sentence] = []
@@ -139,10 +142,15 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         // запомнен для следующего play().
     }
 
-    func setVoice(_ v: AVSpeechSynthesisVoice?) {
+    /// Возвращает true, если смена голоса пере-наполнила очередь (звук
+    /// перезапустился) — `SpeechEngine.voice.didSet` использует это, чтобы не
+    /// рестартовать чтение повторно через `restartCurrent()`.
+    @discardableResult
+    func setVoice(_ v: AVSpeechSynthesisVoice?) -> Bool {
         voice = v
-        guard synthesizer.isSpeaking || synthesizer.isPaused else { return }
+        guard synthesizer.isSpeaking || synthesizer.isPaused else { return false }
         enqueue(from: lastStartedIndex)
+        return true
     }
 
     // MARK: - Внутренняя очередь
@@ -170,8 +178,6 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         let utterance = AVSpeechUtterance(string: render(s).text)
         utterance.voice = voice
         utterance.rate = SpeechEngine.utteranceRate(for: currentSpeed)
-        // headingPause: дополнительная пауза после заголовка главы/раздела.
-        let headingPause: Double = 0.7
         utterance.postUtteranceDelay = pauseBetweenSentences + (s.isHeading ? headingPause : 0)
         indexForUtterance[ObjectIdentifier(utterance)] = index
         synthesizer.speak(utterance)

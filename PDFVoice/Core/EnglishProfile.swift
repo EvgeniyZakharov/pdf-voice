@@ -28,25 +28,17 @@ struct EnglishProfile: LanguageProfile {
         "^\\d+(\\.\\d+)+\\s+\\S",
     ].compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
 
-    private static let specialSections: Set<String> = [
+    private static let specialSectionsStatic: Set<String> = [
         "prologue", "epilogue", "foreword", "afterword", "preface",
         "introduction", "conclusion", "contents", "acknowledgments",
         "acknowledgements", "appendix", "index", "glossary", "notes",
         "dedication", "abstract", "summary",
     ]
 
-    func isHeading(_ raw: String) -> Bool {
-        let t = raw.trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty else { return false }
-        guard t.split(separator: " ").count <= 12 else { return false }
-        if let last = t.last, ".!?…".contains(last) { return false }
-        let lower = t.lowercased()
-        let firstWord = lower.split(whereSeparator: { $0 == " " || $0 == ":" })
-            .first.map(String.init) ?? lower
-        if Self.specialSections.contains(firstWord) { return true }
-        let range = NSRange(t.startIndex..<t.endIndex, in: t)
-        return Self.headingPatterns.contains { $0.firstMatch(in: t, range: range) != nil }
-    }
+    // Вердикт `isHeading` считает общая реализация в `extension LanguageProfile`
+    // (см. LanguageProfile.swift) — здесь только языковые таблицы.
+    var headingPatterns: [NSRegularExpression] { Self.headingPatterns }
+    var specialSections: Set<String> { Self.specialSectionsStatic }
 
     // MARK: - Раскрытие для озвучки
 

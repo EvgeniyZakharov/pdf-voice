@@ -29,6 +29,10 @@ private struct ReaderScreen: View {
     @State private var tapPoint: CGPoint = .zero
     /// Пульс иконки закладки в правом верхнем углу — подтверждение добавления.
     @State private var bookmarkPulse = false
+    /// Мини-тост «Закладка уже есть» — обратная связь при попытке дублировать
+    /// закладку на то же предложение (см. `bookmarkHere`/`showDuplicateBookmarkToast`).
+    @State private var showDuplicateBookmarkBanner = false
+    @State private var duplicateBookmarkToken = 0
     @State private var currentPage = 0
     @State private var scrubValue: Double = 1
     /// Идёт ли перетаскивание слайдера страниц. `Slider`'s `onEditingChanged(false)`
@@ -79,7 +83,6 @@ private struct ReaderScreen: View {
     /// совпадающих с этим прямоугольником. Из него берём: верхний инсет (навбар),
     /// нижнюю границу (верх панели), позиции пузырька и кнопки возврата.
     @State private var readingFrame: CGRect = .zero
-    private var contentSize: CGSize { readingFrame.size }
     /// Пользователь сейчас тащит reflow-слайдер — гасит обратную связь от onScroll.
     @State private var isReflowScrubbing = false
     /// Последняя доля, пришедшая ИЗ onScroll (эхо собственного скролла вида).
@@ -106,6 +109,11 @@ private struct ReaderScreen: View {
                 }
             }
             .onPreferenceChange(PanelHeightKey.self) { panelHeight = $0 }
+            .overlay(alignment: .top) {
+                duplicateBookmarkBanner
+                    .padding(.top, 8)
+                    .allowsHitTesting(false)
+            }
         // Фон читалки = фон СТРАНИЦЫ (не хрома): панель плеера и верхние кнопки
         // висят прямо над «бумагой», без отдельной полосы фона за ними.
         .background(pageBackdrop.ignoresSafeArea())
@@ -217,8 +225,12 @@ private struct ReaderScreen: View {
                 .accessibilityLabel("Фон чтения")
             }
 
-            // Закладки — открывает список; добавление через + внутри листа
-            let hasBookmarkOnPage = model.bookmarks.contains(where: { $0.pageIndex == currentPage })
+            // Закладки — открывает список; добавление через + внутри листа.
+            // В reflow `currentPage` (из PDF-скролла) всегда 0 — индикатор
+            // строится по индексу ТЕКУЩЕЙ ГЛАВЫ читаемого предложения.
+            let hasBookmarkOnPage = model.isReflowable
+                ? model.bookmarks.contains(where: { $0.pageIndex == model.currentChapterIndex })
+                : model.bookmarks.contains(where: { $0.pageIndex == currentPage })
             Button {
                 showBookmarks = true
             } label: {
@@ -351,6 +363,19 @@ private struct ReaderScreen: View {
                                              language: model.libraryItem.effectiveLanguage)
     }
 
+    /// Общий обработчик тапа по PDF/тексту (передаётся как `onTap` в оба
+    /// представления, PDF и reflow — раньше два идентичных замыкания жили в
+    /// каждой вьюхе отдельно). Индекс — попавшее предложение (кандидат на
+    /// «Читать отсюда»), nil — тап мимо текста.
+    private func handlePendingTap(_ index: Int?, _ point: CGPoint) {
+        if let index {
+            tapPoint = point
+            withAnimation(.easeOut(duration: 0.12)) { pendingIndex = index }
+        } else {
+            withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
+        }
+    }
+
     private func requestJump(to page: Int) {
         let clamped = max(0, min(page, max(pageCount - 1, 0)))
         jumpToken += 1
@@ -410,14 +435,7 @@ private struct ReaderScreen: View {
                              highlight: model.currentSentence,
                              pendingHighlight: pendingSentence,
                              sentences: model.speech.sentences,
-                             onTap: { index, point in
-                                 if let index {
-                                     tapPoint = point
-                                     withAnimation(.easeOut(duration: 0.12)) { pendingIndex = index }
-                                 } else {
-                                     withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
-                                 }
-                             },
+                             onTap: handlePendingTap,
                              onScroll: { f, ch, vis, following in
                                  // Пока юзер тащит слайдер — он источник истины, не перебиваем.
                                  // Гварды по неравенству: @State-присваивание перезапускает body
@@ -482,17 +500,9 @@ private struct ReaderScreen: View {
                        pendingHighlight: pendingSentence,
                        sentences: model.speech.sentences,
                        pageJump: pageJump,
-                       onTap: { index, point in
-                           if let index {
-                               tapPoint = point
-                               withAnimation(.easeOut(duration: 0.12)) { pendingIndex = index }
-                           } else {
-                               withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
-                           }
-                       },
+                       onTap: handlePendingTap,
                        onPageChange: { page in
                            currentPage = page
-                           model.updateVisiblePage(page)
                        },
                        onFollowChanged: { vis, following in
                            // То же правило, что в reflow: юзер увёл вид И подсветка
@@ -559,6 +569,22 @@ private struct ReaderScreen: View {
             .padding(.trailing, 16)
             .padding(.bottom, 12)
             .transition(.scale.combined(with: .opacity))
+        }
+    }
+
+    /// Мини-тост «Закладка уже есть» — плавающая капсула под навбаром,
+    /// автоскрывается (см. `showDuplicateBookmarkToast`). Не перехватывает тапы.
+    @ViewBuilder
+    private var duplicateBookmarkBanner: some View {
+        if showDuplicateBookmarkBanner {
+            Text("Закладка уже есть")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Theme.accent)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .glass(in: Capsule(), interactive: false)
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 
@@ -699,11 +725,17 @@ private struct ReaderScreen: View {
 
     /// Кнопка закладки в пузырьке: добавляет закладку на ВЫБРАННОЕ предложение,
     /// пульсирует иконкой в правом верхнем углу как подтверждение и прячет пузырёк.
+    /// `addBookmark` возвращает false для уже существующей закладки на это
+    /// предложение — тогда обратная связь ДРУГАЯ (не молчаливый no-op):
+    /// предупреждающий haptic + мини-тост, иначе тап выглядел бы багом.
     private func bookmarkHere() {
         guard let index = pendingIndex else { return }
         if model.addBookmark(atSentence: index) {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             pulseBookmarkIcon()
+        } else {
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+            showDuplicateBookmarkToast()
         }
         withAnimation(.easeOut(duration: 0.12)) { pendingIndex = nil }
     }
@@ -714,6 +746,19 @@ private struct ReaderScreen: View {
         withAnimation(.spring(response: 0.2, dampingFraction: 0.45)) { bookmarkPulse = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.6)) { bookmarkPulse = false }
+        }
+    }
+
+    /// Мини-тост «Закладка уже есть» с автоскрытием. Токен защищает от
+    /// преждевременного скрытия при быстром повторном тапе (второй показ не
+    /// должен обрываться таймером первого).
+    private func showDuplicateBookmarkToast() {
+        duplicateBookmarkToken += 1
+        let token = duplicateBookmarkToken
+        withAnimation(.easeOut(duration: 0.2)) { showDuplicateBookmarkBanner = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard token == duplicateBookmarkToken else { return }
+            withAnimation(.easeOut(duration: 0.25)) { showDuplicateBookmarkBanner = false }
         }
     }
 
@@ -762,33 +807,85 @@ extension ReaderView {
 private struct PlayerControls: View {
     @ObservedObject var model: ReaderViewModel
     @ObservedObject private var speech: SpeechEngine
+    /// Отдельный `@ObservedObject`, а не чтение через `model` — `ReaderViewModel`
+    /// форвардит наверх только `speech.objectWillChange` (см. её `init`), тиканье
+    /// `sleepTimer.remainingSeconds` иначе не перерисовывало бы этот экран.
+    @ObservedObject private var sleepTimer: SleepTimer
 
     init(model: ReaderViewModel) {
         _model = ObservedObject(wrappedValue: model)
         _speech = ObservedObject(wrappedValue: model.speech)
+        _sleepTimer = ObservedObject(wrappedValue: model.sleepTimer)
     }
 
     var body: some View {
-        // Контролы делят ширину поровну — на узких экранах ничего не наезжает
-        // (раньше чип скорости лежал в ZStack поверх транспорта и пересекался
-        // с кнопкой перемотки). Иконки «в край» — шаг по предложениям, не ±сек.
-        HStack(spacing: 0) {
-            speedMenu
-                .frame(maxWidth: .infinity)
-            skipButton("backward.end.fill", label: "Предыдущее предложение") {
-                model.skipBackward()
+        VStack(spacing: 4) {
+            // Таймер сна — тонкая строка над транспортом, не крадёт место у
+            // основных кнопок. Видна всегда (не завязана на pageBar/reflowBar,
+            // которые сами скрыты для однострочных PDF/книг без глав).
+            HStack {
+                Spacer()
+                sleepTimerMenu
             }
-            .frame(maxWidth: .infinity)
-            playButton
+            .padding(.horizontal, 12)
+
+            // Контролы делят ширину поровну — на узких экранах ничего не наезжает
+            // (раньше чип скорости лежал в ZStack поверх транспорта и пересекался
+            // с кнопкой перемотки). Иконки «в край» — шаг по предложениям, не ±сек.
+            HStack(spacing: 0) {
+                speedMenu
+                    .frame(maxWidth: .infinity)
+                skipButton("backward.end.fill", label: "Предыдущее предложение") {
+                    model.skipBackward()
+                }
                 .frame(maxWidth: .infinity)
-            skipButton("forward.end.fill", label: "Следующее предложение") {
-                model.skipForward()
+                playButton
+                    .frame(maxWidth: .infinity)
+                skipButton("forward.end.fill", label: "Следующее предложение") {
+                    model.skipForward()
+                }
+                .frame(maxWidth: .infinity)
             }
-            .frame(maxWidth: .infinity)
+            .disabled(speech.sentences.isEmpty)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .disabled(speech.sentences.isEmpty)
+    }
+
+    /// Таймер сна: Menu в том же стиле, что чип скорости — капсула с акцентным
+    /// текстом. Неактивен — просто значок луны; активен — значок + остаток
+    /// (`remainingFormatted`, тикает благодаря `@ObservedObject sleepTimer`).
+    private var sleepTimerMenu: some View {
+        Menu {
+            Button {
+                sleepTimer.cancel()
+            } label: {
+                if sleepTimer.isActive {
+                    Text("Выкл")
+                } else {
+                    Label("Выкл", systemImage: "checkmark")
+                }
+            }
+            ForEach(SleepTimer.options, id: \.self) { minutes in
+                Button("\(minutes) мин") { sleepTimer.start(minutes: minutes) }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: sleepTimer.isActive ? "moon.fill" : "moon")
+                    .font(.system(size: 13, weight: .semibold))
+                if sleepTimer.isActive {
+                    Text(sleepTimer.remainingFormatted)
+                        .font(.caption2.monospacedDigit())
+                }
+            }
+            .foregroundStyle(sleepTimer.isActive ? Theme.accent : Theme.accent.opacity(0.6))
+            .padding(.horizontal, sleepTimer.isActive ? 10 : 8)
+            .frame(height: 28)
+            .background(Theme.accent.opacity(sleepTimer.isActive ? 0.14 : 0.08), in: Capsule())
+        }
+        .accessibilityLabel(sleepTimer.isActive
+            ? "Таймер сна, осталось \(sleepTimer.remainingFormatted)"
+            : "Таймер сна выключен")
     }
 
     private var playButton: some View {

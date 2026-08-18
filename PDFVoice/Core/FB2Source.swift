@@ -55,7 +55,9 @@ private final class FB2Delegate: NSObject, XMLParserDelegate {
             buffer = ""
             if capture != .title { capture = .paragraph }
         case "empty-line":
-            if capture == .none { curParas.append("") }
+            // Пустой абзац-разделитель не несёт текста; EPUB/DOCX уже не кладут
+            // такие в поток — держим паритет, а не «\n\n» между абзацами.
+            break
         default:
             break   // inline-теги (emphasis/strong/a…) — текст соберётся через foundCharacters
         }

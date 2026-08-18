@@ -37,9 +37,53 @@ struct Sentence: Identifiable {
     }
 }
 
+/// Одно предложение, ещё не привязанное к странице/боксам: результат общего
+/// шага «токенизация чистого текста → обрезка пробелов по краям → детект
+/// заголовка → перевод диапазона в исходные UTF-16-координаты через `origIndex`».
+/// Используется тремя местами нарезки (`PDFTextExtractor.sentences`,
+/// `PDFTextExtractor.extractSentences`, `OCRTextExtractor.sentences`) — раньше
+/// каждое дублировало этот цикл почти дословно.
+struct TokenizedSentence {
+    let rawText: String
+    let isHeading: Bool
+    /// Первый и последний (включительно) UTF-16 код-юнит предложения в ИСХОДНОЙ
+    /// строке страницы (`origIndex`, не в `cleaned`).
+    let oLo: Int
+    let oHi: Int
+}
+
 /// Извлечение текстового слоя PDF и разбиение на предложения.
 /// OCR для сканов появится в M3; здесь — только текстовый слой (PDFKit).
 enum PDFTextExtractor {
+
+    /// Общий шаг нарезки: токенизирует уже очищенную страницу (`cleanPage`) на
+    /// предложения через `profile.sentenceRanges`, обрезает пробелы по краям и
+    /// мапит диапазон обратно в координаты исходной строки страницы через
+    /// `origIndex`. Не знает про `Sentence`/боксы/страницы — это дело вызывающих.
+    static func tokenize(cleaned: String, origIndex: [Int],
+                         profile: any LanguageProfile) -> [TokenizedSentence] {
+        guard !cleaned.isEmpty else { return [] }
+        let cleanedUnits = Array(cleaned.utf16)
+        var result: [TokenizedSentence] = []
+        for range in profile.sentenceRanges(in: cleaned) {
+            let ns = NSRange(range, in: cleaned)
+            guard ns.length > 0 else { continue }
+
+            // Обрезаем пробелы по краям токена (в координатах чистого текста).
+            var lo = ns.location
+            var hi = ns.location + ns.length - 1
+            while lo <= hi, cleanedUnits[lo] == 0x20 { lo += 1 }
+            while hi >= lo, cleanedUnits[hi] == 0x20 { hi -= 1 }
+            guard lo <= hi else { continue }
+
+            let rawSpoken = String(utf16CodeUnits: Array(cleanedUnits[lo...hi]), count: hi - lo + 1)
+            guard !rawSpoken.isEmpty else { continue }
+            let heading = profile.isHeading(rawSpoken)
+            result.append(TokenizedSentence(rawText: rawSpoken, isHeading: heading,
+                                            oLo: origIndex[lo], oHi: origIndex[hi]))
+        }
+        return result
+    }
 
     /// Разбивает документ на предложения постранично.
     ///
@@ -80,25 +124,10 @@ enum PDFTextExtractor {
             let (cleaned, origIndex) = TextPipeline.cleanPage(lines, dropped: dropped)
             guard !cleaned.isEmpty else { continue }
 
-            let cleanedUnits = Array(cleaned.utf16)
-            for range in profile.sentenceRanges(in: cleaned) {
-                let ns = NSRange(range, in: cleaned)
-                guard ns.length > 0 else { continue }
-
-                // Обрезаем пробелы по краям токена (в координатах чистого текста).
-                var lo = ns.location
-                var hi = ns.location + ns.length - 1
-                while lo <= hi, cleanedUnits[lo] == 0x20 { lo += 1 }
-                while hi >= lo, cleanedUnits[hi] == 0x20 { hi -= 1 }
-                guard lo <= hi else { continue }
-
-                let rawSpoken = String(utf16CodeUnits: Array(cleanedUnits[lo...hi]), count: hi - lo + 1)
-                guard !rawSpoken.isEmpty else { continue }
-                let heading = profile.isHeading(rawSpoken)
-
-                let nsRange = NSRange(location: origIndex[lo], length: origIndex[hi] - origIndex[lo] + 1)
-                result.append(Sentence(rawText: rawSpoken, pageIndex: pi, range: nsRange,
-                                       isHeading: heading, language: profile.code))
+            for tok in tokenize(cleaned: cleaned, origIndex: origIndex, profile: profile) {
+                let nsRange = NSRange(location: tok.oLo, length: tok.oHi - tok.oLo + 1)
+                result.append(Sentence(rawText: tok.rawText, pageIndex: pi, range: nsRange,
+                                       isHeading: tok.isHeading, language: profile.code))
             }
         }
         return mergeCrossPage(result)
@@ -126,7 +155,9 @@ enum PDFTextExtractor {
                                                     pageIndex: last.pageIndex,
                                                     range: last.range,
                                                     boxes: last.boxes,
-                                                    isHeading: last.isHeading)
+                                                    isHeading: last.isHeading,
+                                                    language: last.language,
+                                                    charOffset: last.charOffset)
             } else {
                 result.append(s)
             }
@@ -162,21 +193,10 @@ enum PDFTextExtractor {
             let (cleaned, origIndex) = TextPipeline.cleanPage(lines, dropped: dropped)
             guard !cleaned.isEmpty else { continue }
 
-            let cleanedUnits = Array(cleaned.utf16)
-            for range in profile.sentenceRanges(in: cleaned) {
-                let ns = NSRange(range, in: cleaned)
-                guard ns.length > 0 else { continue }
-                var lo = ns.location
-                var hi = ns.location + ns.length - 1
-                while lo <= hi, cleanedUnits[lo] == 0x20 { lo += 1 }
-                while hi >= lo, cleanedUnits[hi] == 0x20 { hi -= 1 }
-                guard lo <= hi else { continue }
-                let rawSpoken = String(utf16CodeUnits: Array(cleanedUnits[lo...hi]), count: hi - lo + 1)
-                guard !rawSpoken.isEmpty else { continue }
-                let heading = profile.isHeading(rawSpoken)
-                let nsRange = NSRange(location: origIndex[lo], length: origIndex[hi] - origIndex[lo] + 1)
-                result.append(Sentence(rawText: rawSpoken, pageIndex: pi + pageOffset, range: nsRange,
-                                       isHeading: heading, language: profile.code))
+            for tok in tokenize(cleaned: cleaned, origIndex: origIndex, profile: profile) {
+                let nsRange = NSRange(location: tok.oLo, length: tok.oHi - tok.oLo + 1)
+                result.append(Sentence(rawText: tok.rawText, pageIndex: pi + pageOffset, range: nsRange,
+                                       isHeading: tok.isHeading, language: profile.code))
             }
         }
         return mergeCrossPage(result)

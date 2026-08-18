@@ -77,7 +77,15 @@ final class DocumentStore: ObservableObject {
     /// публикует `items` сразу. Реальный перенос — по дебаунс-таймеру
     /// (`scheduleProgressFlush`) либо принудительно (`flushProgress`).
     func updateProgress(for itemID: UUID, sentenceIndex: Int) {
-        guard items.contains(where: { $0.id == itemID }) else { return }
+        guard let idx = items.firstIndex(where: { $0.id == itemID }) else { return }
+        // Книга была помечена «Закончено», но озвучка снова пошла вперёд (дочитывает
+        // с начала или продолжает после того, как пользователь перемотал назад) —
+        // «Закончено» больше не отражает состояние. Без нового поля-состояния:
+        // любой новый индекс, пришедший после markFinished, снимает отметку.
+        if items[idx].isFinished {
+            items[idx].isFinished = false
+            save()
+        }
         dirtyProgress[itemID] = sentenceIndex
         scheduleProgressFlush()
     }
@@ -194,13 +202,6 @@ final class DocumentStore: ObservableObject {
         }
         saveCollections()
         save()
-    }
-
-    func renameCollection(_ collection: BookCollection, to name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let idx = collections.firstIndex(where: { $0.id == collection.id }) else { return }
-        collections[idx].name = trimmed
-        saveCollections()
     }
 
     /// Добавляет/убирает книгу из коллекции (тумблер принадлежности).

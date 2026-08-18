@@ -242,7 +242,7 @@ final class SileroBackend: NSObject, SpeechBackend {
                 result = try await current.value
             } catch is CancellationError {
                 return
-            } catch SileroFetchError.contentRejected(let code) {
+            } catch SileroClient.ContentError.rejected(let code) {
                 // 4xx (кроме 429) — контентная ошибка (например, сервер не принял
                 // пустой/невалидный текст после раскрытия предложения), а не сбой
                 // сервиса. НЕ повод откатываться на системный голос — пропускаем
@@ -337,38 +337,21 @@ final class SileroBackend: NSObject, SpeechBackend {
 
     // MARK: - Сеть (nonisolated — выполняется вне MainActor)
 
-    private struct SileroRequest: Encodable {
-        let text: String
-        let speaker: String
-    }
-
-    /// Контентная ошибка сервера (4xx, кроме 429) — сервер отверг конкретный
-    /// текст, а не недоступен. Не повод для отката на системный голос
-    /// (см. `runQueue`), в отличие от сетевых ошибок/5xx.
-    private enum SileroFetchError: Error {
-        case contentRejected(Int)
-    }
-
     /// Сетевой запрос + чтение/запись LRU-кэша. `nonisolated static` — не трогает
     /// MainActor вообще: все параметры переданы копиями значений, доступ к кэшу
     /// синхронизирован самим `actor SileroAudioCache`. Раньше это был @MainActor-метод
     /// (JSON-энкод, сборка WAV, ретрай-сны на главном потоке) — блокировало UI-поток
-    /// на время сети.
+    /// на время сети. Построение запроса/классификация статуса — через общий
+    /// `SileroClient` (тот же строитель использует `VoicePreviewer`); ретраи/бэкофф/
+    /// кэш остаются здесь — они специфичны для боевой очереди озвучки.
     private nonisolated static func fetchAudio(
         _ text: String, key: SileroAudioCache.Key, cache: SileroAudioCache,
         serverURL: URL?, apiKey: String, speaker: String
     ) async throws -> Data {
         if let cached = await cache.data(for: key) { return cached }
         guard let base = serverURL else { throw URLError(.badURL) }
-        let url = base.appendingPathComponent("synthesize")
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = requestTimeout
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !apiKey.isEmpty {
-            req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        }
-        req.httpBody = try JSONEncoder().encode(SileroRequest(text: text, speaker: speaker))
+        let req = try SileroClient.makeRequest(baseURL: base, apiKey: apiKey, speaker: speaker,
+                                               text: text, timeout: requestTimeout)
 
         // Ретраи с бэкоффом на ТРАНЗИЕНТНЫХ сбоях (таймаут, обрыв соединения,
         // фон-throttling сети, 5xx, 429 — rate limit). Иначе одна временная ошибка
@@ -387,10 +370,7 @@ final class SileroBackend: NSObject, SpeechBackend {
                         try await Task.sleep(nanoseconds: UInt64(retryBackoff * 1_000_000_000))
                         continue
                     }
-                    if (400...499).contains(http.statusCode), http.statusCode != 429 {
-                        throw SileroFetchError.contentRejected(http.statusCode)
-                    }
-                    throw URLError(.badServerResponse)
+                    try SileroClient.validate(resp)
                 }
                 await cache.store(data, for: key)
                 return data

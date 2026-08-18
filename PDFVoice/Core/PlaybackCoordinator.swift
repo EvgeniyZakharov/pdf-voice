@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// Владелец активной сессии чтения. Поднят выше `ReaderView`, чтобы воспроизведение
@@ -12,10 +13,43 @@ final class PlaybackCoordinator: ObservableObject {
 
     private let store: DocumentStore
     private let settings: SettingsStore
+    private var cancellables = Set<AnyCancellable>()
 
     init(store: DocumentStore, settings: SettingsStore) {
         self.store = store
         self.settings = settings
+        observeSettings()
+    }
+
+    /// Настройки, применимые к УЖЕ ИГРАЮЩЕЙ фоновой сессии (мини-плеер, книга
+    /// закрыта, но чтение продолжается): раньше реакция на смену голоса/паузы
+    /// жила только в `ReaderView.onChange` — пока экран читалки закрыт, изменения
+    /// в Настройках долетали до звука лишь при следующем открытии книги.
+    /// Голос — через `changeVoice` (умеет чистый рестарт «на лету», без дубля —
+    /// см. `SpeechEngine.didRestartSincePrepare`); пауза между предложениями —
+    /// без рестарта, `applySettings` просто прокидывает значение в backend.
+    private func observeSettings() {
+        settings.$selectedVoice
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.active?.changeVoice(self.settings)
+            }
+            .store(in: &cancellables)
+        settings.$selectedVoiceEN
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.active?.changeVoice(self.settings)
+            }
+            .store(in: &cancellables)
+        settings.$pauseBetweenSentences
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.active?.applySettings(self.settings)
+            }
+            .store(in: &cancellables)
     }
 
     /// Возвращает сессию для `item`: ту же, если уже открыта, иначе сносит прежнюю и

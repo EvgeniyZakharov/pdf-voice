@@ -10,7 +10,6 @@ final class ReaderViewModel: ObservableObject {
     @Published private(set) var loadError: String?
     @Published private(set) var ocrProgress: Double?
     @Published private(set) var bookmarks: [Bookmark] = []
-    @Published private(set) var currentVisiblePage: Int = 0
     @Published private(set) var isLoadingRemainingPages = false
     @Published private(set) var loadedPageCount: Int = 0 {
         didSet { revealPages(upTo: loadedPageCount) }
@@ -71,10 +70,6 @@ final class ReaderViewModel: ObservableObject {
     /// с разных потоков.
     private var extractionDoc: PDFDocument?
 
-    // Тип документа, устанавливается при load() однократно.
-    private enum DocumentMode { case text, ocr, mixed }
-    private var documentMode: DocumentMode = .text
-
     // Постраничная классификация для смешанного режима.
     private var pageKinds: [PageKind] = []
 
@@ -90,6 +85,12 @@ final class ReaderViewModel: ObservableObject {
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
         sleepTimer.onExpire = { [weak self] in self?.speech.pause() }
+        // Скорость меняется прямо в плеере читалки (`speech.speed = …`), а не
+        // через SettingsStore — прокидываем выбор обратно в настройки здесь,
+        // чтобы тёмп пережил закрытие книги (см. У9, скорость глобальная).
+        speech.onSpeedChange = { [weak self] newSpeed in
+            self?.lastSettings?.playbackSpeed = newSpeed
+        }
     }
 
     func attach(store: DocumentStore) {
@@ -113,16 +114,41 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    /// Последний выбор голоса, на который эта сессия уже отреагировала (ключ —
+    /// выбор ДЛЯ ЯЗЫКА ТЕКУЩЕЙ КНИГИ, см. ниже). `changeVoice` вызывается из ДВУХ
+    /// независимых слушателей одного и того же реального изменения в Настройках —
+    /// `ReaderView.onChange` (пока открыта читалка) и `PlaybackCoordinator`
+    /// (фоновая сессия за мини-плеером); когда читалка открыта, срабатывают ОБА
+    /// на одно и то же событие. Без этого ключа второй вызов не отличил бы «ничего
+    /// не изменилось с прошлого раза» от «пользователь снова сменил голос» и
+    /// рестартовал бы звук ещё раз поверх уже идущего рестарта первого вызова.
+    private var lastVoiceSelection: String?
+
     /// Смена голоса на лету: применяем настройки и, если книга сейчас читается,
     /// делаем чистый «пауза → play» — старый голос сразу смолкает, текущее
     /// предложение перечитывается новым голосом с начала. Смена backend'а
-    /// (система ↔ Silero) сама перезапускает игру через didSet `sileroServerURL`;
-    /// смена голоса/спикера ВНУТРИ одного backend'а авто-перезапуска не даёт —
-    /// его и добавляет этот явный `restartCurrent()`.
+    /// (система ↔ Silero) и смена голоса AVSpeech сами перезапускают игру внутри
+    /// `applySettings` (см. `SpeechEngine.didRestartSincePrepare`); смена
+    /// спикера Silero ВНУТРИ backend'а авто-перезапуска не даёт — его и
+    /// добавляет этот явный `restartCurrent()`, но только если ни один из
+    /// путей `applySettings` уже не рестартовал сам (иначе двойной рестарт).
     func changeVoice(_ settings: SettingsStore) {
+        let isEnglishBook = VoiceCatalog.isEnglish(item.effectiveLanguage)
+        let selection = isEnglishBook ? settings.selectedVoiceEN : settings.selectedVoice
+        guard selection != lastVoiceSelection else {
+            // Тот же реальный выбор, что мы уже применили (второй слушатель того
+            // же события) — прочие поля (пауза и т.п.) синхронизируем, но без
+            // рестарта звука.
+            applySettings(settings)
+            return
+        }
+        lastVoiceSelection = selection
         let wasSpeaking = speech.isSpeaking
+        speech.prepareForSettingsChange()
         applySettings(settings)
-        if wasSpeaking { speech.restartCurrent() }
+        if wasSpeaking, !speech.didRestartSincePrepare {
+            speech.restartCurrent()
+        }
     }
 
     func applySettings(_ settings: SettingsStore) {
@@ -130,6 +156,10 @@ final class ReaderViewModel: ObservableObject {
         // определится по ходу загрузки (детект идёт уже после первого applySettings).
         lastSettings = settings
         speech.pauseBetweenSentences = settings.pauseBetweenSentences
+        // Скорость — глобальная настройка (не по-книжная): применяем сохранённый
+        // темп при каждом открытии/пере-применении настроек. Обратная связь —
+        // `speech.onSpeedChange`, когда пользователь меняет темп в плеере читалки.
+        speech.speed = settings.playbackSpeed
         speech.sileroAPIKey = settings.sileroAPIKey
         // Профиль книги — для late render (числа/аббревиатуры/ударения при
         // постановке предложения в очередь). Выбор голоса по языку — шаг 5.
@@ -162,8 +192,6 @@ final class ReaderViewModel: ObservableObject {
 
     var currentSentenceText: String { currentSentence?.rawText ?? "" }
 
-    func updateVisiblePage(_ page: Int) { currentVisiblePage = page }
-
     /// Полное число страниц в исходном документе (включая ещё не загруженные).
     var totalPages: Int { totalPageCount }
 
@@ -180,15 +208,6 @@ final class ReaderViewModel: ObservableObject {
             let t = ch.title?.trimmingCharacters(in: .whitespacesAndNewlines)
             return (t?.isEmpty == false) ? t! : "Глава \(i + 1)"
         }) ?? []
-    }
-
-    /// Перейти к дробной позиции книги, сохранив play/pause.
-    func seek(toFraction f: Double) {
-        let n = speech.sentences.count
-        guard n > 0 else { return }
-        clearPendingRestore()
-        let idx = Int((f * Double(n - 1)).rounded())
-        speech.seek(to: idx)
     }
 
     /// Перейти к началу главы, сохранив play/pause.
@@ -323,15 +342,12 @@ final class ReaderViewModel: ObservableObject {
             switch (hasText, hasOCR) {
             case (true, false):
                 // Чисто текстовый — проверенный путь без изменений.
-                self.documentMode = .text
                 self.loadText(doc, extractionDoc: result.extraction, cached: cached)
             case (false, _):
                 // Чисто OCR — проверенный путь без изменений.
-                self.documentMode = .ocr
                 self.loadOCR(doc, extractionDoc: result.extraction, cached: cached)
             default:
                 // Смешанный: часть страниц с текстовым слоем, часть — сканы.
-                self.documentMode = .mixed
                 self.loadMixed(doc, extractionDoc: result.extraction, cached: cached)
             }
         }
@@ -992,26 +1008,6 @@ final class ReaderViewModel: ObservableObject {
         return result
     }
 
-    // MARK: - Приоритетная загрузка (исправление бага: ветвление по типу документа)
-
-    func requestPriorityLoad(pageIndex: Int) {
-        guard pageIndex >= loadedPageCount, let doc = document, let extractionDoc else { return }
-        backgroundTask?.cancel()
-        isLoadingRemainingPages = true
-
-        switch documentMode {
-        case .text:
-            startBackgroundTextLoading(doc: doc, extractionDoc: extractionDoc, from: loadedPageCount,
-                                       totalPageCount: totalPageCount, prior: speech.sentences)
-        case .ocr:
-            runOCR(doc: doc, extractionDoc: extractionDoc, from: loadedPageCount,
-                   totalPageCount: totalPageCount, prior: speech.sentences)
-        case .mixed:
-            startBackgroundMixedLoading(doc: doc, extractionDoc: extractionDoc, from: loadedPageCount,
-                                        totalPageCount: totalPageCount, prior: speech.sentences)
-        }
-    }
-
     private func finishLoading(_ sentences: [Sentence]) {
         // Подстраховка для книг, извлечённых ДО появления детекта: предложения
         // пришли из кэша, образец брать было неоткуда. Берём его из самих
@@ -1118,8 +1114,9 @@ final class ReaderViewModel: ObservableObject {
         bookmarks = store?.items.first(where: { $0.id == item.id })?.bookmarks ?? []
     }
 
+    /// Перейти к закладке, сохранив play/pause (как переход по главе).
     func navigate(to bm: Bookmark) {
         clearPendingRestore()
-        speech.play(from: bm.sentenceIndex)
+        speech.seek(to: bm.sentenceIndex)
     }
 }

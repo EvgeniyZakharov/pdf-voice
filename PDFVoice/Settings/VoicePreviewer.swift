@@ -14,8 +14,14 @@ final class VoicePreviewer: ObservableObject {
     /// Озвучивает «Привет, меня зовут {имя}. С радостью могу почитать для тебя»,
     /// а английским голосом — английскую фразу: русская у него звучала бы
     /// набором нечитаемых звуков (фонетику задаёт голос, а не текст).
-    func preview(_ option: VoiceOption, serverURL: String, apiKey: String) {
+    ///
+    /// `coordinator` — активная сессия чтения (если есть) ставится на паузу
+    /// ПЕРЕД превью: иначе демо-фраза накладывалась бы поверх звучащей книги
+    /// (оба используют одну и ту же `AVAudioSession(.playback)`).
+    func preview(_ option: VoiceOption, serverURL: String, apiKey: String,
+                coordinator: PlaybackCoordinator?) {
         stop()
+        coordinator?.active?.speech.pause()
         let isEnglishVoice = option.systemIdentifier.map {
             AVSpeechSynthesisVoice(identifier: $0)?.language.hasPrefix("en-") ?? false
         } ?? false
@@ -61,19 +67,16 @@ final class VoicePreviewer: ObservableObject {
         try? session.setActive(true)
     }
 
-    private struct SileroRequest: Encodable {
-        let text: String
-        let speaker: String
-    }
-
+    /// Построение запроса и проверка статуса — через общий `SileroClient`
+    /// (тот же тип использует боевой путь `SileroBackend.fetchAudio`). Превью не
+    /// ретраит (единичный демо-запрос, не критичный для чтения книги) — ошибка
+    /// просто гасится в `try?` вызывающей стороной.
     private static func fetch(base: URL, apiKey: String,
                               speaker: String, text: String) async throws -> Data {
-        var req = URLRequest(url: base.appendingPathComponent("synthesize"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "X-API-Key") }
-        req.httpBody = try JSONEncoder().encode(SileroRequest(text: text, speaker: speaker))
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let req = try SileroClient.makeRequest(baseURL: base, apiKey: apiKey, speaker: speaker,
+                                               text: text, timeout: 10)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        try SileroClient.validate(resp)
         return data
     }
 }

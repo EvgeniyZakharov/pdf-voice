@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
+    @EnvironmentObject private var coordinator: PlaybackCoordinator
     @Environment(\.dismiss) private var dismiss
     @StateObject private var previewer = VoicePreviewer()
 
@@ -95,13 +96,13 @@ struct SettingsView: View {
             .onChange(of: settings.selectedVoice) { id in
                 if let opt = voiceOptions.first(where: { $0.id == id }) {
                     previewer.preview(opt, serverURL: settings.sileroServerURL,
-                                      apiKey: settings.sileroAPIKey)
+                                      apiKey: settings.sileroAPIKey, coordinator: coordinator)
                 }
             }
             .onChange(of: settings.selectedVoiceEN) { id in
                 if let opt = englishVoiceOptions.first(where: { $0.id == id }) {
                     previewer.preview(opt, serverURL: settings.sileroServerURL,
-                                      apiKey: settings.sileroAPIKey)
+                                      apiKey: settings.sileroAPIKey, coordinator: coordinator)
                 }
             }
             .onDisappear { previewer.stop() }
