@@ -37,6 +37,18 @@ enum OCRTextExtractor {
             defer { Task { @MainActor in progress(done, total) } }
 
             guard let page = document.page(at: pi) else { continue }
+
+            // Пустые страницы-разделители не несут текста — полный Vision-проход
+            // (0.5–1.5 с) на них потрачен впустую. `processMixedPages` уже
+            // фильтрует их перед вызовом `sentences` для своих одиночных OCR-
+            // страниц (проверка тут для них избыточна, но безвредна); для
+            // batched-вызовов из `runOCR` (весь чисто-OCR путь) это единственная
+            // точка проверки. Индекс страницы всё равно остаётся в диапазоне —
+            // `loadedPageCount` продвигается по границе батча, как и раньше,
+            // просто для этой страницы не будет ни OCR, ни предложений.
+            let blank = await Task.detached(priority: .background) { isBlankPage(page) }.value
+            guard !blank else { continue }
+
             let pageRect = page.bounds(for: .mediaBox)
             guard let observations = await recognize(page: page, pageRect: pageRect,
                                                      languages: recognitionLanguages(for: profile.code)),
@@ -56,13 +68,8 @@ enum OCRTextExtractor {
                 let utf16Len = str.utf16.count
                 let pageLine = TextPipeline.PageLine(text: str, startUTF16: cumulativeUTF16)
 
-                let bb = obs.boundingBox   // нормализованный, origin внизу-слева
-                let fullBox = CGRect(
-                    x: bb.minX * pageRect.width,
-                    y: bb.minY * pageRect.height,
-                    width: bb.width * pageRect.width,
-                    height: bb.height * pageRect.height
-                )
+                let bb = obs.boundingBox   // нормализованный, origin внизу-слева, координаты ОТОБРАЖАЕМОЙ страницы
+                let fullBox = mapVisionBox(bb, pageRect: pageRect, rotation: page.rotation)
 
                 entries.append((line: pageLine, candidate: candidate, fullBox: fullBox, utf16Len: utf16Len))
                 // +1 за разделитель-пробел между строками
@@ -175,13 +182,7 @@ enum OCRTextExtractor {
                         guard let obs = try? info.candidate.boundingBox(for: strStart..<strEnd) else {
                             return nil
                         }
-                        let bb = obs.boundingBox
-                        return CGRect(
-                            x: bb.minX * pageRect.width,
-                            y: bb.minY * pageRect.height,
-                            width: bb.width * pageRect.width,
-                            height: bb.height * pageRect.height
-                        )
+                        return mapVisionBox(obs.boundingBox, pageRect: pageRect, rotation: page.rotation)
                     }()
 
                     boxes.append(subBox ?? info.fullBox)
@@ -213,7 +214,12 @@ enum OCRTextExtractor {
     private static func recognize(page: PDFPage, pageRect: CGRect,
                                   languages: [String]) async -> [VNRecognizedTextObservation]? {
         let scale: CGFloat = 2
-        let size = CGSize(width: pageRect.width * scale, height: pageRect.height * scale)
+        // `thumbnail(of:for:)` рендерит страницу КАК ОНА ОТОБРАЖАЕТСЯ — с учётом
+        // `/Rotate`. Запрашивать размер в неповёрнутых mediaBox-пропорциях для
+        // повёрнутой на 90/270 страницы значит растянуть/сжать кадр под чужой
+        // аспект — на этом искажении и OCR, и координаты Vision поехали бы.
+        let display = displaySize(for: pageRect, rotation: page.rotation)
+        let size = CGSize(width: display.width * scale, height: display.height * scale)
         guard let cgImage = page.thumbnail(of: size, for: .mediaBox).cgImage else { return nil }
 
         return await withCheckedContinuation { continuation in
@@ -231,5 +237,73 @@ enum OCRTextExtractor {
                 }
             }
         }
+    }
+
+    // MARK: - Геометрия: поворот страницы и origin mediaBox
+
+    /// Нормализует `/Rotate` (может прийти отрицательным или ≥360) к {0, 90, 180, 270}.
+    private static func normalizedRotation(_ rotation: Int) -> Int {
+        ((rotation % 360) + 360) % 360
+    }
+
+    /// Размер страницы КАК ОНА ОТОБРАЖАЕТСЯ: при повороте на 90/270 стороны mediaBox
+    /// меняются местами (портрет становится альбомом и наоборот).
+    private static func displaySize(for pageRect: CGRect, rotation: Int) -> CGSize {
+        normalizedRotation(rotation) == 90 || normalizedRotation(rotation) == 270
+            ? CGSize(width: pageRect.height, height: pageRect.width)
+            : CGSize(width: pageRect.width, height: pageRect.height)
+    }
+
+    /// Точка в координатах ОТОБРАЖАЕМОЙ (уже повёрнутой) страницы → точка в
+    /// координатах НЕповёрнутого mediaBox (origin снизу-слева, `unrotatedSize`
+    /// — исходные width/height страницы). `/Rotate` в PDF — поворот ПО ЧАСОВОЙ
+    /// стрелке при отображении; здесь применяем обратное преобразование.
+    /// Для 90/180/270 формулы выведены из стандартного поворота вектора по
+    /// часовой стрелке (x,y)→(y,−x) с переносом в неотрицательный квадрант,
+    /// инвертированы аналитически и проверены харнессом (точка/прямоугольник
+    /// туда-обратно).
+    private static func unrotatedPoint(_ p: CGPoint, rotation: Int, unrotatedSize: CGSize) -> CGPoint {
+        let w = unrotatedSize.width
+        let h = unrotatedSize.height
+        switch normalizedRotation(rotation) {
+        case 90:  return CGPoint(x: w - p.y, y: p.x)
+        case 180: return CGPoint(x: w - p.x, y: h - p.y)
+        case 270: return CGPoint(x: p.y, y: h - p.x)
+        default:  return p
+        }
+    }
+
+    /// Прямоугольник в координатах отображаемой страницы → в координатах
+    /// неповёрнутого mediaBox. Поворот на кратные 90° сохраняет прямоугольник
+    /// осеосным, но какая пара углов становится min/max — зависит от угла,
+    /// поэтому переводим все 4 угла и берём bounding box результата, а не
+    /// только min/max точки.
+    private static func unrotatedRect(_ r: CGRect, rotation: Int, unrotatedSize: CGSize) -> CGRect {
+        let corners = [
+            CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
+            CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY),
+        ].map { unrotatedPoint($0, rotation: rotation, unrotatedSize: unrotatedSize) }
+        let xs = corners.map(\.x)
+        let ys = corners.map(\.y)
+        return CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+    }
+
+    /// Нормализованный (0…1, origin снизу-слева) бокс Vision — в координатах
+    /// ОТОБРАЖАЕМОЙ страницы — в абсолютные координаты страницы (mediaBox,
+    /// неповёрнутое пространство + `pageRect.origin`, который PDF с ненулевым
+    /// origin mediaBox не забывает прибавить). `PDFAnnotation.bounds` ожидает
+    /// координаты именно в этом пространстве — PDFKit сам поворачивает
+    /// отрисовку аннотации согласно `/Rotate` страницы.
+    private static func mapVisionBox(_ normalized: CGRect, pageRect: CGRect, rotation: Int) -> CGRect {
+        let display = displaySize(for: pageRect, rotation: rotation)
+        let displayRect = CGRect(
+            x: normalized.minX * display.width,
+            y: normalized.minY * display.height,
+            width: normalized.width * display.width,
+            height: normalized.height * display.height
+        )
+        let unrotated = unrotatedRect(displayRect, rotation: rotation,
+                                      unrotatedSize: CGSize(width: pageRect.width, height: pageRect.height))
+        return unrotated.offsetBy(dx: pageRect.minX, dy: pageRect.minY)
     }
 }

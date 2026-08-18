@@ -1,6 +1,7 @@
 [Unit]
 Description=cloudflared tunnel (PDF Voice Silero)
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

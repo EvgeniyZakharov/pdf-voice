@@ -139,9 +139,7 @@ struct RussianProfile: LanguageProfile {
         result = Self.expandUnits(result)
         result = Self.expandNumbers(result)
         result = Self.expandCityPrefix(result)
-        for (abbr, full) in Self.abbreviations {
-            result = result.replacingOccurrences(of: abbr, with: full)
-        }
+        result = Self.replaceAbbreviations(result)
         return TextPipeline.squeezeSpaces(result)
     }
 
@@ -164,6 +162,46 @@ struct RussianProfile: LanguageProfile {
         ("№", "номер ")
     ]
 
+    private static let abbreviationLookup: [String: String] =
+        Dictionary(uniqueKeysWithValues: abbreviations)
+
+    /// Одна скомпилированная регулярка на всю таблицу вместо построчного
+    /// `replacingOccurrences`: без границы слева «рис.» матчился внутри «Борис.»,
+    /// «гл.» — внутри «угл.» и т.п. `(?<![\p{L}])` — левая граница слова (не
+    /// предшествует буква любого алфавита); длинные ключи идут первыми в
+    /// альтернации на случай общих префиксов.
+    private static let abbreviationRegex: NSRegularExpression = {
+        let keys = abbreviations.map(\.0).sorted { $0.count > $1.count }
+        let alternatives = keys.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        let pattern = "(?<![\\p{L}])(?:\(alternatives))"
+        // Таблица статична и известна на этапе компиляции — force try безопасен,
+        // невалидный паттерн тут же ловится харнессом/юнит-тестами.
+        return try! NSRegularExpression(pattern: pattern)
+    }()
+
+    private static func replaceAbbreviations(_ text: String) -> String {
+        let ns = text as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        let matches = abbreviationRegex.matches(in: text, range: full)
+        guard !matches.isEmpty else { return text }
+        let mutable = NSMutableString(string: text)
+        for m in matches.reversed() {
+            let matched = ns.substring(with: m.range)
+            guard let replacement = abbreviationLookup[matched] else { continue }
+            // «см.» → «смотри» только когда слева НЕ цифра — защита от случаев,
+            // которые `expandUnits` (идёт раньше в конвейере) по каким-то причинам
+            // не раскрыл (например, дробные «5,5 см.»). В обычном случае «5 см.»
+            // до сюда уже доходит раскрытым в «сантиметра/ов», и подстрока «см.»
+            // тут вовсе не встречается.
+            if matched == "см.", m.range.location > 0 {
+                let prev = ns.character(at: m.range.location - 1)
+                if prev >= 0x30, prev <= 0x39 { continue }
+            }
+            mutable.replaceCharacters(in: m.range, with: replacement)
+        }
+        return mutable as String
+    }
+
     // MARK: - Единицы измерения
 
     private static let unitForms: [(pattern: String, forms: (String, String, String))] = [
@@ -174,12 +212,17 @@ struct RussianProfile: LanguageProfile {
         ("мл",  ("миллилитр",  "миллилитра",  "миллилитров")),
     ]
 
-    // Compiled once: «(digits) UNIT» where UNIT is NOT followed by letter or dot.
-    // The negative lookahead [а-яёА-ЯЁa-zA-Z.] prevents matching «см.» (смотри) and
-    // run-together words.
+    // Compiled once: «(digits) UNIT» where UNIT is NOT followed by a letter
+    // (run-together word, e.g. «5смотри») and NOT followed by a dot that is
+    // itself immediately followed by a letter (e.g. «см.вводная» — abbreviation-
+    // like continuation, not a sentence-ending period). A dot at the true end of
+    // a sentence («Длина 5 см.») is allowed through — it used to be blocked
+    // unconditionally, which left the unit unexpanded and let the abbreviation
+    // table turn «см.» into «смотри» instead of «сантиметров».
     private static let unitRegexes: [(NSRegularExpression, (String, String, String))] = {
         unitForms.compactMap { entry in
-            let pat = "(\\d+)\\s*\(NSRegularExpression.escapedPattern(for: entry.pattern))(?![а-яёА-ЯЁa-zA-Z.])"
+            let pat = "(\\d+)\\s*\(NSRegularExpression.escapedPattern(for: entry.pattern))" +
+                "(?![а-яёА-ЯЁa-zA-Z])(?!\\.[а-яёА-ЯЁa-zA-Z])"
             guard let re = try? NSRegularExpression(pattern: pat) else { return nil }
             return (re, entry.forms)
         }

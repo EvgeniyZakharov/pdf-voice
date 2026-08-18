@@ -39,10 +39,14 @@ ufw --force enable
 С локальной машины (из корня проекта `pdf-voice`):
 
 ```bash
-# скопировать папку сервера (без .venv) на сервер
+# скопировать папку сервера (без .venv, без секретов) на сервер
 rsync -av --exclude='.venv' --exclude='__pycache__' \
+  --exclude='.env' --exclude='.api_key' --exclude='.git' \
   silero-server/ root@<IP-СЕРВЕРА>:/home/silero/silero-server/
 ```
+> Исключения `.env`/`.api_key` критичны при повторных деплоях: без них rsync
+> затирает прод-ключ и переменные окружения значениями (или отсутствием
+> файла) с локальной машины.
 
 На сервере:
 
@@ -55,9 +59,9 @@ sudo -u silero bash -lc '
   python3 -m venv .venv
   .venv/bin/pip install --upgrade pip -q
   # ВАЖНО: CPU-only torch. Обычный "pip install torch" тянет ~2 ГБ CUDA-колёс (GPU нам не нужен)
-  # и забивает tmpfs → "No space left on device".
-  .venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-  .venv/bin/pip install -q omegaconf fastapi "uvicorn[standard]" numpy
+  # и забивает tmpfs → "No space left on device". --extra-index-url подставляет
+  # CPU-only колесо там, где версия в requirements.txt совпадает.
+  .venv/bin/pip install -q -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 '
 ```
 > CPU-torch (~1 ГБ venv) ставится под архитектуру сервера (x86 или ARM — без разницы),
@@ -82,18 +86,44 @@ sudo -u silero bash -lc '
   cat .env
 '
 ```
-Запиши значение `SILERO_API_KEY` — его пропишем в приложении (Настройки → Silero → API-ключ).
+Запиши значение `SILERO_API_KEY` — оно уже зашито в приложение при сборке через
+`Secrets.xcconfig` (см. §8), сверься, что значения совпадают.
 
-> **Под нагрузку:** правило — `WORKERS ≈ ожидаемые_слушатели / 4–6`, и `WORKERS × TORCH_THREADS ≈ числу vCPU`,
-> при этом RAM ограничивает: каждый воркер ~1.8 ГБ. Точную ёмкость измерит `benchmark.py` (см. §6).
+> **Базовая рекомендация:** сервер сейчас реально работает на 4 ГБ RAM с
+> `WORKERS=1` — это дефолт, ставь именно его, если не уверен. Таблица ниже —
+> опция для масштабирования, если понадобится больше слушателей одновременно;
+> перед тем как поднимать `WORKERS`, точную ёмкость измерь `benchmark.py` (см. §6.1).
+>
+> Правило масштабирования: `WORKERS ≈ ожидаемые_слушатели / 4–6`, и
+> `WORKERS × TORCH_THREADS ≈ числу vCPU`, при этом RAM ограничивает — каждый
+> воркер ~1.8 ГБ.
 >
 > | Сервер | vCPU / RAM | WORKERS | TORCH_THREADS | ~слушателей |
 > |---|---|---|---|---|
-> | CX23 / CAX11 | 2 / 4 ГБ | **1** | 2 | ~4–5 |
-> | CX33 / CAX21 / CPX31 | 4 / 8 ГБ | **2** | 2 | ~8–12 |
-> | CX43 / CAX31 | 8 / 16 ГБ | **4** | 2 | ~16–24 |
+> | CX23 / CAX11 (текущий, дефолт) | 2 / 4 ГБ | **1** | 2 | ~4–5 |
+> | CX33 / CAX21 / CPX31 (опция) | 4 / 8 ГБ | **2** | 2 | ~8–12 |
+> | CX43 / CAX31 (опция) | 8 / 16 ГБ | **4** | 2 | ~16–24 |
 >
-> На 4 ГБ ставь именно `WORKERS=1` — две копии модели (~3.6 ГБ) рискуют словить OOM при старте.
+> На 4 ГБ не поднимай `WORKERS` выше 1 — две копии модели (~3.6 ГБ) рискуют
+> словить OOM при старте.
+
+---
+
+## 3.1 Прогрев кэша модели (один процесс, до многопроцессного старта)
+
+```bash
+sudo -u silero bash -lc '
+  cd /home/silero/silero-server
+  set -a; source .env; set +a
+  .venv/bin/python -c "import server"
+'
+```
+Зачем: `server.py` сам берёт файловую блокировку вокруг `torch.hub.load` (защита
+от одновременной записи в кэш при `WORKERS>=2`), но этот шаг ещё надёжнее —
+качает и распаковывает модель ОДНИМ процессом, пока `.env` уже на месте, а
+systemd-служба (которая при `WORKERS>=2` стартует несколько воркеров сразу)
+ещё не запущена. После него у всех будущих воркеров кэш уже тёплый, и
+конкурентной загрузки при первом `systemctl start` не возникает.
 
 ---
 
@@ -104,9 +134,9 @@ cp /home/silero/silero-server/deploy/silero.service /etc/systemd/system/silero.s
 systemctl daemon-reload
 systemctl enable --now silero
 
-# дождаться загрузки модели (первый старт ~1-2 мин), затем проверить:
+# дождаться загрузки модели (первый старт ~1-2 мин, но кэш уже тёплый после §3.1), затем проверить:
 systemctl status silero --no-pager
-curl -s http://127.0.0.1:8000/health    # ждём {"status":"ok",...}
+curl -s http://127.0.0.1:8000/health    # ждём {"status":"ok","queue_waiting":0,...}
 ```
 Логи при проблемах: `journalctl -u silero -f`
 
@@ -165,7 +195,7 @@ systemctl status cloudflared --no-pager      # ждём active + "Registered tun
 
 ```bash
 curl -s https://tts.pdf-voice.com/health
-# ожидаем: {"status":"ok","speakers":["aidar","baya","kseniya","xenia","eugene"]}
+# ожидаем: {"status":"ok","speakers":["aidar","baya","kseniya","xenia","eugene"],"queue_waiting":0}
 
 # синтез (подставь свой ключ):
 curl -s -X POST https://tts.pdf-voice.com/synthesize \
@@ -213,7 +243,8 @@ API-ключ из приложения извлекаем, поэтому rate-l
 ## 8. Интеграция с приложением (сделано)
 
 - `SettingsStore.swift`: `sileroServerURL`/`sileroAPIKey` — вшитые константы
-  (`https://tts.pdf-voice.com` + ключ из шага 3); поля в Настройках убраны.
+  (`https://tts.pdf-voice.com` + ключ из шага 3, подставляется в `Secrets.xcconfig`
+  при сборке); полей ввода URL/ключа в Настройках нет.
 - Fallback: при недоступном сервере `SpeechEngine` беззвучно переключается на
   системный голос (`SpeechEvent.failed` → `fallBackToSystemVoice`). Проверка —
   `systemctl stop silero`, послушать, что чтение продолжается системным голосом,
@@ -225,8 +256,9 @@ API-ключ из приложения извлекаем, поэтому rate-l
 
 ```bash
 rsync -av --exclude='.venv' --exclude='__pycache__' \
+  --exclude='.env' --exclude='.api_key' --exclude='.git' \
   silero-server/ root@<IP>:/home/silero/silero-server/
-ssh root@<IP> 'systemctl restart silero'
+ssh root@<IP> 'chown -R silero:silero /home/silero/silero-server && systemctl restart silero'
 ```
 
 ## Шпаргалка по сервисам

@@ -13,8 +13,9 @@ HTTPS-адресом **`https://tts.pdf-voice.com`** (Cloudflare Tunnel). При
 Обновить код на сервере:
 ```bash
 rsync -av --exclude='.venv' --exclude='__pycache__' \
+  --exclude='.env' --exclude='.api_key' --exclude='.git' \
   silero-server/ root@<IP>:/home/silero/silero-server/
-ssh root@<IP> 'systemctl restart silero'
+ssh root@<IP> 'chown -R silero:silero /home/silero/silero-server && systemctl restart silero'
 ```
 
 ## Локальная разработка
@@ -39,5 +40,7 @@ curl -s -X POST http://localhost:8000/synthesize \
 
 - Silero v3 — CPU-only, синтез быстрый; GPU не нужен.
 - Авторизация: `X-API-Key`. Локально ключ генерится в `.api_key`; на проде — в `.env`
-  (`SILERO_API_KEY`), см. `deploy/DEPLOY.md`. Пустой ключ → проверка выключена.
+  (`SILERO_API_KEY`), см. `deploy/DEPLOY.md`. Пустой `SILERO_API_KEY` теперь fail-closed —
+  сервер не стартует (`SystemExit`), пока явно не разрешишь анонимный доступ
+  `SILERO_ALLOW_ANON=1` (только для отладки, не для прода).
 - Голоса: `aidar`, `baya`, `kseniya`, `xenia`, `eugene`.

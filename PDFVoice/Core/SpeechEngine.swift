@@ -36,10 +36,18 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     /// Доступные множители скорости (1.0 = обычная речь).
     static let speedOptions: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
+    /// Прокидывается в ОБА backend'а, а не только в `active` (Р3): переключение
+    /// backend'а (Silero-фолбэк/восстановление) не должно воскрешать старую скорость
+    /// у backend'а, который был неактивен на момент смены. Раньше didSet требовал
+    /// `isSpeaking` — на паузе смена скорости не долетала до backend'а вовсе, и после
+    /// resume() играло на старом темпе. Оба backend'а сами решают, можно ли применить
+    /// новую скорость немедленно (играют) или нужно только запомнить и применить на
+    /// следующем play()/resume() без самопроизвольного старта звука (на паузе).
     @Published var speed: Double = 1.0 {
         didSet {
-            guard speed != oldValue, isSpeaking else { return }
-            active.setSpeed(speed)
+            guard speed != oldValue else { return }
+            avBackend.setSpeed(speed)
+            sileroBackend.setSpeed(speed)
         }
     }
 
@@ -96,7 +104,15 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
     // MARK: - Прерывания
 
     private var interruptionObserver: Any?
+    private var routeChangeObserver: Any?
     private var foregroundObserver: Any?
+
+    /// true, если ТЕКУЩАЯ пауза была поставлена нами самими из-за `.began`
+    /// прерывания (звонок и т.п.), а не пользователем вручную. Только в этом
+    /// случае `.ended`+`.shouldResume` должен сам возобновить чтение — иначе
+    /// пользователь, поставивший паузу вручную ПЕРЕД или ВО ВРЕМЯ звонка,
+    /// обнаруживал бы книгу снова говорящей после того, как повесил трубку.
+    private var pausedByInterruption = false
 
     /// true, если Silero был временно оставлен ради системного голоса из-за сбоя
     /// (обычно транзиентная сеть в фоне). Конфиг Silero при этом СОХРАНЁН — при
@@ -113,6 +129,15 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
             object: AVAudioSession.sharedInstance(),
             queue: .main
         ) { [weak self] note in self?.handleAudioInterruption(note) }
+        // Выдернули наушники / отключился Bluetooth-динамик и т.п.: iOS по
+        // умолчанию продолжает играть через встроенный динамик — книга внезапно
+        // "орёт" на весь автобус. Пауза при исчезновении прежнего маршрута —
+        // стандартное поведение медиаплееров.
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] note in self?.handleRouteChange(note) }
         // Возврат приложения на передний план: если в фоне сорвались на системный
         // голос — пробуем восстановить Silero. Имя нотификации задаём строкой, чтобы
         // не тянуть UIKit в Core (эти файлы компилируются и в swiftc-харнессах).
@@ -125,6 +150,9 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
 
     deinit {
         if let token = interruptionObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+        if let token = routeChangeObserver {
             NotificationCenter.default.removeObserver(token)
         }
         if let token = foregroundObserver {
@@ -189,14 +217,30 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
               let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
         switch type {
         case .began:
+            // Запоминаем, БЫЛИ ли мы вообще говорящими на момент прерывания — если
+            // пользователь уже поставил паузу вручную, isSpeaking уже false, и
+            // pausedByInterruption останется false: .ended ниже не станет
+            // самовольно запускать чтение, которое пользователь остановил сам.
+            pausedByInterruption = isSpeaking
             if isSpeaking { pause() }
         case .ended:
             let opts = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
                 .map(AVAudioSession.InterruptionOptions.init) ?? []
-            if opts.contains(.shouldResume) { resume() }
+            if pausedByInterruption && opts.contains(.shouldResume) { resume() }
+            pausedByInterruption = false
         @unknown default:
             break
         }
+    }
+
+    /// Реагируем только на исчезновение прежнего маршрута вывода (наушники
+    /// выдернуты/Bluetooth отключился) — остальные причины (например, подключение
+    /// нового устройства) не должны прерывать чтение.
+    private func handleRouteChange(_ notification: Notification) {
+        guard let reasonValue = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
+        guard reason == .oldDeviceUnavailable else { return }
+        if isSpeaking { pause() }
     }
 
     // MARK: - TTSProvider
@@ -251,7 +295,12 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         // только play(from:), а старт Silero через большую кнопку Play идёт по
         // resume() → звук оставался в дефолтной soloAmbient и глох при сворачивании.
         activateAudioSession()
-        if sileroServerURL != nil {
+        // Ветвимся по ФАКТИЧЕСКИ активному backend'у, не по конфигу (Р4): после
+        // отката на системный голос (fallBackToSystemVoice) sileroServerURL остаётся
+        // non-nil (конфиг сохранён для восстановления), но active уже avBackend —
+        // ветвление по конфигу звало Silero-путь на avBackend'е и перечитывало
+        // предложение с начала вместо продолжения с места паузы.
+        if active === sileroBackend {
             isSpeaking = true
             if sileroBackend.isPausedMidClip {
                 // Клип жив, currentTime сохранён — продолжаем с места остановки.
@@ -291,6 +340,10 @@ final class SpeechEngine: NSObject, ObservableObject, TTSProvider {
         if let token = interruptionObserver {
             NotificationCenter.default.removeObserver(token)
             interruptionObserver = nil
+        }
+        if let token = routeChangeObserver {
+            NotificationCenter.default.removeObserver(token)
+            routeChangeObserver = nil
         }
         if let token = foregroundObserver {
             NotificationCenter.default.removeObserver(token)

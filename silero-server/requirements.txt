@@ -1,5 +1,9 @@
-torch
-omegaconf
-fastapi
-uvicorn[standard]
-numpy
+# Версии запинены по факту установленного в рабочем .venv (macOS, Python 3.9).
+# На проде (Linux/CPU) ставить так:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+# --extra-index-url подставит CPU-only колесо torch (без CUDA, ~1 ГБ вместо ~2 ГБ).
+torch==2.8.0
+omegaconf==2.3.1
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+numpy==2.0.2

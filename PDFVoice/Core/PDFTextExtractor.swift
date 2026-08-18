@@ -63,7 +63,11 @@ enum PDFTextExtractor {
             let raw = document.page(at: pi)?.string ?? ""
             allLines.append(TextPipeline.lines(of: raw))
         }
-        let boilerplate = TextPipeline.detectBoilerplate(pages: allLines, pageCount: pageCount)
+        // Оконный детект (T5): для документов ≤ windowSize страниц ведёт себя как
+        // раньше (сам падает на плоский `detectBoilerplate` внутри), но приводит
+        // этот путь к тому же вызову, что и прогрессивную/OCR/mixed-загрузку —
+        // единая точка правды вместо трёх разных порогов на трёх разных путях.
+        let boilerplate = TextPipeline.detectBoilerplateWindowed(pages: allLines)
 
         // 2. Чистка + токенизация постранично.
         var result: [Sentence] = []

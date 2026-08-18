@@ -41,6 +41,12 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     /// -1 означает «очередь пуста / не инициализирована».
     private var windowEnd: Int = -1
 
+    /// true, если setSpeed() пришёл, пока синтезатор БЫЛ НА ПАУЗЕ — новую скорость
+    /// запомнили (currentSpeed), но очередь не пере-наполняли (это стартовало бы
+    /// звук немедленно, ломая паузу). resume() при этом флаге пере-наполнит очередь
+    /// на актуальной скорости вместо простого continueSpeaking().
+    private var speedDirtyWhilePaused = false
+
     override init() {
         super.init()
         synthesizer.delegate = self
@@ -88,6 +94,17 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
     }
 
     func resume() {
+        if speedDirtyWhilePaused {
+            // Скорость поменяли, пока стояли на паузе: continueSpeaking() продолжил
+            // бы текущую (и все уже поставленные в очередь) utterance на СТАРОМ rate
+            // — AVSpeechUtterance.rate фиксируется при создании. Пере-наполняем окно
+            // с той же позиции на актуальной скорости; это и есть "старт", которого
+            // resume() и ждёт от пользователя (в отличие от setSpeed() ВО ВРЕМЯ паузы,
+            // которая не должна звучать раньше явного resume()).
+            speedDirtyWhilePaused = false
+            enqueue(from: lastStartedIndex)
+            return
+        }
         synthesizer.continueSpeaking()
     }
 
@@ -97,6 +114,7 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         }
         indexForUtterance.removeAll()
         windowEnd = -1
+        speedDirtyWhilePaused = false
         // Обнуляем замыкание рендера: оно захватывает SpeechEngine (пусть и слабо),
         // но держать ссылку на устаревший рендер после stop() смысла нет — и это
         // единственное место, где backend отпускает предыдущую очередь целиком.
@@ -105,9 +123,20 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
 
     func setSpeed(_ speed: Double) {
         currentSpeed = speed
-        // AVSpeechSynthesizer не поддерживает live-смену темпа — пере-наполняем очередь.
-        guard synthesizer.isSpeaking || synthesizer.isPaused else { return }
-        enqueue(from: lastStartedIndex)
+        if synthesizer.isSpeaking {
+            // Уже играем — пере-наполнение стартует звук немедленно, это ожидаемо
+            // (аналог смены голоса на лету): AVSpeechSynthesizer не умеет менять rate
+            // у уже созданных utterance, только пересоздать их.
+            enqueue(from: lastStartedIndex)
+        } else if synthesizer.isPaused {
+            // На паузе НЕЛЬЗЯ пере-наполнять очередь сейчас: stopSpeaking(.immediate)
+            // внутри enqueue() снимает синтезатор с паузы, а последующий speak()
+            // тут же начинает звучать — пользователь слышал бы обрыв тишины без
+            // нажатия Play. Запоминаем и откладываем до resume().
+            speedDirtyWhilePaused = true
+        }
+        // else: backend неактивен (не играет и не на паузе) — currentSpeed просто
+        // запомнен для следующего play().
     }
 
     func setVoice(_ v: AVSpeechSynthesisVoice?) {
@@ -125,6 +154,7 @@ final class AVSpeechBackend: NSObject, SpeechBackend {
         }
         indexForUtterance.removeAll()
         windowEnd = -1
+        speedDirtyWhilePaused = false
         guard currentSentences.indices.contains(start),
               let render = currentRender else { return }
         let end = min(start + AVSpeechBackend.windowSize - 1, currentSentences.count - 1)

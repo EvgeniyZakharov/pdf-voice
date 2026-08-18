@@ -123,9 +123,20 @@ enum HTMLText {
         s.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
     }
 
+    /// `replacingOccurrences(..., options: [.regularExpression])` has no way to pass
+    /// `.dotMatchesLineSeparators` (it only accepts `NSString.CompareOptions`), so `.`
+    /// never matched across lines — `<head>...</head>` spanning multiple lines (the
+    /// normal case) survived untouched, leaking page titles/inline CSS into the first
+    /// sentence of every chapter. `firstHeading` below already builds its own
+    /// `NSRegularExpression` with that flag; do the same here.
     private static func removeBlock(_ s: String, tag: String) -> String {
-        s.replacingOccurrences(of: "<\(tag)[^>]*>.*?</\(tag)>", with: "",
-                               options: [.regularExpression, .caseInsensitive])
+        guard let re = try? NSRegularExpression(
+            pattern: "<\(tag)[^>]*>.*?</\(tag)>",
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else { return s }
+        let ns = s as NSString
+        return re.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: ns.length),
+                                           withTemplate: "")
     }
 
     private static func firstHeading(in s: String) -> String? {

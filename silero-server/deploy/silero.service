@@ -1,11 +1,21 @@
 [Unit]
 Description=Silero TTS server (PDF Voice)
-After=network.target
+After=network-online.target
+Wants=network-online.target
+# Защита от бесконечного restart-лупа при постоянно падающем старте
+# (например, побитый кэш torch.hub) — после 5 рестартов за 10 минут служба
+# остановится вместо вечного цикла Restart=always/RestartSec=3.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=silero
 WorkingDirectory=/home/silero/silero-server
+Environment=PYTHONUNBUFFERED=1
+# Дефолт на случай, если .env ещё не создан/не содержит WORKERS — EnvironmentFile
+# ниже переопределит значение, если оно там задано.
+Environment=WORKERS=1
 EnvironmentFile=/home/silero/silero-server/.env
 # Слушаем ТОЛЬКО localhost — наружу трафик пускает cloudflared, порт 8000 не торчит в интернет.
 # --workers ${WORKERS}: число параллельных процессов-воркеров (значение из .env).
@@ -13,6 +23,10 @@ EnvironmentFile=/home/silero/silero-server/.env
 ExecStart=/home/silero/silero-server/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers ${WORKERS}
 Restart=always
 RestartSec=3
+# Жёсткий потолок памяти на службу (доля от общего RAM машины) — защита от OOM
+# всей системы, если синтез/torch внезапно раздуется. Загрузка модели 1-2 мин
+# укладывается в RestartSec как и раньше.
+MemoryMax=80%
 
 # Перезапуск при падении и подъём после reboot обеспечивает systemd.
 # Первый старт скачает модель (~200MB) — служба «прогреется» за минуту-две.

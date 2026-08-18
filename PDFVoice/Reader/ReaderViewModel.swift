@@ -234,6 +234,21 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    /// Ленивый off-main blank-чек (рендер 48×48 + разброс яркости) — общий хелпер
+    /// для всех мест, которым нужно решить «стоит ли гонять OCR на этой странице».
+    private func isPageBlank(_ page: PDFPage) async -> Bool {
+        await Task.detached(priority: .background) { isBlankPage(page) }.value
+    }
+
+    /// Накопленный набор ключей колонтитулов (см. `TextPipeline.normalizedKey`).
+    /// Растёт по ходу загрузки текстового/смешанного пути — плоский
+    /// `detectBoilerplate` на разных, несогласованных по объёму выборках
+    /// (первые 15 страниц / остаток / батчи по 10 в mixed) давал нестабильный
+    /// результат (порог зависел от размера конкретной выборки); оконный
+    /// детект + объединение с уже найденным делают набор только растущим и не
+    /// зависящим от того, в какой фазе загрузки страница обработана.
+    private var boilerplateKeys: Set<String> = []
+
     // MARK: - Загрузка
 
     func load() {
@@ -525,9 +540,11 @@ final class ReaderViewModel: ObservableObject {
         let initialLines: [[TextPipeline.PageLine]] = (0..<initialCount).map {
             TextPipeline.lines(of: extractionDoc.page(at: $0)?.string ?? "")
         }
-        let quickBoilerplate = TextPipeline.detectBoilerplate(
-            pages: initialLines, pageCount: initialCount
-        )
+        // Оконный детект + объединение с уже накопленным (пусто на первом батче,
+        // растёт дальше в `startBackgroundTextLoading`/`processMixedPages`) —
+        // см. `boilerplateKeys`.
+        boilerplateKeys.formUnion(TextPipeline.detectBoilerplateWindowed(pages: initialLines))
+        let quickBoilerplate = boilerplateKeys
         let fileName = item.fileName
         // Локальная копия для Task.detached (вне главного актора).
         let profile = profile
@@ -565,6 +582,10 @@ final class ReaderViewModel: ObservableObject {
         let fileName = item.fileName
         // Локальная копия для Task.detached (вне главного актора).
         let profile = profile
+        // Снимок накопленного на момент старта фона — объединяется с оконным
+        // детектом остатка ниже, чтобы набор колонтитулов только рос (см. T5,
+        // `boilerplateKeys`), а не пересчитывался с нуля на каждой фазе.
+        let priorBoilerplate = boilerplateKeys
 
         backgroundTask = Task { [weak self] in
             // Читаем строки страниц off main thread через GCD — только из extractionDoc,
@@ -582,10 +603,15 @@ final class ReaderViewModel: ObservableObject {
 
             guard !Task.isCancelled else { return }
 
-            // Детект boilerplate off main thread.
-            let boilerplate = await Task.detached(priority: .background) {
-                TextPipeline.detectBoilerplate(pages: remainingLines, pageCount: remainingLines.count)
+            // Оконный детект boilerplate (окно 30 стр.) off main thread, объединённый
+            // с уже найденным ранее — набор только растёт (T5).
+            let windowed = await Task.detached(priority: .background) {
+                TextPipeline.detectBoilerplateWindowed(pages: remainingLines)
             }.value
+            let boilerplate = priorBoilerplate.union(windowed)
+
+            guard !Task.isCancelled, let self else { return }
+            self.boilerplateKeys = boilerplate
 
             var allSentences = prior
             let batchSize = 50
@@ -609,7 +635,7 @@ final class ReaderViewModel: ObservableObject {
                     )
                 }.value
 
-                guard !Task.isCancelled, let self else { return }
+                guard !Task.isCancelled else { return }
                 allSentences.append(contentsOf: batch)
                 self.speech.appendSentences(batch)
                 self.tryApplyPendingRestore()
@@ -625,7 +651,7 @@ final class ReaderViewModel: ObservableObject {
                 batchStart = batchEnd
             }
 
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled else { return }
             self.speech.isFullyLoaded = true
             self.isLoadingRemainingPages = false
         }
@@ -907,6 +933,9 @@ final class ReaderViewModel: ObservableObject {
         let profile = profile
 
         // Собираем boilerplate по текстовым страницам батча, если не передан снаружи.
+        // Оконный детект + объединение с уже накопленным (T5, `boilerplateKeys`) —
+        // раньше каждый батч по 10 страниц считал колонтитулы плоским детектом с
+        // нуля, независимо от остальных фаз загрузки, и результат «плавал».
         let effectiveBoilerplate: Set<String>
         if let bp = boilerplate {
             effectiveBoilerplate = bp
@@ -915,9 +944,11 @@ final class ReaderViewModel: ObservableObject {
                 guard pi < kinds.count, kinds[pi] == .text else { return [] }
                 return TextPipeline.lines(of: extractionDoc.page(at: pi)?.string ?? "")
             }
-            effectiveBoilerplate = await Task.detached(priority: .background) {
-                TextPipeline.detectBoilerplate(pages: textLines, pageCount: textLines.count)
+            let windowed = await Task.detached(priority: .background) {
+                TextPipeline.detectBoilerplateWindowed(pages: textLines)
             }.value
+            boilerplateKeys.formUnion(windowed)
+            effectiveBoilerplate = boilerplateKeys
         }
 
         for pi in pageRange {
@@ -941,11 +972,12 @@ final class ReaderViewModel: ObservableObject {
             case .ocr:
                 // Ленивый blank-чек: рендерим thumbnail только здесь, off-main, прямо перед OCR.
                 // На этапе load() мы намеренно его пропустили, чтобы не рендерить 720 страниц
-                // пачкой на main thread.
+                // пачкой на main thread. Общий хелпер — тот же чек теперь встроен и в
+                // `OCRTextExtractor.sentences` (единственная точка для чисто-OCR пути `runOCR`,
+                // у которого нет собственного постраничного цикла); здесь он избыточен, но
+                // безвреден и экономит один лишний `await` до вызова экстрактора.
                 guard let page = extractionDoc.page(at: pi) else { continue }
-                let blank = await Task.detached(priority: .background) {
-                    isBlankPage(page)
-                }.value
+                let blank = await isPageBlank(page)
                 guard !blank else { continue }
 
                 let pageSentences = await OCRTextExtractor.sentences(
