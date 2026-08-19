@@ -157,8 +157,6 @@ private struct ReaderScreen: View {
             settings.probeSilero()
             refreshVoiceOptions()
         }
-        .onChange(of: settings.selectedVoice)      { _ in model.changeVoice(settings) }
-        .onChange(of: settings.selectedVoiceEN)    { _ in model.changeVoice(settings) }
         // Опции пикера зависят только от доступности Silero и языка книги —
         // пересобираем список явно на изменение любого из них, не на body.
         .onChange(of: settings.sileroReachable)    { _ in refreshVoiceOptions() }
@@ -177,26 +175,15 @@ private struct ReaderScreen: View {
     @ToolbarContentBuilder
     private var toolbarItems: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            // Выбор голоса прямо в читалке — дублирует пикер из Настроек, но БЕЗ
-            // приветствия: приветствие озвучивается только в SettingsView
-            // (VoicePreviewer). Здесь простое присвоение settings.selectedVoice →
-            // .onChange(of: settings.selectedVoice) в body вызывает
-            // model.applySettings → голос/спикер переключается прямо в чтении книги.
+            // Выбор голоса прямо в читалке пишет голос ЭТОЙ КНИГИ
+            // (`ReaderViewModel.selectVoice` → `item.voiceID`), а не глобальную
+            // настройку — книга дальше держит свой выбор независимо от Настроек.
+            // Голоса ТОЛЬКО языка открытой книги: показывать русские голоса на
+            // английской книге бессмысленно (см. `VoiceCatalog.options`).
             Menu {
-                // Голоса ТОЛЬКО языка открытой книги: показывать русские голоса
-                // на английской книге бессмысленно — озвучивать её будет
-                // английский (см. ReaderViewModel.applySettings).
-                if VoiceCatalog.isEnglish(model.libraryItem.effectiveLanguage) {
-                    Picker("Голос", selection: $settings.selectedVoiceEN) {
-                        ForEach(voiceOptions) { opt in
-                            Text(opt.title).tag(opt.id)
-                        }
-                    }
-                } else {
-                    Picker("Голос", selection: $settings.selectedVoice) {
-                        ForEach(voiceOptions) { opt in
-                            Text(opt.title).tag(opt.id)
-                        }
+                Picker("Голос", selection: voiceSelectionBinding) {
+                    ForEach(voiceOptions) { opt in
+                        Text(opt.title).tag(opt.id)
                     }
                 }
             } label: {
@@ -361,6 +348,16 @@ private struct ReaderScreen: View {
     private func refreshVoiceOptions() {
         voiceOptions = VoiceCatalog.options(sileroReachable: settings.sileroReachable,
                                              language: model.libraryItem.effectiveLanguage)
+    }
+
+    /// Пикер голоса читает/пишет эффективный голос ЭТОЙ книги (не глобальную
+    /// настройку напрямую) — выбор уходит в `model.selectVoice`, который пишет
+    /// `item.voiceID` через `DocumentStore` и применяет голос к сессии на лету.
+    private var voiceSelectionBinding: Binding<String> {
+        Binding(
+            get: { model.effectiveVoiceSelection(settings) },
+            set: { model.selectVoice($0, settings: settings) }
+        )
     }
 
     /// Общий обработчик тапа по PDF/тексту (передаётся как `onTap` в оба
@@ -807,28 +804,14 @@ extension ReaderView {
 private struct PlayerControls: View {
     @ObservedObject var model: ReaderViewModel
     @ObservedObject private var speech: SpeechEngine
-    /// Отдельный `@ObservedObject`, а не чтение через `model` — `ReaderViewModel`
-    /// форвардит наверх только `speech.objectWillChange` (см. её `init`), тиканье
-    /// `sleepTimer.remainingSeconds` иначе не перерисовывало бы этот экран.
-    @ObservedObject private var sleepTimer: SleepTimer
 
     init(model: ReaderViewModel) {
         _model = ObservedObject(wrappedValue: model)
         _speech = ObservedObject(wrappedValue: model.speech)
-        _sleepTimer = ObservedObject(wrappedValue: model.sleepTimer)
     }
 
     var body: some View {
         VStack(spacing: 4) {
-            // Таймер сна — тонкая строка над транспортом, не крадёт место у
-            // основных кнопок. Видна всегда (не завязана на pageBar/reflowBar,
-            // которые сами скрыты для однострочных PDF/книг без глав).
-            HStack {
-                Spacer()
-                sleepTimerMenu
-            }
-            .padding(.horizontal, 12)
-
             // Контролы делят ширину поровну — на узких экранах ничего не наезжает
             // (раньше чип скорости лежал в ZStack поверх транспорта и пересекался
             // с кнопкой перемотки). Иконки «в край» — шаг по предложениям, не ±сек.
@@ -850,42 +833,6 @@ private struct PlayerControls: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-    }
-
-    /// Таймер сна: Menu в том же стиле, что чип скорости — капсула с акцентным
-    /// текстом. Неактивен — просто значок луны; активен — значок + остаток
-    /// (`remainingFormatted`, тикает благодаря `@ObservedObject sleepTimer`).
-    private var sleepTimerMenu: some View {
-        Menu {
-            Button {
-                sleepTimer.cancel()
-            } label: {
-                if sleepTimer.isActive {
-                    Text("Выкл")
-                } else {
-                    Label("Выкл", systemImage: "checkmark")
-                }
-            }
-            ForEach(SleepTimer.options, id: \.self) { minutes in
-                Button("\(minutes) мин") { sleepTimer.start(minutes: minutes) }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: sleepTimer.isActive ? "moon.fill" : "moon")
-                    .font(.system(size: 13, weight: .semibold))
-                if sleepTimer.isActive {
-                    Text(sleepTimer.remainingFormatted)
-                        .font(.caption2.monospacedDigit())
-                }
-            }
-            .foregroundStyle(sleepTimer.isActive ? Theme.accent : Theme.accent.opacity(0.6))
-            .padding(.horizontal, sleepTimer.isActive ? 10 : 8)
-            .frame(height: 28)
-            .background(Theme.accent.opacity(sleepTimer.isActive ? 0.14 : 0.08), in: Capsule())
-        }
-        .accessibilityLabel(sleepTimer.isActive
-            ? "Таймер сна, осталось \(sleepTimer.remainingFormatted)"
-            : "Таймер сна выключен")
     }
 
     private var playButton: some View {

@@ -35,7 +35,6 @@ final class ReaderViewModel: ObservableObject {
     private var chapterFirstSentence: [Int] = []
 
     let speech = SpeechEngine()
-    let sleepTimer = SleepTimer()
 
     private var item: LibraryItem
     private weak var store: DocumentStore?
@@ -84,7 +83,6 @@ final class ReaderViewModel: ObservableObject {
         speech.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
-        sleepTimer.onExpire = { [weak self] in self?.speech.pause() }
         // Скорость меняется прямо в плеере читалки (`speech.speed = …`), а не
         // через SettingsStore — прокидываем выбор обратно в настройки здесь,
         // чтобы тёмп пережил закрытие книги (см. У9, скорость глобальная).
@@ -133,8 +131,7 @@ final class ReaderViewModel: ObservableObject {
     /// добавляет этот явный `restartCurrent()`, но только если ни один из
     /// путей `applySettings` уже не рестартовал сам (иначе двойной рестарт).
     func changeVoice(_ settings: SettingsStore) {
-        let isEnglishBook = VoiceCatalog.isEnglish(item.effectiveLanguage)
-        let selection = isEnglishBook ? settings.selectedVoiceEN : settings.selectedVoice
+        let selection = effectiveVoiceSelection(settings)
         guard selection != lastVoiceSelection else {
             // Тот же реальный выбор, что мы уже применили (второй слушатель того
             // же события) — прочие поля (пауза и т.п.) синхронизируем, но без
@@ -151,6 +148,31 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
+    /// Смена голоса ЭТОЙ книги (пикер в читалке): пишет `voiceID` в модель книги
+    /// с немедленным сохранением (`DocumentStore.setVoice`, не через дебаунс
+    /// прогресса) и применяет на лету — тем же путём, что и `changeVoice`.
+    /// Настройки (глобальный дефолт) не трогает: книга с выбранным голосом
+    /// больше не зависит от них.
+    func selectVoice(_ voiceID: String, settings: SettingsStore) {
+        item.voiceID = voiceID
+        store?.setVoice(voiceID, for: item.id)
+        changeVoice(settings)
+    }
+
+    /// Эффективный голос книги: собственный выбор (`item.voiceID`), если он есть
+    /// И валиден для языка книги, иначе — глобальный дефолт из Настроек по языку
+    /// книги. Невалидность бывает у ru-Silero-спикера на английской книге
+    /// (Silero знает только русский) — тогда книжный выбор игнорируется, как и
+    /// голос, убранный из каталога.
+    func effectiveVoiceSelection(_ settings: SettingsStore) -> String {
+        let language = item.effectiveLanguage
+        let fallback = VoiceCatalog.isEnglish(language) ? settings.selectedVoiceEN : settings.selectedVoice
+        guard let voiceID = item.voiceID, VoiceCatalog.isValid(voiceID, for: language) else {
+            return fallback
+        }
+        return voiceID
+    }
+
     func applySettings(_ settings: SettingsStore) {
         // Запоминаем настройки, чтобы перевыбрать голос, когда язык книги
         // определится по ходу загрузки (детект идёт уже после первого applySettings).
@@ -165,11 +187,12 @@ final class ReaderViewModel: ObservableObject {
         // постановке предложения в очередь). Выбор голоса по языку — шаг 5.
         speech.profile = profile
 
-        // Голос выбирается по ЯЗЫКУ КНИГИ, а не глобальной настройкой: английскую
-        // книгу русский голос читает с сильным акцентом (фонетику задаёт голос,
-        // а не текст), да и Silero знает только русский.
+        // Голос — эффективный для КНИГИ (собственный выбор `item.voiceID`, если
+        // валиден, иначе дефолт Настроек по языку книги): английскую книгу
+        // русский голос читает с сильным акцентом (фонетику задаёт голос, а не
+        // текст), да и Silero знает только русский — см. `effectiveVoiceSelection`.
         let isEnglishBook = VoiceCatalog.isEnglish(item.effectiveLanguage)
-        let sel = isEnglishBook ? settings.selectedVoiceEN : settings.selectedVoice
+        let sel = effectiveVoiceSelection(settings)
         // Голос/спикер выставляем ДО переключения sileroServerURL: его didSet может
         // авто-продолжить озвучку новым backend'ом, и тот должен быть уже настроен.
         if sel.hasPrefix("silero:"), !isEnglishBook, !settings.sileroServerURL.isEmpty {
@@ -1086,7 +1109,6 @@ final class ReaderViewModel: ObservableObject {
         backgroundTask = nil
         persistProgress()
         speech.shutdown()
-        sleepTimer.cancel()
         nowPlaying?.teardown()
         nowPlaying = nil
     }

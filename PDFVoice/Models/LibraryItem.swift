@@ -39,6 +39,10 @@ struct LibraryItem: Codable, Identifiable, Hashable {
     /// книги и записывает результат сюда. Пока nil — поведение прежнее, русское.
     /// Пользователь может исправить значение вручную (детект иногда ошибается).
     var language: String?
+    /// Голос, выбранный ПОЛЬЗОВАТЕЛЕМ для ЭТОЙ книги (пикер в читалке). `nil` —
+    /// книга ещё не имеет собственного выбора, эффективный голос берётся из
+    /// дефолта Настроек по языку книги (см. `ReaderViewModel.effectiveVoiceSelection`).
+    var voiceID: String?
 
     init(id: UUID = UUID(),
          fileName: String,
@@ -49,7 +53,8 @@ struct LibraryItem: Codable, Identifiable, Hashable {
          bookmarks: [Bookmark] = [],
          collectionIDs: [UUID] = [],
          isFinished: Bool = false,
-         language: String? = nil) {
+         language: String? = nil,
+         voiceID: String? = nil) {
         self.id = id
         self.fileName = fileName
         self.title = title
@@ -60,15 +65,17 @@ struct LibraryItem: Codable, Identifiable, Hashable {
         self.collectionIDs = collectionIDs
         self.isFinished = isFinished
         self.language = language
+        self.voiceID = voiceID
     }
 
-    // Ручной Decodable: `collectionIDs`/`isFinished`/`language` добавлены позже —
-    // у старых записей `library.json` этих ключей нет. Синтезированный init их бы
-    // ТРЕБОВАЛ (дефолты свойств при декодировании не применяются) и ронял загрузку
-    // всей библиотеки. `decodeIfPresent` с фолбэком делает миграцию бесшовной.
+    // Ручной Decodable: `collectionIDs`/`isFinished`/`language`/`voiceID` добавлены
+    // позже — у старых записей `library.json` этих ключей нет. Синтезированный
+    // init их бы ТРЕБОВАЛ (дефолты свойств при декодировании не применяются) и
+    // ронял загрузку всей библиотеки. `decodeIfPresent` с фолбэком делает
+    // миграцию бесшовной.
     enum CodingKeys: String, CodingKey {
         case id, fileName, title, addedDate, lastOpened
-        case currentSentenceIndex, bookmarks, collectionIDs, isFinished, language
+        case currentSentenceIndex, bookmarks, collectionIDs, isFinished, language, voiceID
     }
 
     init(from decoder: Decoder) throws {
@@ -83,6 +90,7 @@ struct LibraryItem: Codable, Identifiable, Hashable {
         collectionIDs = try c.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
         isFinished = try c.decodeIfPresent(Bool.self, forKey: .isFinished) ?? false
         language = try c.decodeIfPresent(String.self, forKey: .language)
+        voiceID = try c.decodeIfPresent(String.self, forKey: .voiceID)
     }
 
     /// Абсолютный URL файла в каталоге Documents.

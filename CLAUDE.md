@@ -50,15 +50,13 @@ PDFVoice/
 │   │                                pause→продолжение с позиции); ударения как «+» после гласной
 │   ├── SpeechEngine.swift         — КООРДИНАТОР: выбор backend, очередь-намерение, подсветка
 │   │                                из событий, Now-Playing, прерывания; render на воспроизведении
-│   ├── TTSProvider.swift          — протокол-шов (load/play/pause/...)
 │   ├── PageClassifier.swift       — classifyPage/textDensityKind → .text/.ocr/.skip; isBlankPage
 │   ├── PDFTextExtractor.swift     — извлечение предложений из текстового слоя + mergeCrossPage
 │   ├── OCRTextExtractor.swift     — Vision OCR → ЕДИНЫЙ конвейер TextPipeline; под-строчные боксы
 │   ├── TextNormalizer.swift       — ПУСТОЙ stub (логика переехала в TextPipeline/RussianProfile)
 │   ├── SentencePageCache.swift    — кэш предложений (schemaVersion=2, хранит rawText), частичная загрузка
 │   ├── OCRCache.swift             — легаси (compile-only; v2-кэш его не читает)
-│   ├── NowPlayingController.swift — экран блокировки, MPRemoteCommandCenter
-│   └── SleepTimer.swift
+│   └── NowPlayingController.swift — экран блокировки, MPRemoteCommandCenter
 ├── Reader/
 │   ├── ReaderViewModel.swift     — загрузка: классификация → text/ocr/mixed/reflow, прогрессивно,
 │   │                                displayDocument; reflow: bookContent/chapterOffsets, seek, главы
@@ -225,15 +223,26 @@ booted screenshot` — скриншот. Так проверяются тап «
 системный, он же офлайн-фолбэк), женский «Ксения» (`xenia`) и мужской «Евгений» (`eugene`).
 Остальные спикеры сервера и прочие русские голоса iOS из UI убраны; сервер их не терял.
 Сохранённый выбор старого голоса чинится `VoiceCatalog.sanitized` при старте (иначе Picker
-показывал бы пустую строку). Подпись системного голоса задана явно («Милена»), т.к.
-`AVSpeechSynthesisVoice.name` приходит на языке системы («Milena»).
+показывал бы пустую строку) — для ГЛОБАЛЬНОГО дефолта (`SettingsStore`); по-книжный `voiceID`
+чинится симметрично в `DocumentStore.sanitizeVoiceIDs` (`VoiceCatalog.isValid`), тоже при
+старте. Подпись системного голоса задана явно («Милена»), т.к. `AVSpeechSynthesisVoice.name`
+приходит на языке системы («Milena»).
 
-**Голос выбирается по ЯЗЫКУ КНИГИ, а не глобальной настройкой.** В Настройках две ячейки —
-«Русские книги» (Милена/Ксения/Евгений) и «Английские книги» (Samantha/Daniel/Karen);
-`ReaderViewModel.applySettings` берёт нужную по `item.effectiveLanguage`, для английской книги
-Silero принудительно выключается (модель русская). Пикер в читалке показывает голоса только
-языка открытой книги. После детекта языка (он идёт уже в процессе загрузки) настройки
-ПЕРЕПРИМЕНЯЮТСЯ — иначе английская книга осталась бы на русском голосе до следующего открытия.
+**Голос — на КНИГУ, Настройки — только дефолт для новых книг.** `LibraryItem.voiceID` (optional,
+бесшовная миграция как `language`) — голос, который пользователь выбрал ИМЕННО в этой книге
+(пикер в читалке, `person.wave.2` в тулбаре). `ReaderViewModel.effectiveVoiceSelection` — голос
+книги: `item.voiceID`, если он есть и валиден для языка книги (`VoiceCatalog.isValid` — русский
+Silero-спикер невалиден для английской книги), иначе дефолт `SettingsStore.selectedVoice`/
+`selectedVoiceEN` по `item.effectiveLanguage`. Пикер в читалке (`ReaderView.voiceSelectionBinding`)
+читает/пишет ЭТУ функцию, а не настройку напрямую — `ReaderViewModel.selectVoice` сохраняет
+`voiceID` немедленно через `DocumentStore.setVoice` (не через дебаунс прогресса) и применяет
+голос к активной сессии тем же путём, что и `changeVoice`. Настройки — две ячейки «Голос по
+умолчанию» («Русские книги»/«Английские книги») — влияют ТОЛЬКО на книги без собственного
+выбора, и только при следующем открытии книги: `PlaybackCoordinator` больше не подписан на
+`$selectedVoice`/`$selectedVoiceEN` (раньше хот-свопил активную сессию по глобальной настройке —
+это и давало баг «смена отстаёт на один выбор», когда пикер книги и Настройки писали в одно и
+то же поле). После детекта языка (он идёт уже в процессе загрузки) `applySettings`
+ПЕРЕПРИМЕНЯЕТСЯ — эффективный голос пересчитывается по новому языку книги.
 **Ловушка:** `AVSpeechSynthesisVoice.speechVoices()` отдаёт для en-US два десятка шуточных
 голосов (Albert, Bad News, Zarvox…) с тем же качеством `.default`, что у нормальной Samantha —
 сортировкой их не отделить. Фильтруем по префиксу идентификатора: настоящие голоса это

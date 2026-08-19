@@ -169,9 +169,16 @@ enum VoiceCatalog {
     /// Для русского проверяем по ПОЛНОМУ набору, без гейта доступности сервера:
     /// выбранный нейроголос остаётся валидным и когда сервер временно не отвечает.
     static func sanitized(_ selection: String, for language: String = "ru") -> String {
+        isValid(selection, for: language) ? selection : defaultSelection(for: language)
+    }
+
+    /// Голос из полного каталога языка (независимо от доступности Silero-сервера
+    /// в моменте — см. комментарий у `sanitized`). Используется для проверки
+    /// ПО-КНИЖНОГО выбора (`LibraryItem.voiceID`): русский Silero-спикер невалиден
+    /// для английской книги (Silero знает только русский), голос, убранный из
+    /// каталога — невалиден для любой книги.
+    static func isValid(_ selection: String, for language: String = "ru") -> Bool {
         let valid = isEnglish(language) ? englishOptions() : systemOptions() + sileroOptions()
         return valid.contains { $0.id == selection }
-            ? selection
-            : defaultSelection(for: language)
     }
 }

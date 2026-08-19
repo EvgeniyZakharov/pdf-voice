@@ -22,27 +22,13 @@ final class PlaybackCoordinator: ObservableObject {
     }
 
     /// Настройки, применимые к УЖЕ ИГРАЮЩЕЙ фоновой сессии (мини-плеер, книга
-    /// закрыта, но чтение продолжается): раньше реакция на смену голоса/паузы
-    /// жила только в `ReaderView.onChange` — пока экран читалки закрыт, изменения
-    /// в Настройках долетали до звука лишь при следующем открытии книги.
-    /// Голос — через `changeVoice` (умеет чистый рестарт «на лету», без дубля —
-    /// см. `SpeechEngine.didRestartSincePrepare`); пауза между предложениями —
-    /// без рестарта, `applySettings` просто прокидывает значение в backend.
+    /// закрыта, но чтение продолжается): раньше реакция на паузу жила только в
+    /// `ReaderView.onChange` — пока экран читалки закрыт, изменения в Настройках
+    /// долетали до звука лишь при следующем открытии книги. Голос сюда не входит:
+    /// он выбирается ПО КНИГЕ (`LibraryItem.voiceID`, см. `ReaderViewModel.selectVoice`),
+    /// глобальный дефолт Настроек больше не влияет на уже открытую/играющую
+    /// сессию — только на книги без собственного выбора при следующем открытии.
     private func observeSettings() {
-        settings.$selectedVoice
-            .dropFirst()
-            .sink { [weak self] _ in
-                guard let self else { return }
-                self.active?.changeVoice(self.settings)
-            }
-            .store(in: &cancellables)
-        settings.$selectedVoiceEN
-            .dropFirst()
-            .sink { [weak self] _ in
-                guard let self else { return }
-                self.active?.changeVoice(self.settings)
-            }
-            .store(in: &cancellables)
         settings.$pauseBetweenSentences
             .dropFirst()
             .sink { [weak self] _ in

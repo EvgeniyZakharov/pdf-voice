@@ -176,6 +176,17 @@ final class DocumentStore: ObservableObject {
         save()
     }
 
+    /// Записывает голос, выбранный пользователем для КОНКРЕТНОЙ книги (пикер в
+    /// читалке) — немедленный save (не через дебаунс прогресса), т.к. это
+    /// редкое явное действие, а не поток событий на каждое предложение.
+    func setVoice(_ voiceID: String?, for itemID: UUID) {
+        guard let idx = items.firstIndex(where: { $0.id == itemID }) else { return }
+        let normalized = (voiceID?.isEmpty ?? true) ? nil : voiceID
+        guard items[idx].voiceID != normalized else { return }
+        items[idx].voiceID = normalized
+        save()
+    }
+
     /// Помечает книгу дочитанной (озвучка дошла до конца) — для фильтра «Законченные».
     func markFinished(_ itemID: UUID) {
         guard let idx = items.firstIndex(where: { $0.id == itemID }), !items[idx].isFinished else { return }
@@ -229,7 +240,24 @@ final class DocumentStore: ObservableObject {
         guard let data = try? Data(contentsOf: indexURL) else { return }
         if let decoded = try? JSONDecoder().decode([LibraryItem].self, from: data) {
             items = decoded
+            sanitizeVoiceIDs()
         }
+    }
+
+    /// Чинит по-книжный `voiceID`, ставший невалидным (голос убрали из каталога/
+    /// списка Silero-спикеров с прошлой версии, либо книга сменила язык и старый
+    /// русский Silero-спикер больше не годится) — иначе книга застряла бы на
+    /// голосе, которого нет в UI. Симметрично `VoiceCatalog.sanitized` для
+    /// глобального выбора (`SettingsStore`).
+    private func sanitizeVoiceIDs() {
+        var changed = false
+        for idx in items.indices {
+            guard let voiceID = items[idx].voiceID,
+                  !VoiceCatalog.isValid(voiceID, for: items[idx].effectiveLanguage) else { continue }
+            items[idx].voiceID = nil
+            changed = true
+        }
+        if changed { save() }
     }
 
     /// Кодирование + запись на диск — off-main (`writeQueue`, сериализация FIFO).
